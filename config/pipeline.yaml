@@ -1,0 +1,8 @@
+paths:
+  sources_config:       "config/sources_config.yaml"
+  reports_config:       "config/reports_config.yaml"
+  deliverables_config:  "config/deliverables_config.yaml"
+  pipeline_db:          "data/pipeline.db"
+  watermark_db:         "data/watermarks.db"
+  incoming_dir:         "data/incoming/"
+  output_dir:           "output/reports/"

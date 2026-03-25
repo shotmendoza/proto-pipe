@@ -1,0 +1,26 @@
+
+sources:
+  - name: "sales"
+    patterns:
+      - "sales_*.csv"
+      - "Sales_*.xlsx"
+      - "SALES_*.csv"
+      - "sales_*.xlsx"
+    target_table: "sales"
+    timestamp_col: "updated_at"
+
+  - name: "inventory"
+    patterns:
+      - "inventory_*.csv"
+      - "Inventory_*.xlsx"
+      - "INVENTORY_*.csv"
+    target_table: "inventory"
+    timestamp_col: "updated_at"
+
+  - name: "customers"
+    patterns:
+      - "customers_*.csv"
+      - "customer_export_*.csv"
+      - "Customers_*.xlsx"
+    target_table: "customers"
+    timestamp_col: "updated_at"
