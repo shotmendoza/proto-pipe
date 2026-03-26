@@ -18,7 +18,6 @@ from src.checks.built_in import (
     check_schema,
     check_duplicates,
 )
-from src.registry.base import CheckRegistry
 
 
 # ---------------------------------------------------------------------------

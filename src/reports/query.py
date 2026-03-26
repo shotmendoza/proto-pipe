@@ -6,6 +6,7 @@ so the CLI and runner never build queries by hand.
 """
 
 from datetime import datetime, timezone
+
 import duckdb
 import pandas as pd
 

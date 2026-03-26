@@ -12,9 +12,8 @@ when the pipeline starts.
 from functools import partial
 from typing import Callable
 
-from src.registry.base import CheckRegistry
 from src.checks.built_in import BUILT_IN_CHECKS
-
+from src.registry.base import CheckRegistry
 
 # Registry of functions decorated with @custom_check, populated at import time.
 # Maps check name -> function. Consumed by load_custom_checks_module() in registry.py.

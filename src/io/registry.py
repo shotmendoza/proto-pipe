@@ -14,8 +14,8 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from src.registry.base import CheckRegistry, ReportRegistry
 from src.checks.built_in import BUILT_IN_CHECKS
+from src.registry.base import CheckRegistry, ReportRegistry
 
 
 def load_config(config_path: str | PathLike) -> dict:

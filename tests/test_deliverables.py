@@ -14,8 +14,8 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.reports.runner import run_deliverable
 from src.io.registry import resolve_filename, write_csv, write_xlsx_sheet
+from src.reports.runner import run_deliverable
 
 
 # ---------------------------------------------------------------------------

@@ -5,9 +5,9 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from src.checks.runner import run_checks
 from src.io.pipeline import load_from_duckdb
+from src.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from src.pipelines.watermark import WatermarkStore, _watermark_lock
 from src.registry.base import CheckRegistry, ReportRegistry
 from src.reports.query import _log_run, init_report_runs_table

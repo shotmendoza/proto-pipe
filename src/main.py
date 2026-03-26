@@ -9,10 +9,10 @@ Flow:
 from pathlib import Path
 
 from src.io.ingest import ingest_directory
-from src.reports.runner import run_all_reports
-from src.pipelines.watermark import WatermarkStore
 from src.io.registry import load_config, register_from_config
+from src.pipelines.watermark import WatermarkStore
 from src.registry.base import check_registry, report_registry
+from src.reports.runner import run_all_reports
 
 
 def main():

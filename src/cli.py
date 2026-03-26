@@ -1,5 +1,4 @@
-"""
-CLI entrypoint.
+"""CLI entrypoint.
 
 Commands:
     init            — scaffold config files into your project
@@ -14,15 +13,16 @@ Commands:
     checks          — list all available built-in checks
 """
 
-import click
 import shutil
 from pathlib import Path
+
+import click
 
 from src.io.settings import (
     load_settings,
     set_path,
     VALID_PATH_KEYS,
-    DEFAULT_SETTINGS_PATH
+    DEFAULT_SETTINGS_PATH,
 )
 
 _TEMPLATES_DIR = Path(__file__).parent / "config"
@@ -31,6 +31,7 @@ _TEMPLATES_DIR = Path(__file__).parent / "config"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _settings():
     return load_settings()
@@ -48,6 +49,7 @@ def _load_custom_checks(check_registry) -> None:
     touches the check registry so custom checks are always available.
     """
     from src.io.registry import load_custom_checks_module
+
     module_path = _settings().get("custom_checks_module")
     if module_path:
         load_custom_checks_module(module_path, check_registry)
@@ -57,6 +59,7 @@ def _load_custom_checks(check_registry) -> None:
 # init
 # ---------------------------------------------------------------------------
 
+
 @click.group()
 def cli():
     """Validation pipeline — manage your config and pipeline."""
@@ -64,10 +67,18 @@ def cli():
 
 
 @cli.command()
-@click.option("--output", default="config", show_default=True,
-              help="Directory to write config files into.")
-@click.option("--force", is_flag=True, default=False,
-              help="Overwrite existing config files if present.")
+@click.option(
+    "--output",
+    default="config",
+    show_default=True,
+    help="Directory to write config files into.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing config files if present.",
+)
 def init(output: str, force: bool):
     """
     Scaffold starter config files and pipeline.yaml into your project.
@@ -93,7 +104,9 @@ def init(output: str, force: bool):
 
     click.echo("\nNext steps:")
     click.echo(f"  1. Edit pipeline.yaml to set your paths")
-    click.echo(f"  2. Edit {out}/sources_config.yaml to match your file naming conventions")
+    click.echo(
+        f"  2. Edit {out}/sources_config.yaml to match your file naming conventions"
+    )
     click.echo(f"  3. Edit {out}/reports_config.yaml to define your reports and checks")
     click.echo(f"  4. Run: validation-pipeline db-init")
 
@@ -101,6 +114,7 @@ def init(output: str, force: bool):
 # ---------------------------------------------------------------------------
 # db-init
 # ---------------------------------------------------------------------------
+
 
 @cli.command("db-init")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
@@ -158,6 +172,7 @@ def db_init(pipeline_db, watermark_db, sources_config):
 # config
 # ---------------------------------------------------------------------------
 
+
 @cli.group()
 def config():
     """View or update pipeline.yaml path settings."""
@@ -200,14 +215,24 @@ def config_set(key: str, value: str):
 # ingest
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 @click.option("--incoming-dir", default=None, help="Override incoming files directory.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
-@click.option("--mode", default="append", show_default=True,
-              type=click.Choice(["append", "replace"]),
-              help="append: add rows. replace: rebuild table from file.")
-@click.option("--validate", is_flag=True, default=False, help="Run registered checks immediately after each file loads.")
+@click.option(
+    "--mode",
+    default="append",
+    show_default=True,
+    type=click.Choice(["append", "replace"]),
+    help="append: add rows. replace: rebuild table from file.",
+)
+@click.option(
+    "--validate",
+    is_flag=True,
+    default=False,
+    help="Run registered checks immediately after each file loads.",
+)
 def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     """
     Scan the incoming directory and load matching files into DuckDB.
@@ -233,9 +258,15 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
         register_from_config(rep_cfg, cr, rr)
 
     click.echo(f"\nIngesting from: {inc_dir}")
-    summary = ingest_directory(inc_dir, _config["sources"], p_db, mode=mode,
-                               run_checks=validate, check_registry=cr,
-                               report_registry=rr)
+    summary = ingest_directory(
+        inc_dir,
+        _config["sources"],
+        p_db,
+        mode=mode,
+        run_checks=validate,
+        check_registry=cr,
+        report_registry=rr,
+    )
 
     ok = sum(1 for v in summary.values() if v["status"] == "ok")
     failed = sum(1 for v in summary.values() if v["status"] == "failed")
@@ -246,11 +277,12 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
 # validate
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
-@click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
-@click.option("--watermark-db",   default=None, help="Override watermark DB path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--watermark-db", default=None, help="Override watermark DB path.")
 @click.option("--reports-config", default=None, help="Override reports config path.")
-@click.option("--table",          default=None, help="Run checks for one table only.")
+@click.option("--table", default=None, help="Run checks for one table only.")
 def validate(pipeline_db, watermark_db, reports_config, table):
     """Run registered checks against ingested tables.
 
@@ -273,8 +305,11 @@ def validate(pipeline_db, watermark_db, reports_config, table):
 
     # Filter to one table if requested
     if table:
-        reports = [r for r in report_registry.all()
-                   if r.get("source", {}).get("table") == table]
+        reports = [
+            r
+            for r in report_registry.all()
+            if r.get("source", {}).get("table") == table
+        ]
         if not reports:
             click.echo(f"  [warn] No reports registered for table '{table}'")
             return
@@ -299,14 +334,19 @@ def validate(pipeline_db, watermark_db, reports_config, table):
 # update-table
 # ---------------------------------------------------------------------------
 
+
 @cli.command("update-table")
 @click.argument("table")
 @click.argument("filepath")
-@click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
-@click.option("--mode", default="append", show_default=True,
-              type=click.Choice(["append", "replace"]),
-              help="append: add rows. replace: rebuild table from this file.")
+@click.option(
+    "--mode",
+    default="append",
+    show_default=True,
+    type=click.Choice(["append", "replace"]),
+    help="append: add rows. replace: rebuild table from this file.",
+)
 def update_table(table, filepath, pipeline_db, sources_config, mode):
     """
     Re-ingest a specific file into a specific table.
@@ -321,12 +361,12 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
         _init_ingest_log,
         _table_exists,
         _auto_migrate,
-        _log_ingest
+        _log_ingest,
     )
     from src.io.registry import load_config
     import duckdb
 
-    p_db = _p("pipeline_db",    pipeline_db)
+    p_db = _p("pipeline_db", pipeline_db)
     src_cfg = _p("sources_config", sources_config)
     path = Path(filepath)
 
@@ -338,7 +378,9 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     sources = {s["target_table"]: s for s in config["sources"]}
 
     if table not in sources:
-        click.echo(f"  [error] No source defined for table '{table}' in sources_config.yaml")
+        click.echo(
+            f"  [error] No source defined for table '{table}' in sources_config.yaml"
+        )
         return
 
     source = sources[table]
@@ -360,7 +402,9 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     else:
         new_cols = _auto_migrate(conn, table, df)
         conn.execute(f'INSERT INTO "{table}" SELECT * FROM df')
-        click.echo(f"  [ok] '{table}' updated from '{path.name}' ({len(df)} rows appended)")
+        click.echo(
+            f"  [ok] '{table}' updated from '{path.name}' ({len(df)} rows appended)"
+        )
 
     _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
     conn.close()
@@ -370,22 +414,29 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
 # pull-report
 # ---------------------------------------------------------------------------
 
+
 @cli.command("pull-report")
 @click.argument("deliverable_name")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-@click.option("--deliverables-config", default=None, help="Override deliverables config path.")
+@click.option(
+    "--deliverables-config", default=None, help="Override deliverables config path."
+)
 @click.option("--output-dir", default=None, help="Override output directory.")
-@click.option("--date-from", default=None, help="Override date filter from (YYYY-MM-DD).")
+@click.option(
+    "--date-from", default=None, help="Override date filter from (YYYY-MM-DD)."
+)
 @click.option("--date-to", default=None, help="Override date filter to (YYYY-MM-DD).")
-@click.option("--date-col", default=None, help="Column to apply --date-from/--date-to on.")
+@click.option(
+    "--date-col", default=None, help="Column to apply --date-from/--date-to on."
+)
 def pull_report(
-        deliverable_name,
-        pipeline_db,
-        deliverables_config,
-        output_dir,
-        date_from,
-        date_to,
-        date_col
+    deliverable_name,
+    pipeline_db,
+    deliverables_config,
+    output_dir,
+    date_from,
+    date_to,
+    date_col,
 ):
     """Query tables and write deliverable output (CSV or Excel).
 
@@ -438,14 +489,18 @@ def pull_report(
         report_defs = {r["name"]: r for r in rep_config.get("reports", [])}
 
         if report_name not in report_defs:
-            click.echo(f"[warn] Report '{report_name}' not found in reports_config.yaml, skipping")
+            click.echo(
+                f"[warn] Report '{report_name}' not found in reports_config.yaml, skipping"
+            )
             continue
 
         table = report_defs[report_name]["source"]["table"]
         filters = report_cfg.get("filters", {})
 
         try:
-            df = query_table(conn, table, filters=filters, cli_overrides=cli_date_filter)
+            df = query_table(
+                conn, table, filters=filters, cli_overrides=cli_date_filter
+            )
             report_dataframes[report_name] = df
             click.echo(f"[query] {report_name} → {len(df)} rows")
         except Exception as e:
@@ -465,13 +520,20 @@ def pull_report(
 # run-all
 # ---------------------------------------------------------------------------
 
+
 @cli.command("run-all")
-@click.option("--pipeline-db",         default=None, help="Override pipeline DB path.")
-@click.option("--watermark-db",        default=None, help="Override watermark DB path.")
-@click.option("--incoming-dir",        default=None, help="Override incoming files directory.")
-@click.option("--deliverable",         default=None, help="Pull a specific deliverable after validation.")
-@click.option("--ignore-flagged",      is_flag=True, default=False,
-              help="Produce deliverable even if flagged rows exist.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--watermark-db", default=None, help="Override watermark DB path.")
+@click.option("--incoming-dir", default=None, help="Override incoming files directory.")
+@click.option(
+    "--deliverable", default=None, help="Pull a specific deliverable after validation."
+)
+@click.option(
+    "--ignore-flagged",
+    is_flag=True,
+    default=False,
+    help="Produce deliverable even if flagged rows exist.",
+)
 def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged):
     """
     Chain ingest → validate → pull-report in one command.
@@ -490,7 +552,7 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
 
     import duckdb
 
-    p_db = _p("pipeline_db",  pipeline_db)
+    p_db = _p("pipeline_db", pipeline_db)
     w_db = _p("watermark_db", watermark_db)
     inc_dir = _p("incoming_dir", incoming_dir)
     src_cfg = _p("sources_config")
@@ -557,6 +619,7 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
 # checks
 # ---------------------------------------------------------------------------
 
+
 @cli.command()
 def checks():
     """List all built-in checks and their parameters."""
@@ -564,9 +627,15 @@ def checks():
 
     click.echo("\nBuilt-in checks:\n")
     descriptions = {
-        "null_check":      ("No params required",      "Checks all columns for null values"),
-        "range_check":     ("col, min_val, max_val",   "Checks a column's values fall within a range"),
-        "schema_check":    ("expected_cols (list)",    "Checks the table has the expected columns"),
+        "null_check": ("No params required", "Checks all columns for null values"),
+        "range_check": (
+            "col, min_val, max_val",
+            "Checks a column's values fall within a range",
+        ),
+        "schema_check": (
+            "expected_cols (list)",
+            "Checks the table has the expected columns",
+        ),
         "duplicate_check": ("subset (list, optional)", "Checks for duplicate rows"),
     }
     for name in BUILT_IN_CHECKS:

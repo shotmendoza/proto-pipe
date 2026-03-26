@@ -15,9 +15,8 @@ import duckdb
 
 from src.checks.built_in import check_nulls, check_range
 from src.io.registry import register_from_config
-from src.registry.base import CheckRegistry, ReportRegistry
-
 from src.pipelines.watermark import WatermarkStore
+from src.registry.base import CheckRegistry, ReportRegistry
 from src.reports.runner import run_report, run_all_reports
 
 

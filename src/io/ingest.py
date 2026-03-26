@@ -14,11 +14,12 @@ so failures are visible without stopping the entire run.
 
 import json
 import uuid
+from datetime import datetime, timezone
+from fnmatch import fnmatch
+from pathlib import Path
+
 import duckdb
 import pandas as pd
-from datetime import datetime, timezone
-from pathlib import Path
-from fnmatch import fnmatch
 
 
 # ---------------------------------------------------------------------------

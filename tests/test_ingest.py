@@ -8,8 +8,8 @@ Covers:
 - ingest_log entries
 """
 
-import pandas as pd
 import duckdb
+import pandas as pd
 
 from src.io.ingest import (
     resolve_source,
