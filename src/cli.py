@@ -24,6 +24,7 @@ from src.io.settings import (
     VALID_PATH_KEYS,
     DEFAULT_SETTINGS_PATH,
 )
+from src.registry.base import CheckRegistry
 
 _TEMPLATES_DIR = Path(__file__).parent / "config"
 
@@ -34,19 +35,46 @@ _TEMPLATES_DIR = Path(__file__).parent / "config"
 
 
 def _settings():
+    """A utility function to load and return configurations.
+
+    This function serves as a wrapper for loading application
+    settings or configurations using the load_settings method.
+    It operates internally and is not intended to be accessed
+    outside the module.
+
+    :return: Loaded application settings or configurations.
+    """
     return load_settings()
 
 
-def _p(key: str, override: str | None = None) -> str:
-    """Return a path from settings, with an optional CLI override."""
+def _p(
+        key: str,
+        override: str | None = None
+) -> str:
+    """Retrieve a specific path configuration value based on the provided key.
+
+    This function fetches a value from a predefined settings dictionary using
+    a given key. An optional override value can be provided, which will take
+    precedence over the value corresponding to the key in the settings dictionary.
+
+    :param key: The key used to identify the path in the settings dictionary.
+    :param override: An optional value that overrides the value fetched from
+        the settings dictionary. Defaults to None.
+    :return: The path configuration value, either from the settings dictionary
+        or the override if provided.
+    """
     return override or _settings()["paths"][key]
 
 
-def _load_custom_checks(check_registry) -> None:
-    """
-    If custom_checks_module is set in pipeline.yaml, import it and register
-    any @custom_check decorated functions. Called before any command that
-    touches the check registry so custom checks are always available.
+def _load_custom_checks(check_registry: CheckRegistry) -> None:
+    """Loads custom checks from a specified module path, if configured. This function
+    retrieves the module path from settings and uses it to load custom checks into
+    the provided registry. If no custom module path is specified, this function
+    performs no operation.
+
+    :param check_registry: The registry where the custom checks will be loaded.
+    :type check_registry: Any
+    :return: None
     """
     from src.io.registry import load_custom_checks_module
 
@@ -80,10 +108,17 @@ def cli():
     help="Overwrite existing config files if present.",
 )
 def init(output: str, force: bool):
-    """
-    Scaffold starter config files and pipeline.yaml into your project.
+    """Initializes a configuration directory and files with defaults for a validation pipeline.
 
-    Run db-init afterwards to create the DuckDB databases.
+    Provides a way to set up the necessary configuration files for a validation pipeline, if they do
+    not already exist in the specified directory. Will optionally overwrite existing files if the
+    '--force' parameter is provided. Offers information on the next steps required for setup.
+
+    :param output: Directory where configuration files will be generated.
+    :param force: If set to True, any existing files in the output directory will be overwritten.
+    :return: None
+
+    :raises FileExistsError: When the configuration files already exist and '--force' is not used.
     """
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
@@ -121,9 +156,15 @@ def init(output: str, force: bool):
 @click.option("--watermark-db", default=None, help="Override watermark DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
 def db_init(pipeline_db, watermark_db, sources_config):
-    """
-    Create DuckDB files and bootstrap tables from sources_config.yaml.
-    Safe to re-run — existing tables and watermarks are left untouched.
+    """Initialize database setup required for the pipeline operation. This command
+    optionally overrides the default paths for the pipeline database, watermark
+    database, and sources configuration file. The command ensures the necessary tables
+    exist in the pipeline database and initializes the watermark database.
+
+    :param pipeline_db: Path to override the pipeline database.
+    :param watermark_db: Path to override the watermark database.
+    :param sources_config: Path to override the source configuration file.
+    :return: None
     """
     from src.io.ingest import init_db
     from src.io.registry import load_config
@@ -192,16 +233,17 @@ def config_show():
 @click.argument("key")
 @click.argument("value")
 def config_set(key: str, value: str):
-    """
-    Update a path setting in pipeline.yaml.
+    """Sets a configuration value based on the provided key. This function allows users
+    to assign a specific value to a configuration key, updating the application
+    settings. If the key is invalid, an error message will be displayed, along with
+    a list of valid keys.
 
-    \b
-    Keys:
-      sources_config, reports_config, deliverables_config,
-      pipeline_db, watermark_db, incoming_dir, output_dir
-    \b
-    Example:
-      validation-pipeline config set incoming_dir /data/drops/
+    :param key: The configuration key to be set. Must be a valid key from the valid
+        path keys.
+    :param value: The value to assign to the specified configuration key.
+    :return: None
+
+    :raises ValueError: If the provided key is not valid, an error is raised.
     """
     try:
         set_path(key, value)
@@ -234,8 +276,7 @@ def config_set(key: str, value: str):
     help="Run registered checks immediately after each file loads.",
 )
 def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
-    """
-    Scan the incoming directory and load matching files into DuckDB.
+    """Scan the incoming directory and load matching files into DuckDB.
 
     Failures are logged to ingest_log and skipped — the run continues.
     New tables are created lazily if they weren't present at db-init.
@@ -283,11 +324,21 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
 @click.option("--watermark-db", default=None, help="Override watermark DB path.")
 @click.option("--reports-config", default=None, help="Override reports config path.")
 @click.option("--table", default=None, help="Run checks for one table only.")
-def validate(pipeline_db, watermark_db, reports_config, table):
-    """Run registered checks against ingested tables.
+def validate(
+        pipeline_db,
+        watermark_db,
+        reports_config,
+        table
+):
+    """Validates the pipeline and watermark databases by executing the registered
+    checks and generating reports. This function allows optional filtering
+    on a specific table.
 
-    Uses watermarks to check only new/modified rows since the last run.
-    Failures are logged — the run continues across all reports.
+    :param pipeline_db: Overrides the default pipeline database path if provided
+    :param watermark_db: Overrides the default watermark database path if provided
+    :param reports_config: Overrides the default reports configuration file path if provided
+    :param table: Runs checks and generates reports for a specific table, if specified
+    :return: None
     """
     from src.io.registry import load_config, register_from_config
     from src.registry.base import check_registry, report_registry
@@ -348,13 +399,30 @@ def validate(pipeline_db, watermark_db, reports_config, table):
     help="append: add rows. replace: rebuild table from this file.",
 )
 def update_table(table, filepath, pipeline_db, sources_config, mode):
-    """
-    Re-ingest a specific file into a specific table.
+    """Updates the data table in the pipeline database based on the provided file and configuration.
+    This function processes updates to a specific database table by ingesting data from a file.
+    It supports two modes: appending to the existing table or replacing the table's contents
+    entirely. The function also handles schema migration for the database table if necessary.
 
-    \b
-    Example:
-      validation-pipeline update-table sales data/drops/sales_march.csv
-      validation-pipeline update-table sales data/drops/sales_march.csv --mode replace
+    Parameters:
+    ----------
+    :param table: Name of the target database table to update
+    :type table: str
+    :param filepath: Path to the file containing data to ingest
+    :type filepath: str
+    :param pipeline_db: (Optional) Custom path to the DuckDB pipeline database. If not
+        provided, the default location is used
+    :type pipeline_db: str or None
+    :param sources_config: (Optional) Path to the YAML file defining source configurations.
+        If not provided, the default configuration path is used
+    :type sources_config: str or None
+    :param mode: Operation mode for updating the table. Choices are "append" to add new rows
+        and "replace" to recreate the table. The default mode is "append"
+    :type mode: str
+
+    Returns:
+    -------
+    :return: None
     """
     from src.io.ingest import (
         _load_file,
