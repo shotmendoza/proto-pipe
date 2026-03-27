@@ -1,243 +1,142 @@
 # Adding a New Check
 
-Checks are functions that receive a `context` dict (containing a pandas
-DataFrame) and return a dict of results. Once registered, a check is available
-by name in `reports_config.yaml` with no further wiring required.
+Checks are functions that inspect a DataFrame and return a dict.
+There are two ways to add one: as a **built-in** (registered in code before
+the pipeline starts) or as a **config-only check** (an inline check in
+`reports_config.yaml` that references an existing built-in by name).
 
 ---
 
-## Quickstart
-
-```python
-from validation_pipeline import check_registry
-from validation_pipeline.checks.registry_helpers import register_custom_check
-
-def check_no_future_dates(context, col="order_date"):
-    import pandas as pd
-    df = context["df"]
-    future = df[df[col] > pd.Timestamp.now()]
-    return {"future_date_count": len(future), "col": col}
-
-register_custom_check(
-    name="future_date_check",
-    func=check_no_future_dates,
-    check_registry=check_registry,
-)
-```
-
-Then reference it in your config immediately:
-
-```yaml
-checks:
-  - name: future_date_check
-    params:
-      col: "order_date"
-```
-
----
-
-## Check function signature
-
-Every check must follow this signature:
+## What a check function looks like
 
 ```python
 def my_check(context: dict, **params) -> dict:
-    df = context["df"]   # always a pandas DataFrame
-    ...
-    return { ... }       # always a dict
+    df = context["df"]
+    # ... your logic ...
+    return {"some_key": some_value}
 ```
 
-| Argument  | Type   | Description                                                        |
-|-----------|--------|--------------------------------------------------------------------|
-| `context` | dict   | Always the first argument. Contains `df` (the DataFrame to check) |
-| `**params`| any    | Your check's own parameters, baked in at registration time         |
+- `context["df"]` is a pandas DataFrame of the rows being validated.
+- Any extra params are passed as keyword arguments at registration time.
+- **Return value:** any dict. The pipeline does not enforce a schema on it.
+- **Pass vs fail:** a check is marked `passed` if it returns normally,
+  `failed` if it raises an exception. So raise if something is wrong:
 
-The return value can contain any keys you like. Aim to include a clear
-indicator of whether the check found issues (e.g. a `violations` count or a
-`passed` boolean) so results are easy to interpret in reports.
+```python
+def check_no_negatives(context: dict, col: str) -> dict:
+    df = context["df"]
+    neg = df[df[col] < 0]
+    if not neg.empty:
+        raise ValueError(f"{len(neg)} negative values found in '{col}'")
+    return {"col": col, "status": "ok"}
+```
 
 ---
 
-## Registering a check
+## Option 1 — Register a custom check in code
 
-Use `register_custom_check` from `registry_helpers`. This registers the check
-in both the `CheckRegistry` (so the runner can call it) and `BUILT_IN_CHECKS`
-(so the config loader can find it by name in YAML).
+Do this when your check logic is specific to your project and not
+expressible with the built-ins.
 
 ```python
+# my_checks.py (or anywhere that runs before the pipeline starts)
+
 from validation_pipeline import check_registry
 from validation_pipeline.checks.registry_helpers import register_custom_check
 
-register_custom_check(
-    name="my_check",       # name used in reports_config.yaml
-    func=my_check_func,    # the function defined above
-    check_registry=check_registry,
-)
-```
-
-### `register_custom_check` parameters
-
-| Parameter        | Required | Description                                                              |
-|------------------|----------|--------------------------------------------------------------------------|
-| `name`           | yes      | The name used to reference this check in YAML config                     |
-| `func`           | yes      | The check function                                                       |
-| `check_registry` | yes      | The `CheckRegistry` instance (import `check_registry` from the package)  |
-| `**default_params` | no     | Optional params baked in via `functools.partial` at registration time    |
-
-### With default params baked in
-
-If you always use the same params for a check, you can bake them in at
-registration so you don't need to specify them in the config:
-
-```python
-register_custom_check(
-    name="order_date_check",
-    func=check_no_future_dates,
-    check_registry=check_registry,
-    col="order_date",       # baked in — no params needed in YAML
-)
-```
-
-```yaml
-checks:
-  - name: order_date_check   # no params block needed
-```
-
-### Without default params
-
-If you want the config to supply the params each time:
-
-```python
-register_custom_check(
-    name="future_date_check",
-    func=check_no_future_dates,
-    check_registry=check_registry,
-    # no default params — caller must supply col in YAML
-)
-```
-
-```yaml
-checks:
-  - name: future_date_check
-    params:
-      col: "shipped_date"
-```
-
----
-
-## Where to put your check registration
-
-Call `register_custom_check` **before** `register_from_config` runs, so the
-config loader can find your check by name. The recommended place is in your
-project's entrypoint, before the pipeline runs:
-
-```python
-# main.py
-from validation_pipeline import check_registry, report_registry
-from validation_pipeline.config.loader import load_config, register_from_config
-from validation_pipeline.checks.registry_helpers import register_custom_check
-from validation_pipeline.runner import run_all_reports
-from validation_pipeline.watermark import WatermarkStore
-import os
-
-# 1. Register custom checks first
-register_custom_check("future_date_check", check_no_future_dates, check_registry)
-register_custom_check("margin_check", check_margin, check_registry, threshold=0.2)
-
-# 2. Then load config — custom checks are now available by name
-config = load_config("config/reports_config.yaml")
-register_from_config(config, check_registry, report_registry)
-
-# 3. Run
-watermark_store = WatermarkStore(os.environ["WATERMARK_DB_PATH"])
-results = run_all_reports(report_registry, check_registry, watermark_store)
-```
-
----
-
-## Full example
-
-```python
-# checks/my_checks.py — keep your custom checks in their own module
 
 def check_margin(context: dict, col: str = "margin", threshold: float = 0.2) -> dict:
-    """Check that margin values are above a minimum threshold."""
     df = context["df"]
-    if col not in df.columns:
-        raise ValueError(f"Column '{col}' not found")
     below = df[df[col] < threshold]
-    return {
-        "col": col,
-        "threshold": threshold,
-        "violations": len(below),
-        "violation_indices": below.index.tolist(),
-    }
+    if not below.empty:
+        raise ValueError(f"{len(below)} rows below margin threshold {threshold}")
+    return {"violations": 0, "threshold": threshold}
 
-
-def check_no_future_dates(context: dict, col: str = "order_date") -> dict:
-    """Check that a date column contains no future dates."""
-    import pandas as pd
-    df = context["df"]
-    if col not in df.columns:
-        raise ValueError(f"Column '{col}' not found")
-    future = df[df[col] > pd.Timestamp.now()]
-    return {
-        "col": col,
-        "future_date_count": len(future),
-        "has_future_dates": len(future) > 0,
-    }
-```
-
-```python
-# main.py — register them before loading config
-
-from checks.my_checks import check_margin, check_no_future_dates
-from validation_pipeline import check_registry
-from validation_pipeline.checks.registry_helpers import register_custom_check
 
 register_custom_check("margin_check", check_margin, check_registry)
-register_custom_check("future_date_check", check_no_future_dates, check_registry)
 ```
 
-```yaml
-# reports_config.yaml — use them like any built-in
+Call `register_custom_check` **before** `load_config` / `register_from_config`
+so the config loader can find the function by name.
 
+Once registered, reference it in `reports_config.yaml` like any built-in:
+
+```yaml
+checks:
+  - name: margin_check
+    params:
+      col: "margin"
+      threshold: 0.15
+```
+
+Or define it as a template:
+
+```yaml
 templates:
-  low_margin_check:
+  margin_threshold_check:
     name: margin_check
     params:
       col: "margin"
       threshold: 0.15
-
-reports:
-  - name: "sales_validation"
-    source:
-      type: duckdb
-      path: "${PIPELINE_DB_PATH}"
-      table: "sales"
-      timestamp_col: "updated_at"
-    checks:
-      - template: low_margin_check
-      - name: future_date_check
-        params:
-          col: "order_date"
 ```
 
 ---
 
-## Raising errors vs returning violations
+## Option 2 — Inline check in config (no code needed)
 
-A check should **raise** an exception only for unexpected failures (missing
-column, wrong type). For expected validation failures, **return them in the
-result dict** — the runner catches exceptions and marks the check as `failed`,
-whereas a result with `violations > 0` is still a `passed` check status that
-your reporting layer can act on separately.
+If the built-ins already cover your case, just add an inline check directly
+to the report in `reports_config.yaml`:
 
-```python
-def check_range(context, col, min_val, max_val):
-    df = context["df"]
-    if col not in df.columns:
-        raise ValueError(f"Column '{col}' not found")   # unexpected — raise
-    violations = df[~df[col].between(min_val, max_val)]
-    return {"violations": len(violations)}               # expected — return
+```yaml
+reports:
+  - name: "my_report"
+    source:
+      table: "sales"
+      timestamp_col: "updated_at"
+      ...
+    checks:
+      - name: range_check
+        params:
+          col: "discount"
+          min_val: 0
+          max_val: 1
 ```
+
+No code changes, no reinstall. The pipeline picks it up on the next run.
+
+---
+
+## Built-in checks reference
+
+| Name               | Params                                          | Raises when...                              |
+|--------------------|-------------------------------------------------|---------------------------------------------|
+| `null_check`       | none                                            | never (informational only)                  |
+| `range_check`      | `col`, `min_val`, `max_val`                     | column not found                            |
+| `schema_check`     | `expected_cols` (list)                          | never (informational only)                  |
+| `duplicate_check`  | `subset` (optional list)                        | never (informational only)                  |
+
+> Note: the built-ins return results but most don't raise. If you want
+> validation failures to be surfaced as errors, write a custom check
+> that raises on bad data.
+
+---
+
+## Seeing registered checks
+
+```bash
+vp checks
+```
+
+This lists all built-ins. Custom checks registered in code will also appear
+here after registration.
+
+---
+
+## Tips
+
+- Keep check functions pure — read `context["df"]`, return a dict, raise on
+  failure. Don't write to disk or mutate shared state inside a check.
+- Checks run per-report, not per-row. The DataFrame passed in is the full
+  slice of new rows for that report (watermark-filtered).
+- If `parallel: true` is set on the report, checks run in threads.
+  Make sure your check function is thread-safe (no shared mutable state).

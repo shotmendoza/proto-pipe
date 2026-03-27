@@ -551,28 +551,39 @@ def pull_report(
     report_dataframes = {}
     for report_cfg in deliverable["reports"]:
         report_name = report_cfg["name"]
+        sql_file = report_cfg.get("sql_file")
 
-        # Find the source table for this report from reports_config
-        rep_config = load_config(_p("reports_config"))
-        report_defs = {r["name"]: r for r in rep_config.get("reports", [])}
+        if sql_file:
+            # sql_file path — execute SQL directly, skip filter system entirely
+            try:
+                df = query_table(conn, table=None, sql_file=sql_file)
+                report_dataframes[report_name] = df
+                click.echo(f"  [query] {report_name} → {len(df)} rows (sql_file)")
+            except Exception as e:
+                click.echo(f"  [error] Could not execute sql_file for '{report_name}': {e}")
+        else:
+            # Filter path — look up source table from reports_config
+            # Find the source table for this report from reports_config
+            rep_config = load_config(_p("reports_config"))
+            report_defs = {r["name"]: r for r in rep_config.get("reports", [])}
 
-        if report_name not in report_defs:
-            click.echo(
-                f"[warn] Report '{report_name}' not found in reports_config.yaml, skipping"
-            )
-            continue
+            if report_name not in report_defs:
+                click.echo(
+                    f"[warn] Report '{report_name}' not found in reports_config.yaml, skipping"
+                )
+                continue
 
-        table = report_defs[report_name]["source"]["table"]
-        filters = report_cfg.get("filters", {})
+            table = report_defs[report_name]["source"]["table"]
+            filters = report_cfg.get("filters", {})
 
-        try:
-            df = query_table(
-                conn, table, filters=filters, cli_overrides=cli_date_filter
-            )
-            report_dataframes[report_name] = df
-            click.echo(f"[query] {report_name} → {len(df)} rows")
-        except Exception as e:
-            click.echo(f"[error] Could not query '{table}': {e}")
+            try:
+                df = query_table(
+                    conn, table, filters=filters, cli_overrides=cli_date_filter
+                )
+                report_dataframes[report_name] = df
+                click.echo(f"[query] {report_name} → {len(df)} rows")
+            except Exception as e:
+                click.echo(f"[error] Could not query '{table}': {e}")
 
     conn.close()
 
@@ -670,12 +681,22 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
 
         for report_cfg in d["reports"]:
             rname = report_cfg["name"]
-            rdefs = {r["name"]: r for r in rep_config.get("reports", [])}
-            if rname not in rdefs:
-                continue
-            table = rdefs[rname]["source"]["table"]
-            df = query_table(conn, table, filters=report_cfg.get("filters", {}))
-            report_dataframes[rname] = df
+            sql_file = report_cfg.get("sql_file")
+
+            if sql_file:
+                try:
+                    df = query_table(conn, sql_file=sql_file)
+                    report_dataframes[rname] = df
+                    click.echo(f"  [query] {rname} → {len(df)} rows (sql_file)")
+                except Exception as e:
+                    click.echo(f"  [error] sql_file failed for '{rname}': {e}")
+            else:
+                rdefs = {r["name"]: r for r in rep_config.get("reports", [])}
+                if rname not in rdefs:
+                    continue
+                table = rdefs[rname]["source"]["table"]
+                df = query_table(conn, table, filters=report_cfg.get("filters", {}))
+                report_dataframes[rname] = df
 
         conn.close()
         run_deliverable(d, report_dataframes, out_dir, p_db)
