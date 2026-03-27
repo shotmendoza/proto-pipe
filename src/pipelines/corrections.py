@@ -11,8 +11,9 @@ The primary key is defined per source in sources_config.yaml under `primary_key`
 It can be overridden at the CLI with --key.
 """
 
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
+
 import duckdb
 import pandas as pd  # type: ignore
 
@@ -72,6 +73,14 @@ def export_flagged(
     merged.to_csv(output_path, index=False)
 
     return len(merged)
+
+
+def dated_export_path(output_dir: str, table_name: str) -> str:
+    """Build the default export filename including today's date.
+    Format: flagged_<table>_YYYY-MM-DD.csv
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return str(Path(output_dir) / f"flagged_{table_name}_{today}.csv")
 
 
 # ---------------------------------------------------------------------------

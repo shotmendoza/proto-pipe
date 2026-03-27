@@ -1,3 +1,16 @@
+# sources_config.yaml
+#
+# on_duplicate controls what happens when a new file contains a row whose
+# primary key already exists in the table:
+#
+#   flag — (default) compute a row hash; if content differs, flag the conflict
+#             in flagged_rows and skip the incoming row until resolved
+#   append — insert the new row regardless (allows duplicates)
+#   upsert — replace the existing row with the incoming row
+#   skip — keep the existing row, silently discard the incoming row
+#
+# on_duplicate requires primary_key to be defined. If primary_key is absent,
+# on_duplicate is ignored and all rows are appended.
 
 sources:
   - name: "sales"
@@ -9,6 +22,7 @@ sources:
     target_table: "sales"
     timestamp_col: "updated_at"
     primary_key: "order_id"
+    on_duplicate: "flag"          # flag conflicts for manual review
 
   - name: "inventory"
     patterns:
@@ -18,6 +32,7 @@ sources:
     target_table: "inventory"
     timestamp_col: "updated_at"
     primary_key: "sku"
+    on_duplicate: "upsert"        # always take the latest inventory snapshot
 
   - name: "customers"
     patterns:
@@ -27,3 +42,4 @@ sources:
     target_table: "customers"
     timestamp_col: "updated_at"
     primary_key: "customer_id"
+    on_duplicate: "flag"          # flag changes for review

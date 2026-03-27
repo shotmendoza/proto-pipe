@@ -1,253 +1,244 @@
 # Reviewing Flagged Rows
 
-When validation runs, rows that fail a check are written to the `flagged_rows`
-table in `pipeline.db`. This guide explains how to find them, understand what
-went wrong, decide what to do, and apply corrections.
+When validation runs or a new file is ingested, rows that fail a check or
+conflict with existing data are written to the `flagged_rows` table.
+This guide explains how to find them, understand what went wrong, decide
+what to do, and apply corrections.
 
-***
+---
 
 ## Where flagged rows come from
 
-Each time you run `vp validate` or `vp run-all`, the pipeline runs your
-defined checks against newly ingested data. If a check raises an error for
-specific rows, those rows are recorded in `flagged_rows` with the reason.
+Rows get flagged from two places:
 
-Common reasons rows get flagged:
-- A price or quantity value is outside the expected range
-- A required column contains nulls
-- A duplicate row was detected
-- A value doesn't match expected categories
+**During validation** (`vp validate` or `vp run-all`) — checks defined in
+`reports_config.yaml` run against ingested data. If a check raises, the
+offending rows are written to `flagged_rows` with the check name and reason.
 
-***
+**During ingest** (`vp ingest`) — when `on_duplicate: flag` is set on a
+source in `sources_config.yaml`, the pipeline computes a checksum for each
+incoming row and compares it to the existing row with the same primary key.
+If the content differs, the incoming row is flagged and skipped — the original
+row stays in the table until you resolve the conflict.
 
-## Checking if you have flagged rows
+---
 
-After running validation, the CLI tells you directly:
+## Quick health check
 
-```
-⚠ 14 flagged row(s) require review before producing deliverables.
-  Use: vp export-flagged --table <n>  to export them for correction.
-  Re-run with --ignore-flagged to produce deliverables anyway.
+```bash
+vp flagged-summary
 ```
 
-You can also query the table directly in any SQL tool connected to
-`data/pipeline.db`:
+This shows a count of open flags by table, check, and reason:
 
-```sql
-SELECT count(*) FROM flagged_rows;
+```
+  14 flagged row(s) across 2 table(s):
+
+  sales
+       9  [duplicate_conflict]  row content changed: price, region
+       3  [price_range_check]   price out of range (min: 0, max: 500)
+  inventory
+       2  [null_check]          null values in required columns
 ```
 
-***
+Run this after every ingest or validate to know immediately whether anything
+needs attention before producing deliverables.
 
-## Understanding the flagged_rows table
+---
 
-```sql
-SELECT * FROM flagged_rows ORDER BY flagged_at DESC;
+## Viewing flagged rows in the terminal
+
+```bash
+vp flagged-list --table sales
 ```
 
-| Column | What it means |
-|---|---|
-| `id` | Unique ID for this flag entry |
-| `table_name` | Which source table the row came from (e.g. `sales`) |
-| `row_index` | The row's position in the table at the time it was flagged |
-| `check_name` | Which check caught it (e.g. `price_range_check`) |
-| `reason` | The error message from the check — tells you exactly what was wrong |
-| `flagged_at` | When the row was flagged |
+Prints each flagged row inline with its source data and flag reason:
 
-To see flagged rows for a specific table:
+```
+  12 flagged row(s) for 'sales' (showing 50):
 
-```sql
-SELECT * FROM flagged_rows WHERE table_name = 'sales';
+  ── [duplicate_conflict] row content changed: price, region
+     flagged: 2026-03-26 09:14:22+00:00
+     order_id: ORD-042
+     price: -50.0
+     region: EMEA
+     ...
 ```
 
-To see a breakdown by check:
+Filter by a specific check:
 
-```sql
-SELECT check_name, count(*) AS flagged_count
-FROM flagged_rows
-GROUP BY check_name
-ORDER BY flagged_count DESC;
+```bash
+vp flagged-list --table sales --check duplicate_conflict
+vp flagged-list --table sales --check price_range_check
 ```
 
-***
+Limit how many rows are shown (default 50):
+
+```bash
+vp flagged-list --table sales --limit 20
+```
+
+---
 
 ## Deciding what to do
 
-You have three options depending on what you find:
-
 **Option A — The data is wrong and needs to be corrected.**
-The source file contained bad values — a negative price, a missing field, a
-typo. You need to fix the values and write them back. Use the correction
-workflow below.
+Export the flagged rows, fix the values, and import them back.
+See the correction workflow below.
 
 **Option B — The check is too strict.**
-The data is actually fine but your check parameters are wrong — for example,
-the price range was set too narrow and valid prices are being flagged. In this
-case, update the check params in `reports_config.yaml` and re-run validation.
-The flags will no longer appear for those rows.
+The data is actually fine but the check params are wrong — for example, the
+price range was set too narrow. Update the check in `reports_config.yaml`
+and re-run. The flags won't reappear for those rows.
 
-**Option C — The data is known to be imperfect and you want to proceed anyway.**
-You're aware of the issues and need the deliverable regardless. Run:
+**Option C — The conflict is known and acceptable.**
+You've reviewed the flags and want to proceed without correcting. Clear them:
 
 ```bash
-vp run-all --deliverable <name> --ignore-flagged
+vp flagged-clear --table sales
+vp flagged-clear --table sales --check duplicate_conflict   # clear one check only
 ```
 
-This produces the deliverable without clearing the flags — the rows remain
-in `flagged_rows` for the record.
+This asks for confirmation before clearing. Pass `--yes` to skip the prompt:
 
-***
+```bash
+vp flagged-clear --table sales --yes
+```
+
+**Option D — Proceed anyway.**
+Produce the deliverable regardless of open flags:
+
+```bash
+vp run-all --deliverable monthly_pack --ignore-flagged
+```
+
+Flags remain in `flagged_rows` — they are not cleared by `--ignore-flagged`.
+
+---
+
+## Duplicate conflict flags
+
+When `on_duplicate: flag` is set in `sources_config.yaml`, the pipeline
+detects when a new file contains a row whose primary key already exists but
+whose content has changed. The incoming row is skipped and a flag is written
+with the names of the columns that changed:
+
+```
+[duplicate_conflict]  row content changed: price, region
+```
+
+This means a row with the same `order_id` arrived with different `price`
+and `region` values. The original row is preserved. You decide which version
+is correct via the correction workflow.
+
+To re-check an existing table for conflicts without waiting for a new file:
+
+```bash
+vp check-null-overwrites --table sales
+```
+
+---
 
 ## Correcting flagged rows
 
-### Step 1 — Export the flagged rows to CSV
+### Step 1 — Export to CSV
 
 ```bash
 vp export-flagged --table sales
 ```
 
-This writes a CSV to your `output_dir` (default: `output/reports/`) named
-`flagged_sales.csv`. To choose a different location:
+Writes to `output/reports/flagged_sales_YYYY-MM-DD.csv`. To choose a path:
 
 ```bash
-vp export-flagged --table sales --output /tmp/sales_corrections.csv
+vp export-flagged --table sales --output /tmp/sales_fixes.csv
 ```
 
-The file contains all columns from the source table plus two annotation
-columns at the front:
+The file contains all source columns plus two annotation columns at the front:
 
 | Column | Purpose |
 |---|---|
-| `_flag_id` | Internal ID — **do not delete this column** |
-| `_flag_reason` | Why the row was flagged — read-only, for your reference |
-
-Example export:
-
-```
-_flag_id, _flag_reason,          order_id, price,  region, order_date
-abc-123,  price out of range,    ORD-042,  -50.0,  EMEA,   2026-01-15
-def-456,  null value in price,   ORD-089,  ,       APAC,   2026-02-20
-```
+| `_flag_id` | Internal ID — **do not delete or edit this column** |
+| `_flag_reason` | Why the row was flagged — for reference only |
 
 ### Step 2 — Fix the values
 
-Open the CSV in Excel, Google Sheets, or any editor. Fix the values in the
-data columns. Leave `_flag_id` and `_flag_reason` exactly as they are — they
-are used to match your corrections back to the right rows.
-
-```
-_flag_id, _flag_reason,          order_id, price,  region, order_date
-abc-123,  price out of range,    ORD-042,  50.0,   EMEA,   2026-01-15
-def-456,  null value in price,   ORD-089,  120.0,  APAC,   2026-02-20
-```
-
-Only edit the columns that are wrong. You don't need to fill in every column —
-the pipeline only updates columns that are present in your file.
+Open the CSV, edit the data columns that are wrong, and save. Leave
+`_flag_id` and `_flag_reason` exactly as they are.
 
 ### Step 3 — Import the corrections
 
 ```bash
-vp import-corrections output/reports/flagged_sales.csv --table sales
+vp import-corrections output/reports/flagged_sales_2026-03-26.csv --table sales
 ```
 
-The pipeline will:
-1. Match each row to the source table by the primary key defined in
-   `sources_config.yaml` (e.g. `order_id`)
-2. Update only the columns you changed
-3. Remove the corrected entries from `flagged_rows`
-
-You'll see confirmation:
+The pipeline updates the matching rows by primary key and clears the
+resolved flags:
 
 ```
   [ok] 2 row(s) updated in 'sales'
   [ok] 2 flag(s) cleared from flagged_rows
 ```
 
-### Overriding the primary key
-
-If your source doesn't have a `primary_key` defined in `sources_config.yaml`,
-you can specify it directly:
+Override the primary key if it's not defined in `sources_config.yaml`:
 
 ```bash
 vp import-corrections flagged_sales.csv --table sales --key order_id
 ```
 
-***
+---
 
 ## After correcting
 
-Once corrections are imported, re-run validation to confirm the fixed rows
-now pass:
+Re-run validation to confirm the fixed rows now pass:
 
 ```bash
 vp validate
 ```
 
-If `flagged_rows` is empty, you're clear to produce the deliverable:
+Then check the summary is clear:
+
+```bash
+vp flagged-summary
+```
+
+If all clear, produce the deliverable:
 
 ```bash
 vp pull-report monthly_pack
 ```
 
-Or run everything together:
-
-```bash
-vp run-all --deliverable monthly_pack
-```
-
-***
-
-## Checking correction history
-
-Every time you run `import-corrections`, the rows are updated directly in
-the source table. You can verify the current state of any row by querying
-the table directly:
-
-```sql
-SELECT * FROM sales WHERE order_id = 'ORD-042';
-```
-
-To see how many flags are still open vs resolved:
-
-```sql
--- Currently open flags
-SELECT table_name, check_name, count(*) AS open_flags
-FROM flagged_rows
-GROUP BY table_name, check_name;
-
--- All rows delivered, with row counts and timestamps
-SELECT deliverable_name, report_name, row_count, created_at
-FROM report_runs
-ORDER BY created_at DESC;
-```
-
-***
+---
 
 ## Common scenarios
 
-**"I exported the flagged rows but some look fine to me."**
-The check may be misconfigured. Check the `reason` column to understand
-what the check expected vs what it found. If the data is correct, update
-the check parameters in `reports_config.yaml`.
+**"The same row keeps getting flagged after every ingest."**
+The source system is consistently sending a different value for that row.
+Decide which version is correct, apply the correction once, then consider
+switching `on_duplicate` to `upsert` for that source if you always want the
+latest value to win.
 
-**"I corrected the rows but they got flagged again on the next run."**
-The source file was re-ingested with the original bad values. Since the
-pipeline skips already-ingested files by filename, this usually means a new
-file arrived with the same bad data. Fix it at the source if possible, or
-apply corrections again after each ingest.
-
-**"I don't have a primary key column in my data."**
-Without a primary key, the pipeline can't match corrected rows back to the
-right records. If your data doesn't have a natural unique identifier, raise
-this with whoever provides the source files — or add a synthetic key during
-ingestion as a custom check.
+**"I corrected the rows but they got flagged again."**
+A new file arrived with the original bad values. This means the problem is
+in the source system. Fix it at the source if possible, or apply corrections
+again. If you always expect certain fields to change, switch those sources to
+`on_duplicate: upsert`.
 
 **"I want to clear all flags without correcting anything."**
-This should be rare, but if needed you can do it directly in DuckDB:
 
-```sql
-DELETE FROM flagged_rows WHERE table_name = 'sales';
+```bash
+vp flagged-clear --table sales --yes
 ```
 
-Only do this if you're certain the flagged rows don't need correction —
-this action cannot be undone.
+**"I don't have a primary key column in my data."**
+Without a primary key, conflict detection and the correction workflow are
+not available. Raise this with whoever provides the source files, or define
+a synthetic key and add it during ingestion.
+
+**"How do I see what on_duplicate is set to for a table?"**
+
+```bash
+vp config show
+```
+
+Or open `config/sources_config.yaml` directly. The `on_duplicate` field
+is defined per source.

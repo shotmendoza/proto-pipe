@@ -9,15 +9,16 @@ Run with:
 """
 
 import uuid
-import pytest
-import duckdb
-import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.reports.views import create_views, refresh_views, load_views_config, _load_sql
-from src.reports.corrections import export_flagged, import_corrections
+import duckdb
+import pandas as pd
+import pytest
+
 from src.io.ingest import _already_ingested, _init_ingest_log, _log_ingest
+from src.pipelines.corrections import export_flagged, import_corrections
+from src.reports.views import create_views, refresh_views, load_views_config, _load_sql
 
 
 # ---------------------------------------------------------------------------

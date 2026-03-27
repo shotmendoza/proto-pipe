@@ -14,6 +14,7 @@ Usage:
 """
 
 from pathlib import Path
+
 import duckdb
 import yaml  # type: ignore
 
