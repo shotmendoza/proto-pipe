@@ -27,8 +27,7 @@ _DEFAULTS = {
 
 
 def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
-    """
-    Load application settings from a YAML file and merge them with default settings.
+    """Load application settings from a YAML file and merge them with default settings.
 
     This function reads a settings file specified by its path and updates the default
     settings with the loaded values. If the file does not exist, it returns the default

@@ -213,7 +213,6 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
         CREATE TABLE IF NOT EXISTS flagged_rows (
             id           VARCHAR PRIMARY KEY,
             table_name   VARCHAR NOT NULL,
-            row_index    INTEGER,
             check_name   VARCHAR,
             reason       VARCHAR,
             flagged_at   TIMESTAMPTZ NOT NULL
@@ -229,9 +228,9 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
         try:
             create_views(conn, views, replace=False, skip_missing_tables=True)
         except Exception as e:
-            click.echo(f"  [error] Could not create views: {e}")
+            click.echo(f"[error] Could not create views: {e}")
     else:
-        click.echo(f"  [skip] No views defined in {v_cfg}")
+        click.echo(f"[skip] No views defined in {v_cfg}")
 
     conn.close()
 
@@ -257,7 +256,7 @@ def config_show():
     settings = _settings()
     click.echo(f"\nSettings from: {DEFAULT_SETTINGS_PATH}\n")
     for key, val in settings["paths"].items():
-        click.echo(f"  {key:<25} {val}")
+        click.echo(f"{key:<25} {val}")
 
 
 @config.command("set")
@@ -281,10 +280,10 @@ def config_set(
     """
     try:
         set_path(key, value)
-        click.echo(f"  [ok] {key} = {value}")
+        click.echo(f"[ok] {key} = {value}")
     except ValueError as e:
-        click.echo(f"  [error] {e}")
-        click.echo(f"  Valid keys: {', '.join(VALID_PATH_KEYS)}")
+        click.echo(f"[error] {e}")
+        click.echo(f"Valid keys: {', '.join(VALID_PATH_KEYS)}")
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +897,7 @@ def export_flagged(table, output, pipeline_db):
 
     conn = duckdb.connect(p_db)
     try:
-        count = _export(conn, table, output_path, primary_key=pk)
+        count = _export(conn, table, output_path)
         click.echo(f"[ok] {count} flagged row(s) exported to: {output_path}")
         click.echo(f"\nFix the values, then run:")
         click.echo(f"vp import-corrections {output_path} --table {table}")
@@ -1399,58 +1398,5 @@ def flagged_list(table, check, limit, pipeline_db):
                 f"  ... {total - limit} more row(s) not shown. "
                 f"Use --limit or vp export-flagged to see all."
             )
-    finally:
-        conn.close()
-
-
-@click.command("flagged-clear")
-@click.option("--table", required=True)
-@click.option("--check", default=None)
-@click.option("--yes", is_flag=True, default=False)
-@click.option("--pipeline-db", default=None)
-def flagged_clear(table, check, yes, pipeline_db):
-    """
-    Clear all flagged rows for a table without applying corrections.
-
-    \b
-    Examples:
-      vp flagged-clear --table sales
-      vp flagged-clear --table sales --check duplicate_conflict
-      vp flagged-clear --table sales --yes
-    """
-    import duckdb
-
-    p_db = _p("pipeline_db", pipeline_db)
-    conn = duckdb.connect(p_db)
-    try:
-        query = "SELECT count(*) FROM flagged_rows WHERE table_name = ?"
-        params = [table]
-        if check:
-            query += " AND check_name = ?"
-            params.append(check)
-
-        count = conn.execute(query, params).fetchone()[0]
-        if count == 0:
-            click.echo(f"  No flagged rows to clear for '{table}'.")
-            return
-
-        scope = f"check '{check}'" if check else "all checks"
-        if not yes:
-            click.confirm(
-                f"  Clear {count} flagged row(s) for '{table}' ({scope})? "
-                f"This cannot be undone.",
-                abort=True,
-            )
-
-        del_q = "DELETE FROM flagged_rows WHERE table_name = ?"
-        del_p = [table]
-        if check:
-            del_q += " AND check_name = ?"
-            del_p.append(check)
-
-        conn.execute(del_q, del_p)
-        click.echo(f"  [ok] {count} flag(s) cleared for '{table}' ({scope})")
-    except click.Abort:
-        click.echo("\n  Cancelled.")
     finally:
         conn.close()

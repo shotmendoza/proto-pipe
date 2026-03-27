@@ -12,21 +12,23 @@ File deduplication:
 - Files already logged as 'ok' in ingest_log are skipped automatically.
 - Files that previously failed are retried on every run until they succeed.
 
-Duplicate row handling (on_duplicate in sources_config.yaml):
-- flag
-    — (default when primary_key defined) compute md5 row hash; if hash
-        differs from existing row, flag the conflict in flagged_rows with
-        the changed column names in the reason, and skip the incoming row
-- append
-    — insert all rows regardless of duplicates
-- upsert
-    — delete existing rows by primary key, then insert incoming rows
-- skip
-    — silently discard rows whose primary key already exists
+Flag identity:
+- flagged_rows.id = md5(str(pk_value))
+- Deterministic: same row always gets the same id.
+- ON CONFLICT (id) DO NOTHING makes re-flagging idempotent.
+- At export time, the join is:
+      flagged_rows.id = md5(CAST(source.pk_col AS VARCHAR))
+  computed entirely in DuckDB SQL — no extra columns in source tables.
+- Validation check flags (no pk_value) fall back to uuid4.
 
-Each ingest run logs results (including failures) to the `ingest_log` table
-so failures are visible without stopping the entire run.
+Duplicate row handling (on_duplicate in sources_config.yaml):
+- flag   — (default when primary_key defined) compute md5 row hash; if hash
+            differs from existing row, flag the conflict and skip the row
+- append — insert all rows regardless of duplicates
+- upsert — delete existing rows by primary key, then insert incoming rows
+- skip   — silently discard rows whose primary key already exists
 """
+
 import hashlib
 import json
 import uuid
@@ -40,82 +42,47 @@ import pandas as pd  # type: ignore
 
 
 # ---------------------------------------------------------------------------
-# Structural checks — lightweight, run per file before loading
+# Constants
 # ---------------------------------------------------------------------------
 _SUPPORTED_FILE_SUFFIXES = {".csv", ".xlsx", ".xls"}
-"""GLOBAL: Supported file suffixes for ingestion"""
-
-_MAX_DIFF_COLS = 5  # cap reason string to avoid wall-of-text in flagged_rows
-"""GLOBAL: Maximum number of columns to include in the flaggin reason"""
+_MAX_DIFF_COLS = 5
 
 # Number of primary keys processed per SQL IN (...) clause.
 CHUNK_SIZE = 1000
-"""GLOBAL: Maximum number of rows to process in a single SQL IN (...) clause"""
 
 
 # ---------------------------------------------------------------------------
 # Flag identity
 # ---------------------------------------------------------------------------
-def flag_id_for(
-        pk_value: str | int | float | None,
-) -> str:
+
+def flag_id_for(pk_value) -> str:
     """Return the deterministic flag id for a given primary key value.
 
     id = md5(str(pk_value))
 
     Using md5 means the same expression is computable in DuckDB SQL:
         md5(CAST(source.pk_col AS VARCHAR))
-
-    If pk_value is null, then will return a UUID4 with a string wrap.
+    allowing export_flagged to join without any extra stored columns.
     """
-    if pk_value is None:
-        return str(uuid.uuid4())
     return hashlib.md5(str(pk_value).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
 # Structural checks
 # ---------------------------------------------------------------------------
+
 def _is_supported_file(path: Path) -> bool:
-    """Checks if the given file has a supported file extension.
-
-    This function evaluates whether the file specified by the given path has a
-    suffix that matches any of the supported file suffixes.
-
-    :param path: The file path to be checked.
-    :type path: Path
-    :return: True if the file's suffix is in the list of supported suffixes,
-        False otherwise.
-    :rtype: bool
-    """
     return path.suffix.lower() in _SUPPORTED_FILE_SUFFIXES
 
 
 def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
-    """Perform structural integrity checks on the provided DataFrame based on the source metadata.
-
-    This function evaluates the DataFrame to ensure it is not empty and verifies the
-    existence of a required timestamp column if specified in the given source dictionary.
-
-    :param df: The input DataFrame subject to validation.
-    :type df: pandas.DataFrame
-    :param source: A dictionary containing metadata configuration, where the key
-        "timestamp_col" defines the expected name of the timestamp column.
-    :type source: dict
-
-    :return: A list of string messages describing any structural issues found
-        in the DataFrame. The list will be empty if no issues are detected.
-    :rtype: list[str]
-    """
+    """Return a list of structural issues; empty means safe to ingest."""
     issues: list[str] = []
-
     if df.empty:
         issues.append("File is empty")
-
     timestamp_col = source.get("timestamp_col")
     if timestamp_col and timestamp_col not in df.columns:
         issues.append(f"Missing required timestamp column '{timestamp_col}'")
-
     return issues
 
 
@@ -124,34 +91,14 @@ def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
-    """Initializes the ingest log table in the provided DuckDB connection.
-
-    This table is used for logging details about data ingestion activities,
-    such as the status, number of rows processed, and additional columns added during the
-    process.
-
-    The ingest log table includes the following columns:
-        - id: Primary key for identifying each log entry.
-        - filename: The name of the file being ingested.
-        - table_name: Name of the destination table, if applicable.
-        - status: Status of the ingestion (e.g., 'ok', 'failed', 'skipped').
-        - rows: Number of rows processed during the ingestion.
-        - new_cols: JSON list of columns added during the ingestion.
-        - message: Additional information or error message for logging.
-        - ingested_at: Timestamp of when the ingestion occurred.
-
-    :param conn: The DuckDB connection where the ingest log table should be initialized.
-    :type conn: duckdb.DuckDBPyConnection
-    :return: None
-    """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ingest_log (
             id          VARCHAR PRIMARY KEY,
             filename    VARCHAR NOT NULL,
             table_name  VARCHAR,
-            status      VARCHAR NOT NULL,   -- 'ok' | 'failed' | 'skipped'
+            status      VARCHAR NOT NULL,
             rows        INTEGER,
-            new_cols    VARCHAR,            -- JSON list of added columns
+            new_cols    VARCHAR,
             message     VARCHAR,
             ingested_at TIMESTAMPTZ NOT NULL
         )
@@ -167,23 +114,6 @@ def _log_ingest(
         new_cols: list[str] | None = None,
         message: str | None = None
 ) -> None:
-    """Logs a single ingestion detail into the ingestion_log database.
-
-    This function inserts information about a data ingestion process into
-    an `ingest_log` database table. It keeps a record of filenames,
-    table names, statuses, row counts, new columns, and optional messages
-    related to the ingestion. Every log entry is timestamped with the
-    current UTC time.
-
-    :param conn: A database connection object used to execute the SQL insert statement.
-    :param filename: The name of the file being ingested.
-    :param table_name: The name of the database table associated with the ingestion.
-    :param status: The status of the ingestion operation.
-    :param rows: The count of rows ingested. Optional.
-    :param new_cols: A list of new columns added during ingestion. Optional.
-    :param message: An additional message or comment about the ingestion process. Optional.
-    :return: None
-    """
     conn.execute("""
         INSERT INTO ingest_log
             (id, filename, table_name, status, rows, new_cols, message, ingested_at)
@@ -201,65 +131,39 @@ def _log_ingest(
 
 
 # ---------------------------------------------------------------------------
+# File deduplication
+# ---------------------------------------------------------------------------
+
+def _already_ingested(conn: duckdb.DuckDBPyConnection, filename: str) -> bool:
+    """Return True if this filename was already successfully ingested."""
+    result = conn.execute("""
+        SELECT count(*) FROM ingest_log
+        WHERE filename = ? AND status = 'ok'
+    """, [filename]).fetchone()
+    return result[0] > 0  # type: ignore
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def resolve_source(
-        filename: str,
-        sources: list[dict]
-) -> dict | None:
-    """Return the first source whose patterns match the filename.
 
-    This function iterates through a list of source dictionaries and checks if the
-    provided filename matches any patterns specified in the sources. If a match is
-    found, it returns the matching source dictionary. If no matches are found,
-    it returns None. Pattern matching is performed using the `fnmatch` module.
-
-    :param filename: The name of the file to resolve against the source patterns.
-    :param sources: A list of dictionaries. Each dictionary should include a key "patterns", which contains a list of filename patterns.
-    :return: The first matching source dictionary if a match is found, otherwise None.
-    """
+def resolve_source(filename: str, sources: list[dict]) -> dict | None:
     for source in sources:
-        if any(fnmatch(filename, pattern) for pattern in source["patterns"]):
+        if any(fnmatch(filename, p) for p in source["patterns"]):
             return source
     return None
 
 
 def load_file(path: Path) -> pd.DataFrame:
-    """Load a CSV or Excel file into a DataFrame.
-
-    This function supports loading files in CSV or Excel formats. Depending on
-    the file extension, the appropriate pandas function will be used to load
-    the file. If the file extension is not supported, the function raises
-    a ValueError.
-
-    :param path: The path to the file to be loaded.
-    :type path: Path
-    :return: A pandas DataFrame containing the file data.
-    :rtype: pd.DataFrame
-    :raises ValueError: If the file type is unsupported (neither .csv, .xlsx, nor .xls).
-    """
     suffix = path.suffix.lower()
-
     if suffix == ".csv":
         return pd.read_csv(path)
-
     if suffix in {".xlsx", ".xls"}:
         return pd.read_excel(path)
-
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
-    """Checks if a table exists in the given database connection.
-
-    This function queries the `information_schema.tables` to determine whether the
-    specified table exists in the database connected through the DuckDB connection.
-
-    :param conn: The DuckDB connection object used to execute the query.
-    :param table: The name of the table to check for existence.
-    :return: Boolean value indicating whether the table exists in the database.
-    :rtype: bool
-    """
     result = conn.execute(
         "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
         [table],
@@ -268,17 +172,6 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
 
 
 def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
-    """Retrieve the existing column names of a specified table within a DuckDB database.
-
-    This function queries the information schema to gather a set of all column names
-    that exist in the specified table. The returned set can be used to verify, process,
-    or compare column structures within the database.
-
-    :param conn: The DuckDBPyConnection object used to interact with the DuckDB database.
-    :param table: The name of the table whose column names are to be retrieved.
-    :return: A set containing the names of columns in the specified table.
-    :rtype: set[str]
-    """
     rows = conn.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
         [table],
@@ -287,19 +180,7 @@ def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[st
 
 
 def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> list[str]:
-    """Automatically migrates the schema of an existing DuckDB table to align with the columns of a given
-    Pandas DataFrame. Any new columns in the DataFrame that are not present in the table will be added
-    to the table with an appropriate data type.
-
-    :param conn: DuckDB connection object.
-    :type conn: duckdb.DuckDBPyConnection
-    :param table: Name of the table to be migrated.
-    :type table: str
-    :param df: DataFrame containing the desired schema.
-    :type df: pd.DataFrame
-    :return: List of column names that were added to the table.
-    :rtype: list[str]
-    """
+    """Add columns present in df but missing from the table."""
     existing = _get_existing_columns(conn, table)
     new_cols = [col for col in df.columns if col not in existing]
 
@@ -327,21 +208,6 @@ def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame)
 # ---------------------------------------------------------------------------
 
 def init_db(db_path: str, sources: list[dict]) -> None:
-    """Initializes a database and ensures the presence of target tables specified in the sources.
-
-    This function creates the directory for the database file if it does not exist. It then establishes
-    a connection to the database, initializes the ingest log, and iterates over the provided list of
-    source definitions. For each source, if the target table does not already exist in the database,
-    the function creates it.
-
-    :param db_path: Path to the database file.
-    :type db_path: str
-    :param sources: A list of source definitions, each containing information about
-        the target table to be created in the database.
-    :type sources: list[dict]
-
-    :return: None
-    """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(db_path)
     _init_ingest_log(conn)
@@ -370,28 +236,23 @@ def ingest_directory(
     check_registry=None,
     report_registry=None,
 ) -> dict:
-    """Processes and ingests data files from a specified directory into a database, performing
-    optional structural checks, validation, and handling unmatched files. Each successfully
-    processed file's data is inserted or appended into the associated table specified in the
-    source definitions. Failed and unmatched files are appropriately logged.
+    """Scan a directory, match files to source definitions, load into DuckDB."""
+    directory_path = Path(directory)
+    if not directory_path.exists():
+        raise ValueError(
+            f"Incoming directory not found: '{directory}'\n"
+            f"Check the incoming_dir setting in pipeline.yaml or pass --incoming-dir."
+        )
+    if not directory_path.is_dir():
+        raise ValueError(f"incoming_dir '{directory}' exists but is not a directory.")
 
-    :param directory: The directory containing files to ingest.
-    :param sources: A list of source definitions mapping file patterns to target database tables.
-    :param db_path: Path to the DuckDB database file used for data storage and ingestion.
-    :param mode: The ingestion mode, either "append" to add records to existing tables or "replace" to overwrite them.
-    :param run_checks: A flag indicating whether to execute validation checks after ingestion.
-    :param check_registry: Registry of available checks to validate ingested data, if enabled.
-    :param report_registry: Registry used to log the results of executed checks, if enabled.
-    :return: A dictionary summarizing the results of the ingestion process for each file.
-    """
     conn = duckdb.connect(db_path)
     _init_ingest_log(conn)
 
     summary: dict[str, dict] = {}
     unmatched: list[str] = []
 
-    for path in sorted(Path(directory).iterdir()):
-        # skips if file is not supported
+    for path in sorted(directory_path.iterdir()):
         if not _is_supported_file(path):
             continue
 
@@ -405,7 +266,6 @@ def ingest_directory(
             summary[path.name] = {"status": "skipped", "message": "already ingested"}
             continue
 
-        # Load file
         try:
             df = load_file(path)
         except Exception as exc:
@@ -415,7 +275,6 @@ def ingest_directory(
             summary[path.name] = {"status": "failed", "message": message}
             continue
 
-        # Structural checks
         issues = _structural_checks(df, source)
         if issues:
             message = "; ".join(issues)
@@ -424,11 +283,10 @@ def ingest_directory(
             summary[path.name] = {"status": "failed", "message": message}
             continue
 
-        table = source["target_table"]
-        primary_key = source.get("primary_key")
+        table        = source["target_table"]
+        primary_key  = source.get("primary_key")
         on_duplicate = source.get("on_duplicate", "flag" if primary_key else "append")
 
-        # Load into DuckDB
         if mode == "replace" or not _table_exists(conn, table):
             conn.execute(f'DROP TABLE IF EXISTS "{table}"')
             conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
@@ -465,15 +323,10 @@ def ingest_directory(
 
         _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
         summary[path.name] = {
-            "table": table,
-            "rows": len(df),
-            "new_cols": new_cols,
-            "flagged": flagged_count,
-            "skipped": skipped_count,
-            "status": "ok"
+            "table": table, "rows": len(df), "new_cols": new_cols,
+            "flagged": flagged_count, "skipped": skipped_count, "status": "ok",
         }
 
-        # Optional validation checks
         if run_checks and check_registry and report_registry:
             _run_inline_checks(conn, table, source, check_registry, report_registry, path.name)
 
@@ -486,41 +339,15 @@ def ingest_directory(
     return summary
 
 
-def _run_inline_checks(
-        conn,
-        table,
-        source,
-        check_registry,
-        report_registry,
-        filename
-):
-    """Executes inline checks for a given table and source by leveraging the check
-    and report registries to find matching reports and checks to run for the table.
-
-    :param conn: The database connection object used to execute queries.
-    :type conn: Any
-    :param table: The name of the table to query and perform checks on.
-    :type table: str
-    :param source: The source identifier associated with the table.
-    :type source: Any
-    :param check_registry: The registry containing defined check logic to execute.
-    :type check_registry: Any
-    :param report_registry: The registry containing reports that define resolved checks.
-    :type report_registry: Any
-    :param filename: Unused parameter; might be reserved for future functionality.
-    :type filename: Any
-    :return: None
-    """
+def _run_inline_checks(conn, table, source, check_registry, report_registry, filename):
     matching = [
         r for r in report_registry.all()
         if r.get("source", {}).get("table") == table
     ]
     if not matching:
         return
-
-    df = conn.execute(f'SELECT * FROM "{table}"').df()
+    df      = conn.execute(f'SELECT * FROM "{table}"').df()
     context = {"df": df}
-
     for report in matching:
         for check_name in report.get("resolved_checks", []):
             try:
@@ -531,28 +358,11 @@ def _run_inline_checks(
 
 
 # ---------------------------------------------------------------------------
-# NEW — file deduplication
+# Duplicate row handling
 # ---------------------------------------------------------------------------
-def _already_ingested(
-        conn: duckdb.DuckDBPyConnection,
-        filename: str
-) -> bool:
-    """Return True if this filename was already successfully ingested.
-    Only 'ok' status counts — failed files are retried on every run.
-    """
-    result = conn.execute("""
-            SELECT count(*) FROM ingest_log
-            WHERE filename = ? AND status = 'ok'
-        """, [filename]).fetchone()
-    return result[0] > 0  # type: ignore
-
 
 def _row_hash_expr(cols: list[str]) -> str:
-    """
-    Build a DuckDB SQL expression that computes an md5 hash over all given
-    columns, coercing each to VARCHAR. Uses '|' as a separator so that
-    different column values can't accidentally produce the same string.
-    """
+    """DuckDB md5() expression over all given columns for content hashing."""
     parts = " || '|' || ".join(
         [f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in cols]
     )
@@ -563,7 +373,7 @@ def _write_flag(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     diffs: list[str],
-    pk_value: str | None = None,
+    pk_value=None,
 ) -> None:
     """Insert one conflict entry into flagged_rows.
 
@@ -572,27 +382,21 @@ def _write_flag(
 
     Falls back to uuid4 when pk_value is None (validation check flags).
     ON CONFLICT (id) DO NOTHING makes this idempotent.
-
-    diffs is a list of "col: old -> new" strings, capped at _MAX_DIFF_COLS.
-    Example: ["price: -50.0 -> 75.0", "region: EMEA -> APAC"]
     """
-    shown = diffs[:_MAX_DIFF_COLS]
+    shown    = diffs[:_MAX_DIFF_COLS]
     leftover = len(diffs) - len(shown)
-    reason = " | ".join(shown) + (f" +{leftover} more" if leftover else "")
-
-    flag_id = flag_id_for(pk_value=pk_value)
-
+    reason   = " | ".join(shown) + (f" +{leftover} more" if leftover else "")
+    fid      = (
+        flag_id_for(pk_value)
+        if pk_value is not None
+        else str(uuid.uuid4())
+    )
     conn.execute("""
         INSERT INTO flagged_rows
-            (id, table_name, row_index, check_name, reason, flagged_at)
-        VALUES (?, ?, NULL, ?, ?, ?)
-    """, [
-        flag_id,
-        table_name,
-        "duplicate_conflict",
-        reason,
-        datetime.now(timezone.utc),
-    ])
+            (id, table_name, check_name, reason, flagged_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO NOTHING
+    """, [fid, table_name, "duplicate_conflict", reason, datetime.now(timezone.utc)])
 
 
 def _changed_columns(
@@ -600,9 +404,7 @@ def _changed_columns(
     incoming_row: pd.Series,
     cols: list[str],
 ) -> list[str]:
-    """Return a list of "col: old -> new" diff strings for columns whose
-    values differ between the existing and incoming row.
-    """
+    """Return 'col: old -> new' diff strings for columns that changed."""
     diffs = []
     for col in cols:
         old_val = existing_row.get(col)
@@ -627,25 +429,19 @@ def _handle_duplicates(
     table: str,
     df: pd.DataFrame,
     primary_key: str,
-    on_duplicate: Literal["append", "upsert", "skip", "flag"] = "flag",
+    on_duplicate: str,
 ) -> tuple[pd.DataFrame, int, int]:
     """Process incoming rows against existing rows by primary key.
 
     Processes keys in chunks of CHUNK_SIZE to avoid large IN (...) clauses.
     Returns (rows_to_insert, flagged_count, skipped_count).
-
-    on_duplicate:
-        - append: insert everything, no conflict checking
-        - upsert: replace matching rows
-        - skip: ignore matching rows. Keeps old rows
-        - flag: compare row contents; identical rows are ignored, changed rows are recorded as conflicts
     """
     if on_duplicate == "append":
         return df, 0, 0
 
     if primary_key not in df.columns:
         print(
-            f"[warn] primary_key '{primary_key}' not in incoming columns "
+            f"  [warn] primary_key '{primary_key}' not in incoming columns "
             f"— appending all rows"
         )
         return df, 0, 0
@@ -657,29 +453,23 @@ def _handle_duplicates(
             f"'{primary_key}' — bypassing duplicate detection"
         )
 
-    valid_df = df[df[primary_key].notna()].copy()
+    valid_df  = df[df[primary_key].notna()].copy()
     null_rows = df[df[primary_key].isna()].copy()
 
     if valid_df.empty:
         return df, 0, 0
 
-    non_key_cols = [
-        column for column in valid_df.columns if column != primary_key
-    ]
-    hash_cols = [
-        column for column in non_key_cols if column in _get_existing_columns(conn, table)
-    ]
-    """Non-Key columns that are in existing tables"""
-
-    hash_expr = _row_hash_expr(hash_cols) if hash_cols else "md5('')"
+    non_key_cols = [c for c in valid_df.columns if c != primary_key]
+    hash_cols    = [c for c in non_key_cols if c in _get_existing_columns(conn, table)]
+    hash_expr    = _row_hash_expr(hash_cols) if hash_cols else "md5('')"
 
     all_rows_to_insert: list = []
     total_flagged = 0
     total_skipped = 0
 
     for chunk_start in range(0, len(valid_df), CHUNK_SIZE):
-        chunk = valid_df.iloc[chunk_start: chunk_start + CHUNK_SIZE]
-        chunk_keys = chunk[primary_key].tolist()
+        chunk        = valid_df.iloc[chunk_start: chunk_start + CHUNK_SIZE]
+        chunk_keys   = chunk[primary_key].tolist()
         placeholders = ", ".join(["?"] * len(chunk_keys))
 
         existing_df = conn.execute(
@@ -701,10 +491,10 @@ def _handle_duplicates(
 
         if on_duplicate == "skip":
             existing_keys = set(existing_df[primary_key].tolist())
-            keep = chunk[~chunk[primary_key].isin(existing_keys)]
-            skipped = len(df) - len(keep)
+            keep    = chunk[~chunk[primary_key].isin(existing_keys)]
+            skipped = len(chunk) - len(keep)
             if skipped:
-                print(f"[skip] {skipped} row(s) already exist — skipped")
+                print(f"  [skip] {skipped} row(s) already exist — skipped")
             all_rows_to_insert.extend(keep.itertuples(index=False, name=None))
             total_skipped += skipped
             continue
@@ -726,7 +516,6 @@ def _handle_duplicates(
                 .to_dict()
             )
 
-            # Hashes for incoming rows (df is already registered in DuckDB scope)
             incoming_hashes = (
                 conn.execute(
                     f'SELECT "{primary_key}", {hash_expr} AS row_hash FROM chunk '
@@ -765,10 +554,7 @@ def _handle_duplicates(
                 changed = (
                     _changed_columns(existing_row, incoming_row, hash_cols)
                     if existing_row is not None
-                    else [
-                        f"{c}: (unknown) -> {incoming_row.get(c)}"
-                        for c in hash_cols
-                    ]
+                    else [f"{c}: (unknown) -> {incoming_row.get(c)}" for c in hash_cols]
                 )
 
                 _write_flag(conn, table, changed, pk_value=key_val)
@@ -783,23 +569,21 @@ def _handle_duplicates(
         print(f"  [warn] Unknown on_duplicate '{on_duplicate}' — appending chunk")
         all_rows_to_insert.extend(chunk.itertuples(index=False, name=None))
 
-        if total_flagged:
-            print(f"  [flag] {total_flagged} conflict(s) flagged — original rows kept")
+    if total_flagged:
+        print(f"  [flag] {total_flagged} conflict(s) flagged — original rows kept")
 
-        result_parts = []
-        if all_rows_to_insert:
-            result_parts.append(
-                pd.DataFrame(all_rows_to_insert, columns=valid_df.columns)
-            )
-        if not null_rows.empty:
-            result_parts.append(null_rows)
+    result_parts = []
+    if all_rows_to_insert:
+        result_parts.append(pd.DataFrame(all_rows_to_insert, columns=valid_df.columns))
+    if not null_rows.empty:
+        result_parts.append(null_rows)
 
-        result = (
-            pd.concat(result_parts, ignore_index=True)
-            if result_parts
-            else pd.DataFrame(columns=df.columns)
-        )
-        return result, total_flagged, total_skipped
+    result = (
+        pd.concat(result_parts, ignore_index=True)
+        if result_parts
+        else pd.DataFrame(columns=df.columns)
+    )
+    return result, total_flagged, total_skipped
 
 
 def check_null_overwrites(
@@ -807,12 +591,10 @@ def check_null_overwrites(
     table: str,
     primary_key: str,
 ) -> int:
-    """
-    Manual re-check: scan the table for primary keys that appear more than
-    once with different row content, and flag any new conflicts not already
-    recorded in flagged_rows.
+    """Scan for primary keys with multiple rows of differing content and flag conflicts.
 
-    Returns the number of new conflicts flagged.
+    Idempotent — md5(pk_value) + ON CONFLICT DO NOTHING means running twice is safe.
+    Returns the number of INSERT attempts (includes skipped duplicates).
     """
     duplicate_keys = conn.execute(f"""
         SELECT "{primary_key}"
@@ -824,37 +606,32 @@ def check_null_overwrites(
     if duplicate_keys.empty:
         return 0
 
-    all_cols = conn.execute(
+    all_cols     = conn.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
         [table],
     ).df()["column_name"].tolist()
     non_key_cols = [c for c in all_cols if c != primary_key]
 
-    keys = duplicate_keys[primary_key].tolist()
-    placeholders = ", ".join(["?"] * len(keys))
-    rows = conn.execute(
-        f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
-        keys,
-    ).df()
-
+    keys    = duplicate_keys[primary_key].tolist()
     flagged = 0
-    for key_val, group in rows.groupby(primary_key):
-        if len(group) < 2:
-            continue
-        first = group.iloc[0]
-        for _, later in group.iloc[1:].iterrows():
-            changed = _changed_columns(first, later, non_key_cols)
-            if not changed:
+
+    for chunk_start in range(0, len(keys), CHUNK_SIZE):
+        chunk_keys   = keys[chunk_start: chunk_start + CHUNK_SIZE]
+        placeholders = ", ".join(["?"] * len(chunk_keys))
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
+            chunk_keys,
+        ).df()
+
+        for key_val, group in rows.groupby(primary_key):
+            if len(group) < 2:
                 continue
-            reason_fragment = changed[0] if changed else ""
-            already = conn.execute("""
-                SELECT count(*) FROM flagged_rows
-                WHERE table_name = ?
-                  AND check_name = 'duplicate_conflict'
-                  AND reason LIKE ?
-            """, [table, f"%{reason_fragment}%"]).fetchone()[0]
-            if already == 0:
-                _write_flag(conn, table, changed)
+            first = group.iloc[0]
+            for _, later in group.iloc[1:].iterrows():
+                changed = _changed_columns(first, later, non_key_cols)
+                if not changed:
+                    continue
+                _write_flag(conn, table, changed, pk_value=key_val)
                 flagged += 1
 
     return flagged
