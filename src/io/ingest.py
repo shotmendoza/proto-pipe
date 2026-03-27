@@ -27,8 +27,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
-    """
-    Perform structural integrity checks on the provided DataFrame based on the source metadata.
+    """Perform structural integrity checks on the provided DataFrame based on the source metadata.
 
     This function evaluates the DataFrame to ensure it is not empty and verifies the
     existence of a required timestamp column if specified in the given source dictionary.
@@ -57,8 +56,7 @@ def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
-    """
-    Initializes the ingest log table in the provided DuckDB connection. This table
+    """Initializes the ingest log table in the provided DuckDB connection. This table
     is used for logging details about data ingestion activities, such as the
     status, number of rows processed, and additional columns added during the
     process.
@@ -95,8 +93,7 @@ def _init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
 def _log_ingest(
     conn, filename, table_name, status, rows=None, new_cols=None, message=None
 ) -> None:
-    """
-    Logs ingestion details into the database.
+    """Logs ingestion details into the database.
 
     This function inserts information about a data ingestion process into
     an `ingest_log` database table. It keeps a record of filenames,
@@ -135,8 +132,7 @@ def _log_ingest(
 # ---------------------------------------------------------------------------
 
 def resolve_source(filename: str, sources: list[dict]) -> dict | None:
-    """
-    Determines and returns the matching source from a list of sources based on filename patterns.
+    """Determines and returns the matching source from a list of sources based on filename patterns.
 
     This function iterates through a list of source dictionaries and checks if the
     provided filename matches any patterns specified in the sources. If a match is
@@ -155,8 +151,7 @@ def resolve_source(filename: str, sources: list[dict]) -> dict | None:
 
 
 def _load_file(path: Path) -> pd.DataFrame:
-    """
-    Loads a file from the given path and returns its content as a DataFrame.
+    """Loads a file from the given path and returns its content as a DataFrame.
 
     This function supports loading files in CSV or Excel formats. Depending on
     the file extension, the appropriate pandas function will be used to load
@@ -178,8 +173,7 @@ def _load_file(path: Path) -> pd.DataFrame:
 
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
-    """
-    Checks if a table exists in the given database connection.
+    """Checks if a table exists in the given database connection.
 
     This function queries the `information_schema.tables` to determine whether the
     specified table exists in the database connected through the DuckDB connection.
@@ -197,8 +191,7 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
 
 
 def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
-    """
-    Retrieve the existing column names of a specified table within a DuckDB database.
+    """Retrieve the existing column names of a specified table within a DuckDB database.
 
     This function queries the information schema to gather a set of all column names
     that exist in the specified table. The returned set can be used to verify, process,
@@ -217,8 +210,7 @@ def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[st
 
 
 def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> list[str]:
-    """
-    Automatically migrates the schema of an existing DuckDB table to align with the columns of a given
+    """Automatically migrates the schema of an existing DuckDB table to align with the columns of a given
     Pandas DataFrame. Any new columns in the DataFrame that are not present in the table will be added
     to the table with an appropriate data type.
 
@@ -258,8 +250,7 @@ def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame)
 # ---------------------------------------------------------------------------
 
 def init_db(db_path: str, sources: list[dict]) -> None:
-    """
-    Initializes a database and ensures the presence of target tables specified in the sources.
+    """Initializes a database and ensures the presence of target tables specified in the sources.
 
     This function creates the directory for the database file if it does not exist. It then establishes
     a connection to the database, initializes the ingest log, and iterates over the provided list of
@@ -302,15 +293,13 @@ def ingest_directory(
     check_registry=None,
     report_registry=None,
 ) -> dict:
-    """
-    Processes and ingests data files from a specified directory into a database, performing
+    """Processes and ingests data files from a specified directory into a database, performing
     optional structural checks, validation, and handling unmatched files. Each successfully
     processed file's data is inserted or appended into the associated table specified in the
     source definitions. Failed and unmatched files are appropriately logged.
 
     :param directory: The directory containing files to ingest.
-    :param sources: A list of source definitions mapping file patterns to target database
-        tables.
+    :param sources: A list of source definitions mapping file patterns to target database tables.
     :param db_path: Path to the DuckDB database file used for data storage and ingestion.
     :param mode: The ingestion mode, either "append" to add records to existing tables or
         "replace" to overwrite them.
@@ -333,6 +322,12 @@ def ingest_directory(
             unmatched.append(path.name)
             continue
 
+        # NEW: skip files already successfully ingested
+        if _already_ingested(conn, path.name):
+            print(f"[skipped] '{path.name}' — already ingested")
+            summary[path.name] = {"status": "skipped", "message": "already ingested"}
+            continue
+
         # Load file
         try:
             df = _load_file(path)
@@ -347,7 +342,7 @@ def ingest_directory(
         issues = _structural_checks(df, source)
         if issues:
             msg = "; ".join(issues)
-            print(f"  [fail] '{path.name}': {msg}")
+            print(f"[fail] '{path.name}': {msg}")
             _log_ingest(conn, path.name, source["target_table"], "failed", message=msg)
             summary[path.name] = {"status": "failed", "message": msg}
             continue
@@ -359,11 +354,11 @@ def ingest_directory(
             conn.execute(f'DROP TABLE IF EXISTS "{table}"')
             conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
             new_cols = []
-            print(f"  [ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
+            print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
         else:
             new_cols = _auto_migrate(conn, table, df)
             conn.execute(f'INSERT INTO "{table}" SELECT * FROM df')
-            print(f"  [ok] '{path.name}' → '{table}' ({len(df)} rows appended)")
+            print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows appended)")
 
         _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
         summary[path.name] = {"table": table, "rows": len(df), "new_cols": new_cols, "status": "ok"}
@@ -373,7 +368,7 @@ def ingest_directory(
             _run_inline_checks(conn, table, source, check_registry, report_registry, path.name)
 
     if unmatched:
-        print(f"  [warn] No source match for: {', '.join(unmatched)}")
+        print(f"[warn] No source match for: {', '.join(unmatched)}")
         for f in unmatched:
             _log_ingest(conn, f, None, "skipped", message="No matching source pattern")
 
@@ -381,7 +376,14 @@ def ingest_directory(
     return summary
 
 
-def _run_inline_checks(conn, table, source, check_registry, report_registry, filename):
+def _run_inline_checks(
+        conn,
+        table,
+        source,
+        check_registry,
+        report_registry,
+        filename
+):
     """Executes inline checks for a given table and source by leveraging the check
     and report registries to find matching reports and checks to run for the table.
 
@@ -416,3 +418,23 @@ def _run_inline_checks(conn, table, source, check_registry, report_registry, fil
                 print(f"[check] {check_name}: {result}")
             except Exception as e:
                 print(f"[check-fail] {check_name}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# NEW — file deduplication
+# ---------------------------------------------------------------------------
+def _already_ingested(
+        conn: duckdb.DuckDBPyConnection,
+        filename: str
+) -> bool:
+    """Return True if this filename was already successfully ingested.
+    Only 'ok' status counts — failed files are retried on every run.
+    """
+    result = conn.execute(
+        """
+                          SELECT count(*) FROM ingest_log
+                          WHERE filename = ? AND status = 'ok'
+                          """,
+        [filename],
+    ).fetchone()
+    return result[0] > 0

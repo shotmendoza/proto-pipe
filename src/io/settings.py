@@ -17,6 +17,7 @@ _DEFAULTS = {
         "sources_config": "config/sources_config.yaml",
         "reports_config": "config/reports_config.yaml",
         "deliverables_config": "config/deliverables_config.yaml",
+        "views_config": "config/views_config.yaml",
         "pipeline_db": "data/pipeline.db",
         "watermark_db": "data/watermarks.db",
         "incoming_dir": "data/incoming/",
@@ -80,8 +81,7 @@ def get_path(key: str, path: Path = DEFAULT_SETTINGS_PATH) -> str:
 
 
 def set_path(key: str, value: str, path: Path = DEFAULT_SETTINGS_PATH) -> None:
-    """
-    Updates the path configuration for a given key in the settings file.
+    """Updates the path configuration for a given key in the settings file.
 
     This function modifies the specified path configuration in the settings
     stored at the given file path. If the specified key is not present in the

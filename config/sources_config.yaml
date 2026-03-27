@@ -8,6 +8,7 @@ sources:
       - "sales_*.xlsx"
     target_table: "sales"
     timestamp_col: "updated_at"
+    primary_key: "order_id"
 
   - name: "inventory"
     patterns:
@@ -16,6 +17,7 @@ sources:
       - "INVENTORY_*.csv"
     target_table: "inventory"
     timestamp_col: "updated_at"
+    primary_key: "sku"
 
   - name: "customers"
     patterns:
@@ -24,3 +26,4 @@ sources:
       - "Customers_*.xlsx"
     target_table: "customers"
     timestamp_col: "updated_at"
+    primary_key: "customer_id"

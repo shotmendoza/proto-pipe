@@ -128,6 +128,7 @@ def init(output: str, force: bool):
         _TEMPLATES_DIR / "sources_config.yaml": out / "sources_config.yaml",
         _TEMPLATES_DIR / "deliverables_config.yaml": out / "deliverables_config.yaml",
         _TEMPLATES_DIR / "pipeline.yaml": Path("../pipeline.yaml"),
+        _TEMPLATES_DIR / "views_config.yaml": out / "views_config.yaml",
     }
 
     for src, dest in files.items():
@@ -139,11 +140,10 @@ def init(output: str, force: bool):
 
     click.echo("\nNext steps:")
     click.echo(f"  1. Edit pipeline.yaml to set your paths")
-    click.echo(
-        f"  2. Edit {out}/sources_config.yaml to match your file naming conventions"
-    )
+    click.echo(f"  2. Edit {out}/sources_config.yaml to match your file naming conventions")
     click.echo(f"  3. Edit {out}/reports_config.yaml to define your reports and checks")
-    click.echo(f"  4. Run: validation-pipeline db-init")
+    click.echo(f"  4. Edit {out}/views_config.yaml to define shared transformation views")
+    click.echo(f"  5. Run: vp db-init")
 
 
 # ---------------------------------------------------------------------------
@@ -155,15 +155,30 @@ def init(output: str, force: bool):
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--watermark-db", default=None, help="Override watermark DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
-def db_init(pipeline_db, watermark_db, sources_config):
-    """Initialize database setup required for the pipeline operation. This command
-    optionally overrides the default paths for the pipeline database, watermark
-    database, and sources configuration file. The command ensures the necessary tables
-    exist in the pipeline database and initializes the watermark database.
+@click.option("--views-config",   default=None, help="Override views config path.")  # NEW
+def db_init(pipeline_db, watermark_db, sources_config, views_config):
+    """
+    Initializes the pipeline database and watermark database for the data pipeline. This command
+    specifically prepares the necessary tables to store flagged rows, report runs, and watermark
+    data. Additionally, it updates settings based on the provided configurations for sources and
+    views.
 
-    :param pipeline_db: Path to override the pipeline database.
-    :param watermark_db: Path to override the watermark database.
-    :param sources_config: Path to override the source configuration file.
+    :param pipeline_db: Optional override for the path to the pipeline database. If not provided,
+        a default path will be used.
+    :type pipeline_db: str, optional
+
+    :param watermark_db: Optional override for the path to the watermark database. If not provided,
+        a default path will be used.
+    :type watermark_db: str, optional
+
+    :param sources_config: Optional override for the sources configuration file path. The file
+        contains sources details required for database initialization.
+    :type sources_config: str, optional
+
+    :param views_config: Optional override for the views configuration file path. This can specify
+        additional configurations for view-related setup.
+    :type views_config: str, optional
+
     :return: None
     """
     from src.io.ingest import init_db
@@ -176,14 +191,15 @@ def db_init(pipeline_db, watermark_db, sources_config):
     src_cfg = _p("sources_config", sources_config)
     p_db = _p("pipeline_db", pipeline_db)
     w_db = _p("watermark_db", watermark_db)
+    v_cfg = _p("views_config", views_config)
 
     click.echo(f"\nInitialising pipeline DB: {p_db}")
     try:
         _config = load_config(src_cfg)
         init_db(p_db, _config["sources"])
     except FileNotFoundError:
-        click.echo(f"  [error] Could not find sources config at '{src_cfg}'")
-        click.echo(f"          Run `validation-pipeline init` first.")
+        click.echo(f"[error] Could not find sources config at '{src_cfg}'")
+        click.echo(f"Run `validation-pipeline init` first.")
         return
 
     # Also ensure flagged_rows and report_runs tables exist
@@ -199,21 +215,31 @@ def db_init(pipeline_db, watermark_db, sources_config):
         )
     """)
     init_report_runs_table(conn)
+    click.echo(f"[ok] flagged_rows and report_runs tables ready")
+
+    # NEW: create views (skips existing ones)
+    views = load_views_config(v_cfg)
+    if views:
+        click.echo(f"\nCreating views from: {v_cfg}")
+        try:
+            create_views(conn, views, replace=False)
+        except Exception as e:
+            click.echo(f"  [error] Could not create views: {e}")
+    else:
+        click.echo(f"  [skip] No views defined in {v_cfg}")
+
     conn.close()
-    click.echo(f"  [ok]   flagged_rows and report_runs tables ready")
 
     click.echo(f"\nInitialising watermark DB: {w_db}")
     Path(w_db).parent.mkdir(parents=True, exist_ok=True)
     WatermarkStore(w_db)
-    click.echo(f"  [ok]   Watermark table ready")
+    click.echo(f"[ok] Watermark table ready")
     click.echo(f"\nAll done. You're ready to run the pipeline.")
 
 
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
-
-
 @cli.group()
 def config():
     """View or update pipeline.yaml path settings."""
@@ -232,7 +258,10 @@ def config_show():
 @config.command("set")
 @click.argument("key")
 @click.argument("value")
-def config_set(key: str, value: str):
+def config_set(
+        key: str,
+        value: str
+):
     """Sets a configuration value based on the provided key. This function allows users
     to assign a specific value to a configuration key, updating the application
     settings. If the key is invalid, an error message will be displayed, along with
@@ -259,9 +288,21 @@ def config_set(key: str, value: str):
 
 
 @cli.command()
-@click.option("--incoming-dir", default=None, help="Override incoming files directory.")
-@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-@click.option("--sources-config", default=None, help="Override sources config path.")
+@click.option(
+    "--incoming-dir",
+    default=None,
+    help="Override incoming files directory."
+)
+@click.option(
+    "--pipeline-db",
+    default=None,
+    help="Override pipeline DB path."
+)
+@click.option(
+    "--sources-config",
+    default=None,
+    help="Override sources config path."
+)
 @click.option(
     "--mode",
     default="append",
@@ -289,7 +330,6 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     inc_dir = _p("incoming_dir", incoming_dir)
     p_db = _p("pipeline_db", pipeline_db)
     src_cfg = _p("sources_config", sources_config)
-
     _config = load_config(src_cfg)
 
     cr, rr = (check_registry, report_registry) if validate else (None, None)
@@ -310,8 +350,9 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     )
 
     ok = sum(1 for v in summary.values() if v["status"] == "ok")
+    skipped = sum(1 for v in summary.values() if v["status"] == "skipped")
     failed = sum(1 for v in summary.values() if v["status"] == "failed")
-    click.echo(f"\n  {ok} loaded, {failed} failed — see ingest_log table for details.")
+    click.echo(f"\n  {ok} loaded, {skipped} skipped, {failed} failed — see ingest_log table for details.")
 
 
 # ---------------------------------------------------------------------------
@@ -613,9 +654,14 @@ def pull_report(
     default=False,
     help="Produce deliverable even if flagged rows exist.",
 )
-def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged):
-    """
-    Chain ingest → validate → pull-report in one command.
+def run_all(
+        pipeline_db,
+        watermark_db,
+        incoming_dir,
+        deliverable,
+        ignore_flagged
+):
+    """Chain ingest → validate → pull-report in one command.
 
     Stops before pull-report if flagged rows exist, unless --ignore-flagged is set.
     Auto-fixed rows are applied during validate. Complex cases are written to
@@ -627,7 +673,7 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
     from src.reports.runner import run_all_reports
     from src.reports.runner import run_deliverable
     from src.reports.query import query_table
-    from src.io.ingest import ingest_directory
+    from src.io.ingest import ßingest_directory
 
     import duckdb
 
@@ -637,6 +683,7 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
     src_cfg = _p("sources_config")
     rep_cfg = _p("reports_config")
     del_cfg = _p("deliverables_config")
+    v_cfg = _p("views_config")
     out_dir = _p("output_dir")
 
     # Step 1 — Ingest
@@ -655,17 +702,29 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
     # Check for flagged rows before producing deliverable
     conn = duckdb.connect(p_db)
     flagged_count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-    conn.close()
 
     if flagged_count > 0 and not ignore_flagged:
-        click.echo(
-            f"\n⚠ {flagged_count} flagged row(s) require manual review before producing deliverables."
-        )
-        click.echo("  Query the flagged_rows table in your pipeline DB to review.")
-        click.echo("  Re-run with --ignore-flagged to produce the deliverable anyway.")
+        conn.close()
+        click.echo(f"\n⚠ {flagged_count} flagged row(s) require manual review before producing deliverables.")
+        click.echo("Use: vp export-flagged --table <name>  to export them for correction.")
+        click.echo("Query the flagged_rows table in your pipeline DB to review.")
+        click.echo("Re-run with --ignore-flagged to produce the deliverable anyway.")
         return
 
-    # Step 3 — Pull report
+    # Step 3 — Refresh views (NEW)
+    click.echo("\n── Refresh Views ───────────────────────────")
+    views = load_views_config(v_cfg)
+    if views:
+        try:
+            refresh_views(conn, views)
+        except Exception as e:
+            click.echo(f"  [error] Could not refresh views: {e}")
+            conn.close()
+            return
+    else:
+        click.echo("  [skip] No views defined")
+
+    # Step 4 — Pull report
     if deliverable:
         click.echo("\n── Pull Report ─────────────────────────────")
         del_config = load_config(del_cfg)
@@ -673,10 +732,10 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
 
         if deliverable not in deliverables:
             click.echo(f"[error] No deliverable named '{deliverable}'")
+            conn.close()
             return
 
         d = deliverables[deliverable]
-        conn = duckdb.connect(p_db)
         report_dataframes = {}
 
         for report_cfg in d["reports"]:
@@ -687,9 +746,9 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
                 try:
                     df = query_table(conn, sql_file=sql_file)
                     report_dataframes[rname] = df
-                    click.echo(f"  [query] {rname} → {len(df)} rows (sql_file)")
+                    click.echo(f"[query] {rname} → {len(df)} rows (sql_file)")
                 except Exception as e:
-                    click.echo(f"  [error] sql_file failed for '{rname}': {e}")
+                    click.echo(f"[error] sql_file failed for '{rname}': {e}")
             else:
                 rdefs = {r["name"]: r for r in rep_config.get("reports", [])}
                 if rname not in rdefs:
@@ -701,6 +760,7 @@ def run_all(pipeline_db, watermark_db, incoming_dir, deliverable, ignore_flagged
         conn.close()
         run_deliverable(d, report_dataframes, out_dir, p_db)
     else:
+        conn.close()
         click.echo("\n  No --deliverable specified. Ingest and validate complete.")
 
 
@@ -729,6 +789,141 @@ def checks():
     }
     for name in BUILT_IN_CHECKS:
         params, desc = descriptions.get(name, ("", ""))
-        click.echo(f"  {name}")
-        click.echo(f"    params: {params}")
-        click.echo(f"    {desc}\n")
+        click.echo(f"{name}")
+        click.echo(f"params: {params}")
+        click.echo(f"{desc}\n")
+
+
+# ---------------------------------------------------------------------------
+# export-flagged — NEW command
+# ---------------------------------------------------------------------------
+@cli.command("export-flagged")
+@click.option("--table",       required=True, help="Table to export flagged rows from.")
+@click.option("--output",      default=None,  help="Output CSV path. Defaults to flagged_<table>.csv in output_dir.")
+@click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
+def export_flagged(table, output, pipeline_db):
+    """Export flagged rows for a table to CSV for manual correction.
+
+    The file includes all source columns plus _flag_reason and _flag_id.
+    Fix the values in the file, then run import-corrections to apply them.
+
+    \b
+    Example:
+      vp export-flagged --table sales
+      vp export-flagged --table sales --output /tmp/sales_fixes.csv
+    """
+    from src.pipelines.corrections import export_flagged as _export
+    import duckdb
+
+    p_db = _p("pipeline_db", pipeline_db)
+    out_dir = _p("output_dir")
+    output_path = output or str(Path(out_dir) / f"flagged_{table}.csv")
+
+    conn = duckdb.connect(p_db)
+    try:
+        count = _export(conn, table, output_path)
+        click.echo(f"[ok] {count} flagged row(s) exported to: {output_path}")
+        click.echo(f"\nFix the values, then run:")
+        click.echo(f"vp import-corrections {output_path} --table {table}")
+    except ValueError as e:
+        click.echo(f"[error] {e}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# import-corrections — NEW command
+# ---------------------------------------------------------------------------
+
+@cli.command("import-corrections")
+@click.argument("filepath")
+@click.option("--table",          required=True, help="Table to apply corrections to.")
+@click.option("--key",            default=None,  help="Override primary key column (default: from sources_config.yaml).")
+@click.option("--pipeline-db",    default=None,  help="Override pipeline DB path.")
+@click.option("--sources-config", default=None,  help="Override sources config path.")
+def import_corrections(filepath, table, key, pipeline_db, sources_config):
+    """Apply a corrected CSV back to the source table and clear resolved flags.
+
+    Primary key is read from sources_config.yaml or overridden with --key.
+    Only columns present in both the file and the table are updated.
+
+    \b
+    Example:
+      vp import-corrections flagged_sales.csv --table sales
+      vp import-corrections flagged_sales.csv --table sales --key order_id
+    """
+    from src.pipelines.corrections import import_corrections as _import
+    from src.io.registry import load_config
+    import duckdb
+
+    p_db = _p("pipeline_db", pipeline_db)
+    src_cfg = _p("sources_config", sources_config)
+    path = Path(filepath)
+
+    if not path.exists():
+        click.echo(f"[error] File not found: {filepath}")
+        return
+
+    # Resolve primary key: --key overrides sources_config.yaml
+    primary_key = key
+    if not primary_key:
+        _config = load_config(src_cfg)
+        sources = {s["target_table"]: s for s in config["sources"]}
+        if table not in sources:
+            click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
+            click.echo(f"Use --key to specify the primary key directly.")
+            return
+        primary_key = sources[table].get("primary_key")
+        if not primary_key:
+            click.echo(f"[error] No primary_key defined for '{table}' in sources_config.yaml")
+            click.echo(f"Add primary_key to the source or use --key.")
+            return
+
+    conn = duckdb.connect(p_db)
+    try:
+        result = _import(conn, table, str(path), primary_key)
+        click.echo(f"[ok] {result['updated']} row(s) updated in '{table}'")
+        click.echo(f"[ok] {result['flagged_cleared']} flag(s) cleared from flagged_rows")
+    except (ValueError, FileNotFoundError) as e:
+        click.echo(f"[error] {e}")
+    finally:
+        conn.close()
+
+# ---------------------------------------------------------------------------
+# refresh-views — NEW command
+# ---------------------------------------------------------------------------
+
+@cli.command("refresh-views")
+@click.option("--pipeline-db",  default=None, help="Override pipeline DB path.")
+@click.option("--views-config", default=None, help="Override views config path.")
+def refresh_views_cmd(pipeline_db, views_config):
+    """
+    Drop and recreate all views from views_config.yaml.
+
+    Run this after editing a view SQL file. Views are also refreshed
+    automatically during run-all.
+
+    \b
+    Example:
+      vp refresh-views
+    """
+    from src.views import load_views_config, refresh_views
+    import duckdb
+
+    p_db = _p("pipeline_db",  pipeline_db)
+    v_cfg = _p("views_config", views_config)
+
+    views = load_views_config(v_cfg)
+    if not views:
+        click.echo(f"  [skip] No views defined in {v_cfg}")
+        return
+
+    click.echo(f"\nRefreshing {len(views)} view(s) from: {v_cfg}")
+    conn = duckdb.connect(p_db)
+    try:
+        refresh_views(conn, views)
+        click.echo(f"\n  Done.")
+    except Exception as e:
+        click.echo(f"  [error] {e}")
+    finally:
+        conn.close()
