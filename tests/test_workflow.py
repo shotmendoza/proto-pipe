@@ -1,5 +1,4 @@
-"""
-End-to-end workflow integration tests.
+"""End-to-end workflow integration tests.
 
 These tests exercise the full pipeline as an analyst would use it:
   ingest → validate → deliver
