@@ -33,16 +33,33 @@ import uuid
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import Literal
 
 import duckdb
-import pandas as pd
-
-from ingest import _MAX_DIFF_COLS
+import pandas as pd  # type: ignore
 
 
 # ---------------------------------------------------------------------------
 # Structural checks — lightweight, run per file before loading
 # ---------------------------------------------------------------------------
+_SUPPORTED_FILE_SUFFIXES = {".csv", ".xlsx", ".xls"}
+_MAX_DIFF_COLS = 5  # cap reason string to avoid wall-of-text in flagged_rows
+
+
+def _is_supported_file(path: Path) -> bool:
+    """Checks if the given file has a supported file extension.
+
+    This function evaluates whether the file specified by the given path has a
+    suffix that matches any of the supported file suffixes.
+
+    :param path: The file path to be checked.
+    :type path: Path
+    :return: True if the file's suffix is in the list of supported suffixes,
+        False otherwise.
+    :rtype: bool
+    """
+    return path.suffix.lower() in _SUPPORTED_FILE_SUFFIXES
+
 
 def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
     """Perform structural integrity checks on the provided DataFrame based on the source metadata.
@@ -60,12 +77,15 @@ def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
         in the DataFrame. The list will be empty if no issues are detected.
     :rtype: list[str]
     """
-    issues = []
+    issues: list[str] = []
+
     if df.empty:
         issues.append("File is empty")
-    ts_col = source.get("timestamp_col")
-    if ts_col and ts_col not in df.columns:
-        issues.append(f"Missing required timestamp column '{ts_col}'")
+
+    timestamp_col = source.get("timestamp_col")
+    if timestamp_col and timestamp_col not in df.columns:
+        issues.append(f"Missing required timestamp column '{timestamp_col}'")
+
     return issues
 
 
@@ -74,23 +94,23 @@ def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
-    """Initializes the ingest log table in the provided DuckDB connection. This table
-    is used for logging details about data ingestion activities, such as the
-    status, number of rows processed, and additional columns added during the
+    """Initializes the ingest log table in the provided DuckDB connection.
+
+    This table is used for logging details about data ingestion activities,
+    such as the status, number of rows processed, and additional columns added during the
     process.
 
     The ingest log table includes the following columns:
-    - id: Primary key for identifying each log entry.
-    - filename: The name of the file being ingested.
-    - table_name: Name of the destination table, if applicable.
-    - status: Status of the ingestion (e.g., 'ok', 'failed', 'skipped').
-    - rows: Number of rows processed during the ingestion.
-    - new_cols: JSON list of columns added during the ingestion.
-    - message: Additional information or error message for logging.
-    - ingested_at: Timestamp of when the ingestion occurred.
+        - id: Primary key for identifying each log entry.
+        - filename: The name of the file being ingested.
+        - table_name: Name of the destination table, if applicable.
+        - status: Status of the ingestion (e.g., 'ok', 'failed', 'skipped').
+        - rows: Number of rows processed during the ingestion.
+        - new_cols: JSON list of columns added during the ingestion.
+        - message: Additional information or error message for logging.
+        - ingested_at: Timestamp of when the ingestion occurred.
 
-    :param conn: The DuckDB connection where the ingest log table should be
-                 initialized.
+    :param conn: The DuckDB connection where the ingest log table should be initialized.
     :type conn: duckdb.DuckDBPyConnection
     :return: None
     """
@@ -109,9 +129,15 @@ def _init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _log_ingest(
-    conn, filename, table_name, status, rows=None, new_cols=None, message=None
+        conn: duckdb.DuckDBPyConnection,
+        filename: str,
+        table_name: str | None,
+        status: str,
+        rows: int | None = None,
+        new_cols: list[str] | None = None,
+        message: str | None = None
 ) -> None:
-    """Logs ingestion details into the database.
+    """Logs a single ingestion detail into the ingestion_log database.
 
     This function inserts information about a data ingestion process into
     an `ingest_log` database table. It keeps a record of filenames,
@@ -119,17 +145,13 @@ def _log_ingest(
     related to the ingestion. Every log entry is timestamped with the
     current UTC time.
 
-    :param conn: A database connection object used to execute the SQL
-                 insert statement.
+    :param conn: A database connection object used to execute the SQL insert statement.
     :param filename: The name of the file being ingested.
-    :param table_name: The name of the database table associated with the
-                       ingestion.
+    :param table_name: The name of the database table associated with the ingestion.
     :param status: The status of the ingestion operation.
     :param rows: The count of rows ingested. Optional.
-    :param new_cols: A list of new columns added during ingestion.
-                     Optional.
-    :param message: An additional message or comment about the ingestion
-                    process. Optional.
+    :param new_cols: A list of new columns added during ingestion. Optional.
+    :param message: An additional message or comment about the ingestion process. Optional.
     :return: None
     """
     conn.execute("""
@@ -137,7 +159,10 @@ def _log_ingest(
             (id, filename, table_name, status, rows, new_cols, message, ingested_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, [
-        str(uuid.uuid4()), filename, table_name, status,
+        str(uuid.uuid4()),
+        filename,
+        table_name,
+        status,
         rows,
         json.dumps(new_cols) if new_cols else None,
         message,
@@ -148,9 +173,11 @@ def _log_ingest(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def resolve_source(filename: str, sources: list[dict]) -> dict | None:
-    """Determines and returns the matching source from a list of sources based on filename patterns.
+def resolve_source(
+        filename: str,
+        sources: list[dict]
+) -> dict | None:
+    """Return the first source whose patterns match the filename.
 
     This function iterates through a list of source dictionaries and checks if the
     provided filename matches any patterns specified in the sources. If a match is
@@ -158,18 +185,17 @@ def resolve_source(filename: str, sources: list[dict]) -> dict | None:
     it returns None. Pattern matching is performed using the `fnmatch` module.
 
     :param filename: The name of the file to resolve against the source patterns.
-    :param sources: A list of dictionaries. Each dictionary should include a key
-        "patterns", which contains a list of filename patterns.
+    :param sources: A list of dictionaries. Each dictionary should include a key "patterns", which contains a list of filename patterns.
     :return: The first matching source dictionary if a match is found, otherwise None.
     """
     for source in sources:
-        if any(fnmatch(filename, p) for p in source["patterns"]):
+        if any(fnmatch(filename, pattern) for pattern in source["patterns"]):
             return source
     return None
 
 
 def _load_file(path: Path) -> pd.DataFrame:
-    """Loads a file from the given path and returns its content as a DataFrame.
+    """Load a CSV or Excel file into a DataFrame.
 
     This function supports loading files in CSV or Excel formats. Depending on
     the file extension, the appropriate pandas function will be used to load
@@ -182,12 +208,15 @@ def _load_file(path: Path) -> pd.DataFrame:
     :rtype: pd.DataFrame
     :raises ValueError: If the file type is unsupported (neither .csv, .xlsx, nor .xls).
     """
-    if path.suffix.lower() == ".csv":
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
         return pd.read_csv(path)
-    elif path.suffix.lower() in (".xlsx", ".xls"):
+
+    if suffix in {".xlsx", ".xls"}:
         return pd.read_excel(path)
-    else:
-        raise ValueError(f"Unsupported file type: {path.suffix}")
+
+    raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
 def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
@@ -306,7 +335,7 @@ def ingest_directory(
     directory: str,
     sources: list[dict],
     db_path: str,
-    mode: str = "append",
+    mode: Literal["append", "replace"] = "append",
     run_checks: bool = False,
     check_registry=None,
     report_registry=None,
@@ -327,11 +356,13 @@ def ingest_directory(
     """
     conn = duckdb.connect(db_path)
     _init_ingest_log(conn)
-    summary = {}
-    unmatched = []
+
+    summary: dict[str, dict] = {}
+    unmatched: list[str] = []
 
     for path in sorted(Path(directory).iterdir()):
-        if path.suffix.lower() not in (".csv", ".xlsx", ".xls"):
+        # skips if file is not supported
+        if not _is_supported_file(path):
             continue
 
         source = resolve_source(path.name, sources)
@@ -347,33 +378,31 @@ def ingest_directory(
         # Load file
         try:
             df = _load_file(path)
-        except Exception as e:
-            msg = f"Could not load file: {e}"
-            print(f"[fail] '{path.name}': {msg}")
-            _log_ingest(conn, path.name, None, "failed", message=msg)
-            summary[path.name] = {"status": "failed", "message": msg}
+        except Exception as exc:
+            message = f"Could not load file: {exc}"
+            print(f"[fail] '{path.name}': {message}")
+            _log_ingest(conn, path.name, None, "failed", message=message)
+            summary[path.name] = {"status": "failed", "message": message}
             continue
 
         # Structural checks
         issues = _structural_checks(df, source)
         if issues:
-            msg = "; ".join(issues)
-            print(f"[fail] '{path.name}': {msg}")
-            _log_ingest(conn, path.name, source["target_table"], "failed", message=msg)
-            summary[path.name] = {"status": "failed", "message": msg}
+            message = "; ".join(issues)
+            print(f"[fail] '{path.name}': {message}")
+            _log_ingest(conn, path.name, source["target_table"], "failed", message=message)
+            summary[path.name] = {"status": "failed", "message": message}
             continue
 
         table = source["target_table"]
         primary_key = source.get("primary_key")
-        on_duplicate = source.get(
-            "on_duplicate", "flag" if primary_key else "append"
-        )
+        on_duplicate = source.get("on_duplicate", "flag" if primary_key else "append")
 
         # Load into DuckDB
         if mode == "replace" or not _table_exists(conn, table):
             conn.execute(f'DROP TABLE IF EXISTS "{table}"')
             conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
-            new_cols = []
+            new_cols: list[str] = []
             flagged_count = 0
             skipped_count = 0
             print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
@@ -395,7 +424,10 @@ def ingest_directory(
 
             if not df.empty:
                 col_list = ", ".join(f'"{c}"' for c in df.columns)
-                conn.execute(f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df')
+                conn.execute(
+                    f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df'
+                )
+
             print(
                 f"[ok] '{path.name}' → '{table}' "
                 f"({len(df)} inserted, {flagged_count} flagged, {skipped_count} skipped)"
@@ -417,8 +449,8 @@ def ingest_directory(
 
     if unmatched:
         print(f"[warn] No source match for: {', '.join(unmatched)}")
-        for f in unmatched:
-            _log_ingest(conn, f, None, "skipped", message="No matching source pattern")
+        for filename in unmatched:
+            _log_ingest(conn, filename, None, "skipped", message="No matching source pattern")
 
     conn.close()
     return summary
