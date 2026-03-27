@@ -91,8 +91,13 @@ def _is_supported_file(path: Path) -> bool:
     return path.suffix.lower() in _SUPPORTED_FILE_SUFFIXES
 
 
-def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
+def _structural_checks(
+        df: pd.DataFrame,
+        source: dict
+) -> list[str]:
     """Perform structural integrity checks on the provided DataFrame based on the source metadata.
+
+    This check evaluates and runs before the existing database tables are touched.
 
     This function evaluates the DataFrame to ensure it is not empty and verifies the
     existence of a required timestamp column if specified in the given source dictionary.
@@ -116,6 +121,14 @@ def _structural_checks(df: pd.DataFrame, source: dict) -> list[str]:
     if timestamp_col and timestamp_col not in df.columns:
         issues.append(f"Missing required timestamp column '{timestamp_col}'")
 
+    primary_key = source.get("primary_key")
+    if primary_key and primary_key in df.columns:
+        null_count = int(df[primary_key].isna().sum())
+        if null_count:
+            issues.append(
+                f"{null_count} row(s) have NULL value in primary key "
+                f"column '{primary_key}' — file rejected"
+            )
     return issues
 
 
@@ -370,10 +383,7 @@ def ingest_directory(
     check_registry=None,
     report_registry=None,
 ) -> dict:
-    """Processes and ingests data files from a specified directory into a database, performing
-    optional structural checks, validation, and handling unmatched files. Each successfully
-    processed file's data is inserted or appended into the associated table specified in the
-    source definitions. Failed and unmatched files are appropriately logged.
+    """Scan a directory, match files to source definitions, and load into DuckDB.
 
     :param directory: The directory containing files to ingest.
     :param sources: A list of source definitions mapping file patterns to target database tables.
@@ -384,6 +394,15 @@ def ingest_directory(
     :param report_registry: Registry used to log the results of executed checks, if enabled.
     :return: A dictionary summarizing the results of the ingestion process for each file.
     """
+    directory_path = Path(directory)
+    if not directory_path.exists():
+        raise ValueError(
+            f"Incoming directory not found: '{directory}'\n"
+            f"Check the incoming_dir setting in pipeline.yaml or pass --incoming-dir."
+        )
+    if not directory_path.is_dir():
+        raise ValueError(f"incoming_dir '{directory}' exists but is not a directory.")
+
     conn = duckdb.connect(db_path)
     _init_ingest_log(conn)
 
@@ -665,13 +684,6 @@ def _handle_duplicates(
         )
         return df, 0, 0
 
-    null_key_count = df[primary_key].isna().sum()
-    if null_key_count:
-        print(
-            f"[warn] {null_key_count} row(s) have NULL primary key "
-            f"'{primary_key}' — bypassing duplicate detection"
-        )
-
     non_null_df = df[df[primary_key].notna()].copy()
     null_rows = df[df[primary_key].isna()].copy()
 
@@ -736,13 +748,13 @@ def _handle_duplicates(
             # __NULL__ sentinel distinguishes SQL NULL from the string 'NULL'.
             col_diff_exprs = [
                 f"CASE"
-                f"WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__')"
-                f"!= COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__')"
-                f"THEN '{c}: '"
-                f"|| COALESCE(CAST(e.\"{c}\" AS VARCHAR), 'NULL')"
-                f"|| ' -> '"
-                f"|| COALESCE(CAST(c.\"{c}\" AS VARCHAR), 'NULL')"
-                f"END"
+                f"  WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__')"
+                f"    != COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__')"
+                f"  THEN '{c}: '"
+                f"    || COALESCE(CAST(e.\"{c}\" AS VARCHAR), 'NULL')"
+                f"    || ' -> '"
+                f"    || COALESCE(CAST(c.\"{c}\" AS VARCHAR), 'NULL')"
+                f"  END"
                 for c in comparable_cols
             ]
 
@@ -827,17 +839,9 @@ def _handle_duplicates(
             f"[flag] {total_flagged} conflict(s) flagged — original rows kept"
         )
 
-    result_parts = []
-    if rows_to_insert:
-        result_parts.append(
-            pd.DataFrame(rows_to_insert, columns=non_null_df.columns)
-        )
-    if not null_rows.empty:
-        result_parts.append(null_rows)
-
     result = (
-        pd.concat(result_parts, ignore_index=True)
-        if result_parts
+        pd.DataFrame(rows_to_insert, columns=df.columns)
+        if rows_to_insert
         else pd.DataFrame(columns=df.columns)
     )
     return result, total_flagged, total_skipped

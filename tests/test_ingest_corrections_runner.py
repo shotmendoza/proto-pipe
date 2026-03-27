@@ -194,19 +194,63 @@ class TestDirectoryValidation:
 # ---------------------------------------------------------------------------
 
 class TestNullPrimaryKeyWarning:
-    def test_null_keys_warned_and_appended(self, tmp_path, capsys):
-        db  = _make_db(tmp_path)
+    def test_null_key_in_file_rejects_entire_file(self, tmp_path):
+        """A file with any NULL primary key values is rejected before touching the DB."""
+        db = _make_db(tmp_path)
         inc = _make_incoming(tmp_path)
-        _write_csv(inc / "sales_jan.csv", [
-            {"order_id": None,    "price": 10.0, "updated_at": "2026-01-01"},
-            {"order_id": "ORD-1", "price": 20.0, "updated_at": "2026-01-02"},
-        ])
+        _write_csv(
+            inc / "sales_jan.csv",
+            [
+                {"order_id": None, "price": 10.0, "updated_at": "2026-01-01"},
+                {"order_id": "ORD-1", "price": 20.0, "updated_at": "2026-01-02"},
+            ],
+        )
+        summary = ingest_directory(str(inc), _sources(), db)
+        assert summary["sales_jan.csv"]["status"] == "failed"
+        assert "NULL" in summary["sales_jan.csv"]["message"]
+
+    def test_null_key_logged_in_ingest_log(self, tmp_path):
+        db = _make_db(tmp_path)
+        inc = _make_incoming(tmp_path)
+        _write_csv(
+            inc / "sales_jan.csv",
+            [
+                {"order_id": None, "price": 10.0, "updated_at": "2026-01-01"},
+            ],
+        )
         ingest_directory(str(inc), _sources(), db)
-        assert "NULL primary key" in capsys.readouterr().out
-        conn  = duckdb.connect(db)
+        conn = duckdb.connect(db)
+        row = conn.execute(
+            "SELECT status, message FROM ingest_log WHERE filename = 'sales_jan.csv'"
+        ).fetchone()
+        conn.close()
+        assert row[0] == "failed"
+        assert "NULL" in row[1]
+
+    def test_null_key_does_not_touch_existing_table(self, tmp_path):
+        """Existing table is untouched when a file is rejected for NULL keys."""
+        db = _make_db(tmp_path)
+        inc = _make_incoming(tmp_path)
+        # First ingest — clean file
+        _write_csv(
+            inc / "sales_jan.csv",
+            [
+                {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        # Second ingest — file with NULL key
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {"order_id": None, "price": 10.0, "updated_at": "2026-02-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
         count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
         conn.close()
-        assert count == 2
+        assert count == 1  # original row untouched
 
 
 # ---------------------------------------------------------------------------
@@ -215,21 +259,21 @@ class TestNullPrimaryKeyWarning:
 
 class TestChunking:
     def test_large_file_all_rows_inserted(self, tmp_path):
-        db  = _make_db(tmp_path)
+        db = _make_db(tmp_path)
         inc = _make_incoming(tmp_path)
-        n   = CHUNK_SIZE * 2 + 50
+        n = CHUNK_SIZE * 2 + 50
         _write_csv(inc / "sales_jan.csv", [
             {"order_id": f"ORD-{i}", "price": float(i), "updated_at": "2026-01-01"}
             for i in range(n)
         ])
         ingest_directory(str(inc), _sources(on_duplicate="append"), db)
-        conn  = duckdb.connect(db)
+        conn = duckdb.connect(db)
         count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
         conn.close()
         assert count == n
 
     def test_chunk_boundary_identical_rows_deduped(self, tmp_path):
-        db  = _make_db(tmp_path)
+        db = _make_db(tmp_path)
         inc = _make_incoming(tmp_path)
         rows = [
             {"order_id": f"ORD-{i}", "price": float(i), "updated_at": "2026-01-01"}
@@ -254,7 +298,7 @@ class TestChunking:
 
 class TestMultipleExistingRows:
     def test_no_crash_on_duplicate_keys_in_table(self, tmp_path):
-        db  = _make_db(tmp_path)
+        db = _make_db(tmp_path)
         inc = _make_incoming(tmp_path)
         _write_csv(inc / "sales_jan.csv", [
             {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
@@ -569,7 +613,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
             "options": {"parallel": False},
             "resolved_checks": ["failing_check"],
         }
-        with patch("runner.load_from_duckdb") as mock_load:
+        with patch("src.reports.runner.load_from_duckdb") as mock_load:
             mock_load.return_value = pd.DataFrame([
                 {"order_id": "ORD-1", "updated_at": "2026-01-01"}
             ])
@@ -589,7 +633,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
             "options": {"parallel": False},
             "resolved_checks": ["passing_check"],
         }
-        with patch("runner.load_from_duckdb") as mock_load:
+        with patch("src.reports.runner.load_from_duckdb") as mock_load:
             mock_load.return_value = pd.DataFrame([
                 {"order_id": "ORD-1",
                  "updated_at": pd.Timestamp("2026-01-01", tz="UTC")}
