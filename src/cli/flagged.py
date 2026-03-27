@@ -8,6 +8,42 @@ import click
 from .helpers import config_path_or_override
 
 
+def _resolve_primary_key(
+        table: str,
+        sources_config: str | None
+) -> str | None:
+    """Look up the primary key for a table from sources_config.yaml.
+
+    Returns the key string if found, or None after printing an error message.
+    The caller should return early when this returns None.
+    """
+    from src.io.registry import load_config
+
+    src_cfg = config_path_or_override("sources_config", sources_config)
+    try:
+        _config = load_config(src_cfg)
+    except FileNotFoundError:
+        click.echo(f"[error] Could not find sources config at '{src_cfg}'")
+        return None
+
+    sources = {s["target_table"]: s for s in _config["sources"]}
+
+    if table not in sources:
+        click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
+        click.echo("Use --key to specify the primary key directly.")
+        return None
+
+    primary_key = sources[table].get("primary_key")
+    if not primary_key:
+        click.echo(
+            f"[error] No primary_key defined for '{table}' in sources_config.yaml"
+        )
+        click.echo("Add primary_key to the source definition, or use --key.")
+        return None
+
+    return primary_key
+
+
 # ---------------------------------------------------------------------------
 # flagged-summary
 # ---------------------------------------------------------------------------
@@ -201,9 +237,11 @@ def flagged_clear(table, check, yes, pipeline_db):
 # ---------------------------------------------------------------------------
 @click.command("export-flagged")
 @click.option("--table", required=True, help="Table to export flagged rows from.")
+@click.option("--key", default=None, help="Override primary key column (default: from sources_config.yaml).")
 @click.option("--output", default=None,  help="Output CSV path. Defaults to flagged_<table>.csv in output_dir.")
 @click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
-def export_flagged(table, output, pipeline_db):
+@click.option("--sources-config", default=None, help="Override sources config path.")
+def export_flagged(table, key, output, pipeline_db, sources_config):
     """Export flagged rows for a table to CSV for manual correction.
 
     The file includes all source columns plus _flag_id and _flag_reason.
@@ -213,9 +251,14 @@ def export_flagged(table, output, pipeline_db):
     Example:
       vp export-flagged --table sales
       vp export-flagged --table sales --output /tmp/sales_fixes.csv
+      vp export-flagged --table sales --key order_id
     """
     import duckdb
     from src.reports.corrections import export_flagged as _export, dated_export_path
+
+    primary_key = key or _resolve_primary_key(table, key, sources_config)
+    if not primary_key:
+        return
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     out_dir = config_path_or_override("output_dir")
@@ -223,7 +266,7 @@ def export_flagged(table, output, pipeline_db):
 
     conn = duckdb.connect(p_db)
     try:
-        count = _export(conn, table, output_path)
+        count = _export(conn, table, output_path, primary_key)
         click.echo(f"[ok] {count} flagged row(s) exported to: {output_path}")
         click.echo(f"\nFix the values, then run:")
         click.echo(f"vp import-corrections {output_path} --table {table}")
@@ -269,7 +312,7 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
         return
 
     # Resolve primary key: --key overrides sources_config.yaml
-    primary_key = key
+    primary_key = key or _resolve_primary_key(table, key, sources_config)
     if not primary_key:
         _config = load_config(src_cfg)
         sources = {s["target_table"]: s for s in _config["sources"]}
@@ -327,7 +370,7 @@ def check_null_overwrites_cmd(table, pipeline_db, sources_config):
         click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
         return
 
-    primary_key = sources[table].get("primary_key")
+    primary_key = _resolve_primary_key(table, None, sources_config)
     if not primary_key:
         click.echo(
             f"  [error] No primary_key defined for '{table}' in sources_config.yaml\n"

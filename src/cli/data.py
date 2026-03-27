@@ -78,6 +78,88 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
         f"{flagged} row conflict(s) flagged — see ingest_log for details."
     )
 
+    if failed:
+        click.echo("Run: vp ingest-log --status failed  to see failure reasons.")
+
+
+# ---------------------------------------------------------------------------
+# ingest-log
+# ---------------------------------------------------------------------------
+
+
+@click.command("ingest-log")
+@click.option(
+    "--status",
+    default=None,
+    type=click.Choice(["ok", "failed", "skipped"]),
+    help="Filter by status.",
+)
+@click.option("--table", default=None, help="Filter by target table name.")
+@click.option("--limit", default=50, show_default=True, help="Max rows to display.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def ingest_log(status, table, limit, pipeline_db):
+    """Show recent ingest attempts — including failures and their reasons.
+
+    Use this after `vp ingest` reports failures to find out why a file
+    didn't load. Filter by --status failed to focus on problems only.
+
+    \b
+    Examples:
+      vp ingest-log
+      vp ingest-log --status failed
+      vp ingest-log --table sales
+      vp ingest-log --status failed --limit 10
+    """
+    import duckdb
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    conn = duckdb.connect(p_db)
+    try:
+        query = """
+                 SELECT filename, table_name, status, rows, message, ingested_at
+                 FROM ingest_log
+                 WHERE 1=1 \
+                 """
+        params = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if table:
+            query += " AND table_name = ?"
+            params.append(table)
+        query += " ORDER BY ingested_at DESC"
+        if limit:
+            query += f" LIMIT {limit}"
+
+        df = conn.execute(query, params).df()
+
+        if df.empty:
+            click.echo("\n  No ingest records found.")
+            return
+
+        click.echo(f"\n  {len(df)} record(s):\n")
+        for _, row in df.iterrows():
+            mark = (
+                "✓"
+                if row["status"] == "ok"
+                else ("–" if row["status"] == "skipped" else "✗")
+            )
+            table_str = f" → {row['table_name']}" if row["table_name"] else ""
+            rows_str = (
+                f" ({int(row['rows'])} rows)" if row["rows"] and row["rows"] > 0 else ""
+            )
+            click.echo(f"  {mark} {row['filename']}{table_str}{rows_str}")
+            click.echo(f"    {row['status']}  {row['ingested_at']}")
+            if row["message"]:
+                click.echo(f"    reason: {row['message']}")
+            click.echo()
+
+    except Exception as e:
+        click.echo(f"[error] Could not read ingest_log: {e}")
+        click.echo("  Has `vp db-init` been run yet?")
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # update-table

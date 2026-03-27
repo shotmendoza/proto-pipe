@@ -1,16 +1,11 @@
 """Setup commands — init, db-init, config."""
-
 import shutil
 from pathlib import Path
 
 import click
 
 from src.cli.helpers import config_path_or_override, config_settings
-from src.io.settings import (
-    set_path,
-    VALID_PATH_KEYS,
-    DEFAULT_SETTINGS_PATH,
-)
+from src.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
 
 _TEMPLATES_DIR = Path(__file__).parent.parent / "config"
 
@@ -72,8 +67,6 @@ def init(output: str, force: bool):
 # ---------------------------------------------------------------------------
 # db-init
 # ---------------------------------------------------------------------------
-
-
 @click.command("db-init")
 @click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
 @click.option("--watermark-db",   default=None, help="Override watermark DB path.")

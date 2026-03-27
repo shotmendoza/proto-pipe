@@ -74,16 +74,6 @@ def export_flagged(
     if flag_count == 0:
         raise ValueError(f"No flagged rows found for table '{table_name}'")
 
-    print("flagged_rows:", conn.execute("SELECT * FROM flagged_rows").df().to_dict())
-    print(
-        "sales sample:",
-        conn.execute(
-            f'SELECT order_id, md5(CAST(order_id AS VARCHAR)) as computed_id FROM "{table_name}" LIMIT 4'
-        )
-        .df()
-        .to_dict(),
-    )
-
     # Single JOIN — md5 of the primary key column matches flagged_rows.id
     source_df = conn.execute(
         f"""
