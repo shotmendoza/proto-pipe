@@ -9,6 +9,16 @@ Handles the flagged-row correction workflow:
 
 The primary key is defined per source in sources_config.yaml under `primary_key`.
 It can be overridden at the CLI with --key.
+
+Row identity:
+  flagged_rows.id = md5(str(pk_value)), set at flag time in ingest.py.
+
+  At export time, the source table is joined to flagged_rows via:
+      md5(CAST(source.pk_col AS VARCHAR)) = flagged_rows.id
+
+  This is drift-free (derived from the data value, not row position),
+  requires no extra columns in source tables, and DuckDB computes it
+  in one vectorised pass before joining to the small flagged_rows result.
 """
 
 from datetime import datetime, timezone
@@ -50,56 +60,42 @@ def export_flagged(
     Raises ValueError if no flagged rows exist for the table.
     """
     # Pull flagged metadata for this table
-    flagged = conn.execute("""
-        SELECT id AS _flag_id, row_index, reason AS _flag_reason
-        FROM flagged_rows
-        WHERE table_name = ?
-        ORDER BY row_index
-    """, [table_name]).df()
+    flag_count = conn.execute(
+        "SELECT count(*) FROM flagged_rows WHERE table_name = ?",
+        [table_name],
+    ).fetchone()[0]
 
-    if flagged.empty:
+    if flag_count == 0:
         raise ValueError(f"No flagged rows found for table '{table_name}'")
 
-    # Pull the full source table
-    source_df = conn.execute(f'SELECT * FROM "{table_name}"').df()
+    # Single JOIN — md5 of the primary key column matches flagged_rows.id
+    source_df = conn.execute(
+        f"""
+        SELECT
+            f.id AS _flag_id,
+            f.reason AS _flag_reason,
+            s.*
+        FROM "{table_name}" s
+        JOIN flagged_rows f
+          ON md5(CAST(s."{primary_key}" AS VARCHAR)) = f.id
+        WHERE f.table_name = ?
+        ORDER BY f.flagged_at
+    """, [table_name]).df()
 
     if source_df.empty:
-        raise ValueError(f"Table '{table_name}' is empty")
+        raise ValueError(
+            f"No source rows matched flagged ids for table '{table_name}'. "
+            f"Ensure primary_key='{primary_key}' matches sources_config.yaml."
+        )
 
-    if primary_key and primary_key in source_df.columns:
-        # CHANGED: stable join on primary key — immune to row insertion/deletion
-        # We stored the primary key value at flag time via row_index, so we
-        # first map row_index → primary_key using the current table, then join.
-        source_df["_row_index"] = source_df.index
-        idx_to_key = source_df.set_index("_row_index")[primary_key].to_dict()
-        flagged["_pk_value"] = flagged["row_index"].map(idx_to_key)
-
-        merged = flagged.merge(
-            source_df.drop(columns=["_row_index"]),
-            left_on="_pk_value",
-            right_on=primary_key,
-            how="left",
-        ).drop(columns=["_pk_value", "row_index"])
-    else:
-        # Fallback: row_index join
-        source_df["_row_index"] = source_df.index
-        merged = flagged.merge(
-            source_df,
-            left_on="row_index",
-            right_on="_row_index",
-            how="left"
-        ).drop(columns=["_row_index", "row_index"])
-
-    # Put annotation columns first so they're visible without scrolling
-    cols = ["_flag_id", "_flag_reason"] + [
-        c for c in merged.columns if c not in ("_flag_id", "_flag_reason")
-    ]
-    merged = merged[cols]
+    # Annotation columns first so they're visible without scrolling
+    other_cols = [c for c in source_df.columns if c not in ("_flag_id", "_flag_reason")]
+    source_df = source_df[["_flag_id", "_flag_reason"] + other_cols]
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(output_path, index=False)
+    source_df.to_csv(output_path, index=False)
 
-    return len(merged)
+    return len(source_df)
 
 
 def dated_export_path(output_dir: str, table_name: str) -> str:
@@ -173,7 +169,7 @@ def import_corrections(
             f"table columns: {sorted(table_cols)}"
         )
 
-    # CHANGED: warn about keys in the corrections file that don't exist in the table
+    # Warn about keys in the corrections file that don't exist in the table
     existing_keys = set(
         conn.execute(f'SELECT DISTINCT "{primary_key}" FROM "{table_name}"')
         .df()[primary_key]
@@ -189,7 +185,7 @@ def import_corrections(
             + (" ..." if not_found > 5 else "")
         )
 
-    # CHANGED: batched UPDATE via staging table instead of row-by-row Python loop.
+    # Batched UPDATE via staging table instead of row-by-row Python loop.
     # Register the corrections DataFrame as a temporary view, then issue a single
     # UPDATE ... FROM ... JOIN which DuckDB executes in one pass.
     conn.execute(

@@ -547,15 +547,25 @@ def _already_ingested(
     return result[0] > 0  # type: ignore
 
 
-def _row_hash_expr(cols: list[str]) -> str:
-    """
-    Build a DuckDB SQL expression that computes an md5 hash over all given
+def _row_hash_expr(cols: list[str], alias: str | None = None) -> str:
+    """Build a DuckDB SQL expression that computes an md5 hash over all given
     columns, coercing each to VARCHAR. Uses '|' as a separator so that
     different column values can't accidentally produce the same string.
+
+    When `alias` is provided, will prefix each column with the table alias.
+
+    The alias is used when computing hashes in a JOIN so the correct table's column
+    is referenced — e.g. alias='e' gives CAST(e."price" AS VARCHAR)
+    not CAST("e."price"" AS VARCHAR).
     """
-    parts = " || '|' || ".join(
-        [f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in cols]
-    )
+    if alias:
+        parts = " || '|' || ".join(
+            [f"COALESCE(CAST({alias}.\"{c}\" AS VARCHAR), '')" for c in cols]
+        )
+    else:
+        parts = " || '|' || ".join(
+            [f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in cols]
+        )
     return f"md5({parts})"
 
 
@@ -563,7 +573,7 @@ def _write_flag(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     diffs: list[str],
-    pk_value: str | None = None,
+    pk_value: str | int | float | None = None,
 ) -> None:
     """Insert one conflict entry into flagged_rows.
 
@@ -579,13 +589,13 @@ def _write_flag(
     shown = diffs[:_MAX_DIFF_COLS]
     leftover = len(diffs) - len(shown)
     reason = " | ".join(shown) + (f" +{leftover} more" if leftover else "")
-
     flag_id = flag_id_for(pk_value=pk_value)
 
     conn.execute("""
         INSERT INTO flagged_rows
-            (id, table_name, row_index, check_name, reason, flagged_at)
-        VALUES (?, ?, NULL, ?, ?, ?)
+            (id, table_name, check_name, reason, flagged_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO NOTHING
     """, [
         flag_id,
         table_name,
@@ -631,6 +641,11 @@ def _handle_duplicates(
 ) -> tuple[pd.DataFrame, int, int]:
     """Process incoming rows against existing rows by primary key.
 
+    For flag mode, a single SQL query per chunk categorises every incoming
+    row as 'new', 'identical', or 'conflict' and computes the per-column
+    diff reason string entirely inside DuckDB. Conflicts are then written
+    to flagged_rows in one batched INSERT.
+
     Processes keys in chunks of CHUNK_SIZE to avoid large IN (...) clauses.
     Returns (rows_to_insert, flagged_count, skipped_count).
 
@@ -653,32 +668,27 @@ def _handle_duplicates(
     null_key_count = df[primary_key].isna().sum()
     if null_key_count:
         print(
-            f"  [warn] {null_key_count} row(s) have NULL primary key "
+            f"[warn] {null_key_count} row(s) have NULL primary key "
             f"'{primary_key}' — bypassing duplicate detection"
         )
 
-    valid_df = df[df[primary_key].notna()].copy()
+    non_null_df = df[df[primary_key].notna()].copy()
     null_rows = df[df[primary_key].isna()].copy()
 
-    if valid_df.empty:
+    if non_null_df.empty:
         return df, 0, 0
 
-    non_key_cols = [
-        column for column in valid_df.columns if column != primary_key
+    comparable_cols = [
+        column for column in non_null_df.columns
+        if column != primary_key and column in _get_existing_columns(conn, table)
     ]
-    hash_cols = [
-        column for column in non_key_cols if column in _get_existing_columns(conn, table)
-    ]
-    """Non-Key columns that are in existing tables"""
 
-    hash_expr = _row_hash_expr(hash_cols) if hash_cols else "md5('')"
-
-    all_rows_to_insert: list = []
+    rows_to_insert: list[tuple] = []
     total_flagged = 0
     total_skipped = 0
 
-    for chunk_start in range(0, len(valid_df), CHUNK_SIZE):
-        chunk = valid_df.iloc[chunk_start: chunk_start + CHUNK_SIZE]
+    for chunk_start in range(0, len(non_null_df), CHUNK_SIZE):
+        chunk = non_null_df.iloc[chunk_start: chunk_start + CHUNK_SIZE]
         chunk_keys = chunk[primary_key].tolist()
         placeholders = ", ".join(["?"] * len(chunk_keys))
 
@@ -688,7 +698,7 @@ def _handle_duplicates(
         ).df()
 
         if existing_df.empty:
-            all_rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+            rows_to_insert.extend(chunk.itertuples(index=False, name=None))
             continue
 
         if on_duplicate == "upsert":
@@ -696,110 +706,141 @@ def _handle_duplicates(
                 f'DELETE FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
                 chunk_keys,
             )
-            all_rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+            rows_to_insert.extend(chunk.itertuples(index=False, name=None))
             continue
 
         if on_duplicate == "skip":
             existing_keys = set(existing_df[primary_key].tolist())
             keep = chunk[~chunk[primary_key].isin(existing_keys)]
-            skipped = len(df) - len(keep)
+            skipped = len(chunk) - len(keep)
             if skipped:
                 print(f"[skip] {skipped} row(s) already exist — skipped")
-            all_rows_to_insert.extend(keep.itertuples(index=False, name=None))
+            rows_to_insert.extend(keep.itertuples(index=False, name=None))
             total_skipped += skipped
             continue
 
         if on_duplicate == "flag":
-            if not hash_cols:
-                all_rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+            if not comparable_cols:
+                rows_to_insert.extend(chunk.itertuples(index=False, name=None))
                 continue
 
-            existing_hashes = (
-                conn.execute(
-                    f'SELECT "{primary_key}", {hash_expr} AS row_hash '
-                    f'FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
-                    chunk_keys,
-                )
-                .df()
-                .groupby(primary_key)["row_hash"]
-                .first()
-                .to_dict()
-            )
-
-            # Hashes for incoming rows (df is already registered in DuckDB scope)
-            incoming_hashes = (
-                conn.execute(
-                    f'SELECT "{primary_key}", {hash_expr} AS row_hash FROM chunk '
-                    f'WHERE "{primary_key}" IN ({placeholders})',
-                    chunk_keys,
-                )
-                .df()
-                .set_index(primary_key)["row_hash"]
-                .to_dict()
-            )
-
-            existing_by_key: dict = {}
-            for _, row in existing_df.iterrows():
-                key_val = row[primary_key]
-                if key_val not in existing_by_key:
-                    existing_by_key[key_val] = row
-
-            dup_existing = len(existing_df) - len(existing_by_key)
+            dup_existing = len(existing_df) - existing_df[primary_key].nunique()
             if dup_existing:
                 print(
-                    f"  [warn] {dup_existing} duplicate primary key(s) in existing "
+                    f"[warn] {dup_existing} duplicate primary key(s) in existing "
                     f"table — using first occurrence for conflict comparison"
                 )
 
-            for _, incoming_row in chunk.iterrows():
-                key_val = incoming_row[primary_key]
+            # Build one CASE WHEN expression per column.
+            # Produces NULL when unchanged, 'col: old -> new' when it differs.
+            # __NULL__ sentinel distinguishes SQL NULL from the string 'NULL'.
+            col_diff_exprs = [
+                f"CASE"
+                f"WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__')"
+                f"!= COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__')"
+                f"THEN '{c}: '"
+                f"|| COALESCE(CAST(e.\"{c}\" AS VARCHAR), 'NULL')"
+                f"|| ' -> '"
+                f"|| COALESCE(CAST(c.\"{c}\" AS VARCHAR), 'NULL')"
+                f"END"
+                for c in comparable_cols
+            ]
 
-                if key_val not in existing_hashes:
-                    all_rows_to_insert.append(incoming_row)
-                    continue
+            # list_filter removes NULLs (unchanged cols),
+            # array_to_string joins the remaining diffs with ' | '
+            reason_expr = (
+                "array_to_string(list_filter(["
+                + ", ".join(col_diff_exprs)
+                + "], x -> x IS NOT NULL), ' | ')"
+            )
 
-                if existing_hashes.get(key_val) == incoming_hashes.get(key_val):
-                    continue
+            e_hash = _row_hash_expr(cols=comparable_cols, alias="e")
+            c_hash = _row_hash_expr(cols=comparable_cols, alias="c")
 
-                existing_row = existing_by_key.get(key_val)
-                changed = (
-                    _changed_columns(existing_row, incoming_row, hash_cols)
-                    if existing_row is not None
-                    else [
-                        f"{c}: (unknown) -> {incoming_row.get(c)}"
-                        for c in hash_cols
-                    ]
-                )
+            # Single query categorizes all rows in the chunk.
+            # DISTINCT ON in the subquery handles duplicate existing keys.
+            # chunk_keys passed twice: once for the subquery, once for outer WHERE.
+            classify_sql = f"""
+                SELECT
+                    c."{primary_key}",
+                    CASE
+                        WHEN e."{primary_key}" IS NULL THEN 'new'
+                        WHEN {e_hash} = {c_hash} THEN 'identical'
+                        ELSE 'conflict'
+                    END AS status,
+                    {reason_expr} AS reason
+                FROM chunk c
+                LEFT JOIN (
+                    SELECT DISTINCT ON ("{primary_key}") *
+                    FROM "{table}"
+                    WHERE "{primary_key}" IN ({placeholders})
+                ) e ON CAST(c."{primary_key}" AS VARCHAR)
+                      = CAST(e."{primary_key}" AS VARCHAR)
+                WHERE c."{primary_key}" IN ({placeholders})
+            """
+            classified = conn.execute(classify_sql, chunk_keys + chunk_keys).df()
 
-                _write_flag(conn, table, changed, pk_value=key_val)
-                total_flagged += 1
-                print(
-                    f"  [flag] key={key_val} — "
-                    f"{' | '.join(changed[:3])}{'...' if len(changed) > 3 else ''}"
-                )
+            # New rows — insert directly, no conflict
+            new_keys = set(
+                classified.loc[classified["status"] == "new", primary_key].tolist()
+            )
+            if new_keys:
+                new_rows = chunk[chunk[primary_key].isin(new_keys)]
+                rows_to_insert.extend(new_rows.itertuples(index=False, name=None))
 
+            # Conflicts — build flags DataFrame and INSERT in one statement.
+            # One round-trip to DuckDB regardless of how many conflicts exist.
+            conflicts = classified[classified["status"] == "conflict"].copy()
+            if not conflicts.empty:
+                flags_df = pd.DataFrame({
+                    "id": conflicts[primary_key].apply(flag_id_for),
+                    "table_name": table,
+                    "check_name": "duplicate_conflict",
+                    "reason": conflicts["reason"].fillna("").str[:500],
+                    "flagged_at": datetime.now(timezone.utc),
+                })
+                conn.execute("""
+                    INSERT INTO flagged_rows
+                        (id, table_name, check_name, reason, flagged_at)
+                    SELECT id, table_name, check_name, reason, flagged_at
+                    FROM flags_df
+                    ON CONFLICT (id) DO NOTHING
+                """)
+                total_flagged += len(conflicts)
+                for key_val, reason_str in zip(
+                    conflicts[primary_key], conflicts["reason"].fillna("")
+                ):
+                    diffs = [d.strip() for d in str(reason_str).split(" | ") if d.strip()]
+                    print(
+                        f"  [flag] key={key_val} — "
+                        f"{' | '.join(diffs[:3])}{'...' if len(diffs) > 3 else ''}"
+                    )
             continue
 
-        print(f"  [warn] Unknown on_duplicate '{on_duplicate}' — appending chunk")
-        all_rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+        print(f"[warn] Unknown on_duplicate '{on_duplicate}' — appending chunk")
+        rows_to_insert.extend(chunk.itertuples(index=False, name=None))
 
-        if total_flagged:
-            print(f"  [flag] {total_flagged} conflict(s) flagged — original rows kept")
-
-        result_parts = []
-        if all_rows_to_insert:
-            result_parts.append(
-                pd.DataFrame(all_rows_to_insert, columns=valid_df.columns)
-            )
-        if not null_rows.empty:
-            result_parts.append(null_rows)
-
-        result = (
-            pd.concat(result_parts, ignore_index=True)
-            if result_parts
-            else pd.DataFrame(columns=df.columns)
+    # FIXED: previously this block was indented inside the chunk loop,
+    # causing early return after the first chunk for unknown on_duplicate modes.
+    if total_flagged:
+        print(
+            f"[flag] {total_flagged} conflict(s) flagged — original rows kept"
         )
-        return result, total_flagged, total_skipped
+
+    result_parts = []
+    if rows_to_insert:
+        result_parts.append(
+            pd.DataFrame(rows_to_insert, columns=non_null_df.columns)
+        )
+    if not null_rows.empty:
+        result_parts.append(null_rows)
+
+    result = (
+        pd.concat(result_parts, ignore_index=True)
+        if result_parts
+        else pd.DataFrame(columns=df.columns)
+    )
+    return result, total_flagged, total_skipped
 
 
 def check_null_overwrites(
@@ -807,10 +848,13 @@ def check_null_overwrites(
     table: str,
     primary_key: str,
 ) -> int:
-    """
-    Manual re-check: scan the table for primary keys that appear more than
+    """Manual re-check: scan the table for primary keys that appear more than
     once with different row content, and flag any new conflicts not already
     recorded in flagged_rows.
+
+    Idempotent — md5(pk_value) + ON CONFLICT DO NOTHING means running twice
+    is safe; already-open flags are silently skipped rather than duplicated.
+    The old LIKE-based duplicate check is removed — UUID idempotency replaces it.
 
     Returns the number of new conflicts flagged.
     """
@@ -831,30 +875,24 @@ def check_null_overwrites(
     non_key_cols = [c for c in all_cols if c != primary_key]
 
     keys = duplicate_keys[primary_key].tolist()
-    placeholders = ", ".join(["?"] * len(keys))
-    rows = conn.execute(
-        f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
-        keys,
-    ).df()
-
     flagged = 0
-    for key_val, group in rows.groupby(primary_key):
-        if len(group) < 2:
-            continue
-        first = group.iloc[0]
-        for _, later in group.iloc[1:].iterrows():
-            changed = _changed_columns(first, later, non_key_cols)
-            if not changed:
-                continue
-            reason_fragment = changed[0] if changed else ""
-            already = conn.execute("""
-                SELECT count(*) FROM flagged_rows
-                WHERE table_name = ?
-                  AND check_name = 'duplicate_conflict'
-                  AND reason LIKE ?
-            """, [table, f"%{reason_fragment}%"]).fetchone()[0]
-            if already == 0:
-                _write_flag(conn, table, changed)
-                flagged += 1
 
+    for chunk_start in range(0, len(keys), CHUNK_SIZE):
+        chunk_keys = keys[chunk_start: chunk_start + CHUNK_SIZE]
+        placeholders = ", ".join(["?"] * len(chunk_keys))
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
+            chunk_keys,
+        ).df()
+
+        for key_val, group in rows.groupby(primary_key):
+            if len(group) < 2:
+                continue
+            first = group.iloc[0]
+            for _, later in group.iloc[1:].iterrows():
+                changed = _changed_columns(first, later, non_key_cols)
+                if not changed:
+                    continue
+                _write_flag(conn, table, changed, pk_value=str(key_val))
+                flagged += 1
     return flagged
