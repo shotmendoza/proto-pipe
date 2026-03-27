@@ -1,5 +1,4 @@
-"""
-Tests for validation_pipeline.ingest
+"""Tests for validation_pipeline.ingest
 
 Covers:
 - resolve_source (pattern matching)

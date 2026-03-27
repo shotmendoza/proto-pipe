@@ -1,5 +1,4 @@
-"""
-Tests for validation_pipeline.runner
+"""Tests for validation_pipeline.runner
 
 Covers:
 - run_report: skips when no new data, completes when data present
