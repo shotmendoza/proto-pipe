@@ -147,13 +147,32 @@ class TestIngestDirectoryHappyPath:
 # ---------------------------------------------------------------------------
 
 class TestIngestModes:
+
     def test_append_doubles_rows(
-        self, incoming_dir, sales_csv, pipeline_db, sources_config
+            self,
+            incoming_dir,
+            sales_csv,
+            pipeline_db,
+            sources_config
     ):
+        # First ingest — loads sales_2026-03.csv (3 rows)
         ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        # Drop a second file with a different name so deduplication doesn't skip it
+        sales_csv2 = incoming_dir / "sales_2026-04.csv"
+        pd.DataFrame(
+            [
+                {"order_id": 4, "price": 40.0, "updated_at": "2026-04-01"},
+                {"order_id": 5, "price": 50.0, "updated_at": "2026-04-02"},
+                {"order_id": 6, "price": 60.0, "updated_at": "2026-04-03"},
+            ]
+        ).to_csv(sales_csv2, index=False)
+
+        # Second ingest — loads sales_2026-04.csv, skips sales_2026-03.csv
         ingest_directory(
             str(incoming_dir), sources_config["sources"], pipeline_db, mode="append"
         )
+
         conn = duckdb.connect(pipeline_db)
         count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
         conn.close()

@@ -1,5 +1,4 @@
-"""
-Corrections module.
+"""Corrections module.
 Handles the flagged-row correction workflow:
 
   1. export_flagged — write flagged rows for a table to a CSV so the user

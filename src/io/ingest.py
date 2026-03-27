@@ -1,10 +1,10 @@
-"""
-Ingestion module.
+"""Ingestion module.
+
 Scans a directory for CSV and Excel files, matches each file to a source
 definition by pattern, and loads the data into DuckDB tables.
 
 Table lifecycle:
-- `db-init`  — creates the DuckDB file and bootstraps empty tables from sources_config.yaml
+- `db-init` — creates the DuckDB file and bootstraps empty tables from sources_config.yaml
 - First ingest of a new source — creates the table lazily from the file's schema
 - Subsequent ingests — appends rows, auto-migrating new columns if the schema grew
 
@@ -301,8 +301,7 @@ def ingest_directory(
     :param directory: The directory containing files to ingest.
     :param sources: A list of source definitions mapping file patterns to target database tables.
     :param db_path: Path to the DuckDB database file used for data storage and ingestion.
-    :param mode: The ingestion mode, either "append" to add records to existing tables or
-        "replace" to overwrite them.
+    :param mode: The ingestion mode, either "append" to add records to existing tables or "replace" to overwrite them.
     :param run_checks: A flag indicating whether to execute validation checks after ingestion.
     :param check_registry: Registry of available checks to validate ingested data, if enabled.
     :param report_registry: Registry used to log the results of executed checks, if enabled.
@@ -357,7 +356,8 @@ def ingest_directory(
             print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
         else:
             new_cols = _auto_migrate(conn, table, df)
-            conn.execute(f'INSERT INTO "{table}" SELECT * FROM df')
+            col_list = ", ".join(f'"{c}"' for c in df.columns)
+            conn.execute(f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df')
             print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows appended)")
 
         _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
@@ -430,11 +430,8 @@ def _already_ingested(
     """Return True if this filename was already successfully ingested.
     Only 'ok' status counts — failed files are retried on every run.
     """
-    result = conn.execute(
-        """
-                          SELECT count(*) FROM ingest_log
-                          WHERE filename = ? AND status = 'ok'
-                          """,
-        [filename],
-    ).fetchone()
+    result = conn.execute("""
+            SELECT count(*) FROM ingest_log
+            WHERE filename = ? AND status = 'ok'
+        """, [filename]).fetchone()
     return result[0] > 0

@@ -207,8 +207,10 @@ class TestMidDayAppend:
         conn = duckdb.connect(pipeline_db)
         count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
         conn.close()
-        # Original 3 + first ingest 3 + second ingest 4 = 10
-        assert count == 10
+
+        # The first `ingest` loads sales_2026-03.csv (3 rows).
+        # The second `ingest` skips it (already ingested) and loads sales_2026-03-corrected.csv (4 rows)
+        assert count == 7
 
     def test_replace_rebuilds_table(
         self,
