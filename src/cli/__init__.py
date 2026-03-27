@@ -2,7 +2,7 @@
 
 import click
 
-from .setup import setup_commands
+from .init import setup_commands
 from .data import data_commands
 from .validation import validation_commands
 from .reports import reports_commands
