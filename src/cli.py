@@ -27,9 +27,9 @@ from src.io.settings import (
     VALID_PATH_KEYS,
     DEFAULT_SETTINGS_PATH,
 )
-from src.pipelines.corrections import dated_export_path
+from src.reports.corrections import dated_export_path
 from src.registry.base import CheckRegistry
-from src.reports.views import load_views_config, create_views, refresh_views
+from src.reports.views import load_views_config, create_views
 
 _TEMPLATES_DIR = Path(__file__).parent / "config"
 
@@ -877,7 +877,7 @@ def checks():
 @click.option("--table", required=True, help="Table to export flagged rows from.")
 @click.option("--output", default=None,  help="Output CSV path. Defaults to flagged_<table>.csv in output_dir.")
 @click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
-def export_flagged(table, output, pipeline_db):
+def export_flagged_file(table, output, pipeline_db):
     """Export flagged rows for a table to CSV for manual correction.
 
     The file includes all source columns plus _flag_reason and _flag_id.
@@ -888,7 +888,7 @@ def export_flagged(table, output, pipeline_db):
       vp export-flagged --table sales
       vp export-flagged --table sales --output /tmp/sales_fixes.csv
     """
-    from src.pipelines.corrections import export_flagged as _export
+    from src.reports.corrections import export_flagged as _export
     import duckdb
 
     p_db = _p("pipeline_db", pipeline_db)
@@ -928,7 +928,7 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
       vp import-corrections flagged_sales.csv --table sales
       vp import-corrections flagged_sales.csv --table sales --key order_id
     """
-    from src.pipelines.corrections import import_corrections as _import
+    from src.reports.corrections import import_corrections as _import
     from src.io.registry import load_config
     import duckdb
 

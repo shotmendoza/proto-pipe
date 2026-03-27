@@ -8,7 +8,6 @@ Run with:
   pytest tests/test_views_corrections_ingest.py -v
 """
 
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,8 +15,8 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.io.ingest import _already_ingested, _init_ingest_log, _log_ingest
-from src.pipelines.corrections import export_flagged, import_corrections
+from src.io.ingest import _already_ingested, _init_ingest_log, _log_ingest, flag_id_for
+from src.reports.corrections import import_corrections, export_flagged
 from src.reports.views import create_views, refresh_views, load_views_config, _load_sql
 
 
@@ -84,16 +83,15 @@ def _write_views_config(tmp_path: Path, views: list[dict]) -> str:
     return str(p)
 
 
-def _flag_row(conn, table_name: str, row_index: int, reason: str) -> str:
-    """Insert a flagged_rows entry and return its id."""
-    flag_id = str(uuid.uuid4())
+def _flag_row(conn, table_name: str, pk_value: str, reason: str) -> str:
+    """Insert a flagged_rows entry using md5(pk_value) as the id and return it."""
+    flag_id = flag_id_for(pk_value)
     conn.execute("""
-        INSERT INTO flagged_rows (id, table_name, row_index, check_name, reason, flagged_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, [flag_id, table_name, row_index, "test_check", reason,
-          datetime.now(timezone.utc)])
+        INSERT INTO flagged_rows (id, table_name, check_name, reason, flagged_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO NOTHING
+    """, [flag_id, table_name, "test_check", reason, datetime.now(timezone.utc)])
     return flag_id
-
 
 # ===========================================================================
 # views.py — _load_sql
@@ -291,96 +289,94 @@ class TestLoadViewsConfig:
 
 class TestExportFlagged:
     def test_exports_flagged_rows_to_csv(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 1, "price out of range")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "price out of range")
         output = str(tmp_path / "flagged.csv")
-        count = export_flagged(conn_with_sales, "sales", output)
+        count = export_flagged(conn_with_sales, "sales", output, "order_id")
         assert count == 1
         assert Path(output).exists()
 
     def test_exported_csv_contains_source_columns(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 1, "negative price")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
         output = str(tmp_path / "flagged.csv")
-        export_flagged(conn_with_sales, "sales", output)
+        export_flagged(conn_with_sales, "sales", output, "order_id")
         df = pd.read_csv(output)
         assert "order_id" in df.columns
         assert "price" in df.columns
         assert "region" in df.columns
 
     def test_exported_csv_contains_annotation_columns(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 1, "negative price")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
         output = str(tmp_path / "flagged.csv")
-        export_flagged(conn_with_sales, "sales", output)
+        export_flagged(conn_with_sales, "sales", output, "order_id")
         df = pd.read_csv(output)
         assert "_flag_reason" in df.columns
         assert "_flag_id" in df.columns
 
     def test_annotation_columns_are_first(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 1, "negative price")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
         output = str(tmp_path / "flagged.csv")
-        export_flagged(conn_with_sales, "sales", output)
+        export_flagged(conn_with_sales, "sales", output, "order_id")
         df = pd.read_csv(output)
         assert df.columns[0] == "_flag_id"
         assert df.columns[1] == "_flag_reason"
 
     def test_flag_reason_matches(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 1, "negative price")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
         output = str(tmp_path / "flagged.csv")
-        export_flagged(conn_with_sales, "sales", output)
+        export_flagged(conn_with_sales, "sales", output, "order_id")
         df = pd.read_csv(output)
         assert df["_flag_reason"].iloc[0] == "negative price"
 
     def test_exports_multiple_flagged_rows(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 1, "negative price")
-        _flag_row(conn_with_sales, "sales", 3, "zero price")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
+        _flag_row(conn_with_sales, "sales", "ORD-004", "zero price")
         output = str(tmp_path / "flagged.csv")
-        count = export_flagged(conn_with_sales, "sales", output)
+        count = export_flagged(conn_with_sales, "sales", output, "order_id")
         assert count == 2
 
     def test_raises_if_no_flagged_rows(self, conn_with_sales, tmp_path):
         output = str(tmp_path / "flagged.csv")
         with pytest.raises(ValueError, match="No flagged rows found"):
-            export_flagged(conn_with_sales, "sales", output)
+            export_flagged(conn_with_sales, "sales", output, "order_id")
 
     def test_raises_if_table_is_empty(self, conn, tmp_path):
-        conn.execute("""
-            CREATE TABLE sales (order_id VARCHAR, price DOUBLE)
-        """)
+        conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
         conn.execute("""
             CREATE TABLE flagged_rows (
-                id VARCHAR PRIMARY KEY, table_name VARCHAR NOT NULL,
-                row_index INTEGER, check_name VARCHAR, reason VARCHAR,
+                id         VARCHAR PRIMARY KEY,
+                table_name VARCHAR NOT NULL,
+                check_name VARCHAR,
+                reason     VARCHAR,
                 flagged_at TIMESTAMPTZ NOT NULL
             )
         """)
-        _flag_row(conn, "sales", 0, "test")
+        _flag_row(conn, "sales", "ORD-EMPTY", "test")
         output = str(tmp_path / "flagged.csv")
-        with pytest.raises(ValueError, match="is empty"):
-            export_flagged(conn, "sales", output)
+        with pytest.raises(ValueError, match="No source rows matched"):
+            export_flagged(conn, "sales", output, "order_id")
 
     def test_only_exports_rows_for_specified_table(self, conn_with_sales, tmp_path):
-        # Add a second table with its own flagged rows
         conn_with_sales.execute("CREATE TABLE orders (order_id VARCHAR, total DOUBLE)")
         conn_with_sales.execute("INSERT INTO orders VALUES ('X1', 5.0)")
-        _flag_row(conn_with_sales, "sales",  1, "bad price")
-        _flag_row(conn_with_sales, "orders", 0, "bad total")
-
+        _flag_row(conn_with_sales, "sales",  "ORD-002", "bad price")
+        _flag_row(conn_with_sales, "orders", "X1",      "bad total")
         output = str(tmp_path / "flagged.csv")
-        count = export_flagged(conn_with_sales, "sales", output)
+        count = export_flagged(conn_with_sales, "sales", output, "order_id")
         df = pd.read_csv(output)
         assert count == 1
         assert len(df) == 1
 
     def test_creates_output_directory_if_missing(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 0, "reason")
+        _flag_row(conn_with_sales, "sales", "ORD-001", "reason")
         output = str(tmp_path / "subdir" / "nested" / "flagged.csv")
-        export_flagged(conn_with_sales, "sales", output)
+        export_flagged(conn_with_sales, "sales", output, "order_id")
         assert Path(output).exists()
 
     def test_returns_row_count(self, conn_with_sales, tmp_path):
-        _flag_row(conn_with_sales, "sales", 0, "r1")
-        _flag_row(conn_with_sales, "sales", 2, "r2")
+        _flag_row(conn_with_sales, "sales", "ORD-001", "r1")
+        _flag_row(conn_with_sales, "sales", "ORD-003", "r2")
         output = str(tmp_path / "f.csv")
-        count = export_flagged(conn_with_sales, "sales", output)
+        count = export_flagged(conn_with_sales, "sales", output, "order_id")
         assert count == 2
 
 
@@ -432,7 +428,7 @@ class TestImportCorrections:
         assert result["updated"] == 1
 
     def test_clears_flagged_rows_by_flag_id(self, conn_with_sales, tmp_path):
-        flag_id = _flag_row(conn_with_sales, "sales", 1, "negative price")
+        flag_id = _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
         path = self._make_corrections_csv(tmp_path, [
             {
                 "_flag_id": flag_id,
@@ -497,7 +493,7 @@ class TestImportCorrections:
         assert result["updated"] == 1
 
     def test_partial_corrections_dont_affect_unflagged_rows(self, conn_with_sales, tmp_path):
-        flag_id = _flag_row(conn_with_sales, "sales", 1, "bad price")
+        flag_id = _flag_row(conn_with_sales, "sales", "ORD-002", "bad price")
         path = self._make_corrections_csv(tmp_path, [
             {
                 "_flag_id": flag_id, "_flag_reason": "bad price",
@@ -560,11 +556,11 @@ class TestCorrectionRoundTrip:
     def test_full_round_trip(self, conn_with_sales, tmp_path):
         """Export flagged rows, simulate user fix, import corrections, verify state."""
         # Flag row at index 1 (ORD-002, price=-50.0)
-        flag_id = _flag_row(conn_with_sales, "sales", 1, "negative price")
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
 
         # Export
         output = str(tmp_path / "flagged_sales.csv")
-        count = export_flagged(conn_with_sales, "sales", output)
+        count = export_flagged(conn_with_sales, "sales", output, "order_id")
         assert count == 1
 
         # Simulate user fixing the price in the CSV
@@ -604,9 +600,9 @@ class TestCorrectionRoundTrip:
         assert "ORD-002" not in df_before["order_id"].values
 
         # Flag and correct ORD-002
-        flag_id = _flag_row(conn_with_sales, "sales", 1, "negative price")
         output = str(tmp_path / "flagged.csv")
-        export_flagged(conn_with_sales, "sales", output)
+        _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
+        export_flagged(conn_with_sales, "sales", output, "order_id")
         df = pd.read_csv(output)
         df.loc[0, "price"] = 75.0
         df.to_csv(output, index=False)

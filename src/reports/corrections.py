@@ -38,7 +38,7 @@ def export_flagged(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     output_path: str,
-    primary_key: str | None = None,
+    primary_key: str,
 ) -> int:
     """ Join flagged_rows metadata with the actual table rows and write to CSV.
 
@@ -59,6 +59,12 @@ def export_flagged(
     Returns the number of rows exported.
     Raises ValueError if no flagged rows exist for the table.
     """
+    if not primary_key:
+        raise ValueError(
+            "primary_key is required for export_flagged. "
+            "Set primary_key in sources_config.yaml and pass it here."
+        )
+
     # Pull flagged metadata for this table
     flag_count = conn.execute(
         "SELECT count(*) FROM flagged_rows WHERE table_name = ?",
@@ -67,6 +73,16 @@ def export_flagged(
 
     if flag_count == 0:
         raise ValueError(f"No flagged rows found for table '{table_name}'")
+
+    print("flagged_rows:", conn.execute("SELECT * FROM flagged_rows").df().to_dict())
+    print(
+        "sales sample:",
+        conn.execute(
+            f'SELECT order_id, md5(CAST(order_id AS VARCHAR)) as computed_id FROM "{table_name}" LIMIT 4'
+        )
+        .df()
+        .to_dict(),
+    )
 
     # Single JOIN — md5 of the primary key column matches flagged_rows.id
     source_df = conn.execute(
