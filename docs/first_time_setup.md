@@ -217,6 +217,7 @@ A `✓` means the check returned without raising. A `✗` means it raised an
 exception — the error message tells you why.
 
 If checks flag bad rows, they are written to the `flagged_rows` table.
+Run `vp flagged-summary` to see a count of open flags before proceeding.
 See `docs/reviewing_flagged_rows.md` for how to review and correct them.
 
 ---
@@ -290,6 +291,15 @@ New files dropped into the incoming folder are picked up automatically.
 Files already ingested are skipped. The deliverable is written to the output
 folder with the current date in the filename.
 
+If the run stops due to flagged rows:
+
+```bash
+vp flagged-summary                          # see what needs attention
+vp export-flagged --table sales             # export for correction
+vp import-corrections flagged_sales.csv --table sales   # apply fixes
+vp run-all --deliverable monthly_pack       # re-run clean
+```
+
 ---
 
 ## Quick reference
@@ -304,5 +314,12 @@ folder with the current date in the filename.
 | Check current paths | `vp config show` |
 | Update a path | `vp config set <key> <value>` |
 | List available checks | `vp checks` |
+| Check for flagged rows | `vp flagged-summary` |
+| View flagged rows | `vp flagged-list --table <n>` |
+| Export flagged for correction | `vp export-flagged --table <n>` |
+| Apply corrections | `vp import-corrections <file> --table <n>` |
+| Clear flags without correcting | `vp flagged-clear --table <n>` |
+| Scan for duplicate conflicts | `vp check-null-overwrites --table <n>` |
+| Refresh views manually | `vp refresh-views` |
 | Review failed ingests | Query `ingest_log` in pipeline.db |
 | Review flagged rows | See `docs/reviewing_flagged_rows.md` |

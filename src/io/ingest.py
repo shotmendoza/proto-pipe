@@ -38,7 +38,6 @@ from typing import Literal
 import duckdb
 import pandas as pd  # type: ignore
 
-
 # ---------------------------------------------------------------------------
 # Structural checks — lightweight, run per file before loading
 # ---------------------------------------------------------------------------

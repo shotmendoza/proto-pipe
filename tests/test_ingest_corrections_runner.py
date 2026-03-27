@@ -28,17 +28,17 @@ Tests covering all behaviour with the final flag identity design:
 """
 
 import hashlib
-import uuid
-import pytest
-import duckdb
-import pandas as pd
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import duckdb
+import pandas as pd
+import pytest
+
 from src.io.ingest import (
     ingest_directory, _handle_duplicates, check_null_overwrites,
-    _already_ingested, _init_ingest_log, _log_ingest, CHUNK_SIZE,
+    _init_ingest_log, CHUNK_SIZE,
     flag_id_for, _write_flag,
 )
 from src.reports.corrections import export_flagged, import_corrections, dated_export_path

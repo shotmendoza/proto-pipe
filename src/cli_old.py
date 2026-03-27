@@ -27,8 +27,8 @@ from src.io.settings import (
     VALID_PATH_KEYS,
     DEFAULT_SETTINGS_PATH,
 )
-from src.reports.corrections import dated_export_path
 from src.registry.base import CheckRegistry
+from src.reports.corrections import dated_export_path
 from src.reports.views import load_views_config, create_views
 
 _TEMPLATES_DIR = Path(__file__).parent / "config"

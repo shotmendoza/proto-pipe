@@ -88,26 +88,89 @@ your-project/
 ## Package Structure
 
 ```
-validation_pipeline/
-├── cli.py                  # all CLI commands
-├── registry.py             # CheckRegistry + ReportRegistry
-├── ingest.py               # file ingestion, deduplication, auto-migration, ingest_log
-├── runner.py               # parallel report execution
-├── watermark.py            # watermark store (DuckDB)
-├── query.py                # filter-to-SQL builder, dynamic date tokens, sql_file execution
-├── deliverables.py         # CSV/Excel output + report_runs log
-├── views.py                # DuckDB view creation and refresh
-├── corrections.py          # flagged-row export and correction import
-├── settings.py             # pipeline.yaml reader/writer
-├── checks/
-│   ├── built_in.py         # null_check, range_check, schema_check, duplicate_check
-│   └── registry_helpers.py # register_custom_check
-└── config/
-    ├── pipeline.yaml             # template — copied to project root by init
-    ├── sources_config.yaml       # template
-    ├── reports_config.yaml       # template
-    ├── deliverables_config.yaml  # template
-    └── views_config.yaml         # template
+├── README.md
+├── config
+│       ├── deliverables_config.yaml
+│       ├── pipeline.yaml
+│       ├── reports_config.yaml
+│       ├── sources_config.yaml
+│       └── views_config.yaml
+├── docs
+│       ├── adding_checks.md
+│       ├── adding_deliverables.md
+│       ├── adding_reports.md
+│       ├── first_time_setup.md
+│       └── reviewing_flagged_rows.md
+├── pyproject.toml
+├── src
+│        ├── __init__.py
+│        ├── __pycache__
+│        ├── checks
+│        │       ├── __init__.py
+│        │       ├── __pycache__
+│        │       ├── built_in.py
+│        │       ├── helpers.py
+│        │       └── runner.py
+│        ├── cli.py
+│        ├── io
+│        │       ├── __init__.py
+│        │       ├── __pycache__
+│        │       ├── data.py
+│        │       ├── ingest.py
+│        │       ├── registry.py
+│        │       └── settings.py
+│        ├── main.py
+│        ├── pipelines
+│        │       ├── __init__.py
+│        │       ├── __pycache__
+│        │       └── watermark.py
+│        ├── registry
+│        │       ├── __init__.py
+│        │       ├── __pycache__
+│        │       └── base.py
+│        └── reports
+│            ├── __init__.py
+│            ├── __pycache__
+│            ├── corrections.py
+│            ├── query.py
+│            ├── runner.py
+│            └── views.py
+├── tests
+│        ├── __init__.py
+│        ├── __pycache__
+│        │       ├── __init__.cpython-313.pyc
+│        │       ├── conftest.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_checks.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_checks.cpython-313.pyc
+│        │       ├── test_custom_checks.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_custom_checks.cpython-313.pyc
+│        │       ├── test_deliverables.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_deliverables.cpython-313.pyc
+│        │       ├── test_ingest.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_ingest.cpython-313.pyc
+│        │       ├── test_ingest_chunking.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_ingest_corrections.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_ingest_corrections_runner.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_query.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_query.cpython-313.pyc
+│        │       ├── test_runner.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_runner.cpython-313.pyc
+│        │       ├── test_views_corrections_ingest.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_watermark.cpython-313-pytest-9.0.2.pyc
+│        │       ├── test_watermark.cpython-313.pyc
+│        │       ├── test_workflow.cpython-313-pytest-9.0.2.pyc
+│        │       └── test_workflow.cpython-313.pyc
+│        ├── conftest.py
+│        ├── test_checks.py
+│        ├── test_custom_checks.py
+│        ├── test_deliverables.py
+│        ├── test_ingest.py
+│        ├── test_ingest_corrections_runner.py
+│        ├── test_query.py
+│        ├── test_runner.py
+│        ├── test_views_corrections_ingest.py
+│        ├── test_watermark.py
+│        └── test_workflow.py
 ```
 
 ---
