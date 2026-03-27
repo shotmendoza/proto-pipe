@@ -297,8 +297,6 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
 # ---------------------------------------------------------------------------
 # check-null-overwrites
 # ---------------------------------------------------------------------------
-
-
 @click.command("check-null-overwrites")
 @click.option("--table", required=True, help="Table to scan for duplicate conflicts.")
 @click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
