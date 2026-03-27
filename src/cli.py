@@ -227,7 +227,7 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
     if views:
         click.echo(f"\nCreating views from: {v_cfg}")
         try:
-            create_views(conn, views, replace=False)
+            create_views(conn, views, replace=False, skip_missing_tables=True)
         except Exception as e:
             click.echo(f"  [error] Could not create views: {e}")
     else:
@@ -476,7 +476,7 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     :return: None
     """
     from src.io.ingest import (
-        _load_file,
+        load_file,
         _init_ingest_log,
         _table_exists,
         _auto_migrate,
@@ -505,7 +505,7 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     source = sources[table]
 
     try:
-        df = _load_file(path)
+        df = load_file(path)
     except Exception as e:
         click.echo(f"  [error] Could not load '{filepath}': {e}")
         return
@@ -651,6 +651,71 @@ def pull_report(
 # ---------------------------------------------------------------------------
 
 
+def run_all_pull_report_step(
+    conn,  # single open DuckDB connection passed in
+    deliverable,
+    del_config,
+    rep_config,
+    out_dir,
+    p_db,
+    query_table,
+    produce_deliverable,
+    v_cfg,
+):
+    """
+    Extracted pull-report logic for run-all that reuses the existing conn
+    instead of opening a new one, and refreshes views before producing output.
+    This function is illustrative — integrate the logic inline in your run-all.
+    """
+    from src.reports.views import load_views_config, refresh_views
+
+    deliverables = {d["name"]: d for d in del_config.get("deliverables", [])}
+
+    if deliverable not in deliverables:
+        click.echo(f"  [error] No deliverable named '{deliverable}'")
+        return
+
+    # Refresh views before producing deliverables
+    click.echo("\n── Refresh Views ───────────────────────────")
+    views = load_views_config(v_cfg)
+    if views:
+        try:
+            refresh_views(conn, views)
+        except Exception as e:
+            click.echo(f"  [error] Could not refresh views: {e}")
+            return
+    else:
+        click.echo("  [skip] No views defined")
+
+    click.echo("\n── Pull Report ─────────────────────────────")
+    d = deliverables[deliverable]
+
+    # Load reports config once
+    report_defs = {r["name"]: r for r in rep_config.get("reports", [])}
+
+    report_dataframes = {}
+    for report_cfg in d["reports"]:
+        rname = report_cfg["name"]
+        sql_file = report_cfg.get("sql_file")
+
+        if sql_file:
+            try:
+                df = query_table(conn, sql_file=sql_file)
+                report_dataframes[rname] = df
+                click.echo(f"  [query] {rname} → {len(df)} rows (sql_file)")
+            except Exception as e:
+                click.echo(f"  [error] sql_file failed for '{rname}': {e}")
+        else:
+            if rname not in report_defs:
+                click.echo(f"  [warn] '{rname}' not in reports_config.yaml, skipping")
+                continue
+            table = report_defs[rname]["source"]["table"]
+            df = query_table(conn, table, filters=report_cfg.get("filters", {}))
+            report_dataframes[rname] = df
+
+    produce_deliverable(d, report_dataframes, out_dir, p_db)
+
+
 @cli.command("run-all")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--watermark-db", default=None, help="Override watermark DB path.")
@@ -665,6 +730,7 @@ def pull_report(
     help="Produce deliverable even if flagged rows exist.",
 )
 def run_all(
+        conn,
         pipeline_db,
         watermark_db,
         incoming_dir,
@@ -684,6 +750,7 @@ def run_all(
     from src.reports.runner import run_deliverable
     from src.reports.query import query_table
     from src.io.ingest import ingest_directory
+    from src.reports.views import refresh_views, load_views_config
 
     import duckdb
 
@@ -831,7 +898,7 @@ def export_flagged(table, output, pipeline_db):
 
     conn = duckdb.connect(p_db)
     try:
-        count = _export(conn, table, output_path)
+        count = _export(conn, table, output_path, primary_key=pk)
         click.echo(f"[ok] {count} flagged row(s) exported to: {output_path}")
         click.echo(f"\nFix the values, then run:")
         click.echo(f"vp import-corrections {output_path} --table {table}")
@@ -1168,6 +1235,221 @@ def flagged_clear(table, check, yes, pipeline_db):
 
         conn.execute(del_query, del_params)
         click.echo(f"[ok] {count} flag(s) cleared for '{table}' ({scope})")
+    except click.Abort:
+        click.echo("\n  Cancelled.")
+    finally:
+        conn.close()
+
+
+@click.command("check-null-overwrites")
+@click.option("--table", required=True)
+@click.option("--pipeline-db", default=None)
+@click.option("--sources-config", default=None)
+def check_null_overwrites_cmd(table, pipeline_db, sources_config):
+    """Manually scan a table for rows with the same primary key but different
+    content, and flag any new conflicts not already in flagged_rows.
+
+    \b
+    Example:
+      vp check-null-overwrites --table sales
+    """
+    from src.io.ingest import check_null_overwrites
+    from src.io.registry import load_config
+    import duckdb
+
+    p_db = _p("pipeline_db", pipeline_db)
+    src_cfg = _p("sources_config", sources_config)
+    _config = load_config(src_cfg)
+    sources = {s["target_table"]: s for s in _config["sources"]}
+
+    if table not in sources:
+        click.echo(f"  [error] No source defined for '{table}' in sources_config.yaml")
+        return
+
+    primary_key = sources[table].get("primary_key")
+    if not primary_key:
+        click.echo(
+            f"  [error] No primary_key defined for '{table}' in sources_config.yaml"
+        )
+        return
+
+    conn = duckdb.connect(p_db)
+    try:
+        flagged = check_null_overwrites(conn, table, primary_key)
+        if flagged:
+            click.echo(f"  [ok] {flagged} new conflict(s) flagged in '{table}'")
+            click.echo(f"       Run: vp export-flagged --table {table}")
+        else:
+            click.echo(f"  [ok] No new conflicts found in '{table}'")
+    finally:
+        conn.close()
+
+
+@click.command("flagged-summary")
+@click.option("--pipeline-db", default=None)
+def flagged_summary(pipeline_db):
+    """
+    Print a count of open flagged rows by table and reason.
+
+    \b
+    Example:
+      vp flagged-summary
+    """
+    import duckdb
+
+    p_db = _p("pipeline_db", pipeline_db)
+    conn = duckdb.connect(p_db)
+    try:
+        df = conn.execute("""
+                          SELECT table_name, check_name, reason, count(*) AS flagged_count,
+                                 min(flagged_at) AS first_flagged, max(flagged_at) AS last_flagged
+                          FROM flagged_rows
+                          GROUP BY table_name, check_name, reason
+                          ORDER BY table_name, flagged_count DESC
+                          """).df()
+
+        if df.empty:
+            click.echo("\n  No flagged rows — all clear.")
+            return
+
+        total = df["flagged_count"].sum()
+        click.echo(
+            f"\n  {total} flagged row(s) across {df['table_name'].nunique()} table(s):\n"
+        )
+
+        current_table = None
+        for _, row in df.iterrows():
+            if row["table_name"] != current_table:
+                current_table = row["table_name"]
+                click.echo(f"  {current_table}")
+            click.echo(
+                f"    {row['flagged_count']:>4}  [{row['check_name']}]  {row['reason']}"
+            )
+
+        click.echo(f"\n  Run: vp flagged-list --table <n>   to see affected rows")
+        click.echo(f"  Run: vp export-flagged --table <n>  to export for correction")
+    finally:
+        conn.close()
+
+
+@click.command("flagged-list")
+@click.option("--table", required=True)
+@click.option("--check", default=None)
+@click.option("--limit", default=50, show_default=True)
+@click.option("--pipeline-db", default=None)
+def flagged_list(table, check, limit, pipeline_db):
+    """
+    Print flagged rows for a table inline in the terminal.
+
+    \b
+    Examples:
+      vp flagged-list --table sales
+      vp flagged-list --table sales --check duplicate_conflict
+      vp flagged-list --table sales --limit 20
+    """
+    import duckdb
+
+    p_db = _p("pipeline_db", pipeline_db)
+    conn = duckdb.connect(p_db)
+    try:
+        query = """
+                 SELECT id AS _flag_id, row_index, check_name, reason AS _flag_reason, flagged_at
+                 FROM flagged_rows WHERE table_name = ? \
+                 """
+        params = [table]
+        if check:
+            query += " AND check_name = ?"
+            params.append(check)
+        query += " ORDER BY flagged_at DESC"
+
+        flags = conn.execute(query, params).df()
+
+        if flags.empty:
+            click.echo(f"\n  No flagged rows for '{table}'.")
+            return
+
+        total = len(flags)
+        shown = min(total, limit)
+        click.echo(f"\n  {total} flagged row(s) for '{table}' (showing {shown}):\n")
+
+        source_df = conn.execute(f'SELECT * FROM "{table}"').df()
+        source_df["_row_index"] = source_df.index
+
+        merged = (
+            flags.head(limit)
+            .merge(
+                source_df,
+                left_on="row_index",
+                right_on="_row_index",
+                how="left",
+            )
+            .drop(columns=["_row_index", "row_index", "_flag_id"])
+        )
+
+        for _, row in merged.iterrows():
+            click.echo(f"  ── [{row['check_name']}] {row['_flag_reason']}")
+            click.echo(f"     flagged: {row['flagged_at']}")
+            skip = {"check_name", "_flag_reason", "flagged_at"}
+            for col in [c for c in merged.columns if c not in skip]:
+                click.echo(f"     {col}: {row[col]}")
+            click.echo()
+
+        if total > limit:
+            click.echo(
+                f"  ... {total - limit} more row(s) not shown. "
+                f"Use --limit or vp export-flagged to see all."
+            )
+    finally:
+        conn.close()
+
+
+@click.command("flagged-clear")
+@click.option("--table", required=True)
+@click.option("--check", default=None)
+@click.option("--yes", is_flag=True, default=False)
+@click.option("--pipeline-db", default=None)
+def flagged_clear(table, check, yes, pipeline_db):
+    """
+    Clear all flagged rows for a table without applying corrections.
+
+    \b
+    Examples:
+      vp flagged-clear --table sales
+      vp flagged-clear --table sales --check duplicate_conflict
+      vp flagged-clear --table sales --yes
+    """
+    import duckdb
+
+    p_db = _p("pipeline_db", pipeline_db)
+    conn = duckdb.connect(p_db)
+    try:
+        query = "SELECT count(*) FROM flagged_rows WHERE table_name = ?"
+        params = [table]
+        if check:
+            query += " AND check_name = ?"
+            params.append(check)
+
+        count = conn.execute(query, params).fetchone()[0]
+        if count == 0:
+            click.echo(f"  No flagged rows to clear for '{table}'.")
+            return
+
+        scope = f"check '{check}'" if check else "all checks"
+        if not yes:
+            click.confirm(
+                f"  Clear {count} flagged row(s) for '{table}' ({scope})? "
+                f"This cannot be undone.",
+                abort=True,
+            )
+
+        del_q = "DELETE FROM flagged_rows WHERE table_name = ?"
+        del_p = [table]
+        if check:
+            del_q += " AND check_name = ?"
+            del_p.append(check)
+
+        conn.execute(del_q, del_p)
+        click.echo(f"  [ok] {count} flag(s) cleared for '{table}' ({scope})")
     except click.Abort:
         click.echo("\n  Cancelled.")
     finally:

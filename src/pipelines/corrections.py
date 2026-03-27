@@ -17,6 +17,8 @@ from pathlib import Path
 import duckdb
 import pandas as pd  # type: ignore
 
+from src.io.ingest import load_file
+
 
 # ---------------------------------------------------------------------------
 # Export flagged rows
@@ -26,13 +28,23 @@ def export_flagged(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
     output_path: str,
+    primary_key: str | None = None,
 ) -> int:
-    """Join flagged_rows metadata with the actual table rows and write to CSV.
+    """ Join flagged_rows metadata with the actual table rows and write to CSV.
 
-    The exported file includes all columns from the source table plus two
-    annotation columns:
-        _flag_reason — the reason the row was flagged
-        _flag_id — the flagged_rows.id (used internally on re-import)
+    Joins on primary_key instead of row_index when primary_key is
+    provided. This avoids drift — if rows are inserted or deleted between
+    the time the flag is written and the time the export runs, a row_index
+    join would produce the wrong row. Joining on the primary key is stable.
+
+    Falls back to row_index join when primary_key is not provided.
+
+    The output filename includes today's date:
+        flagged_<table>_YYYY-MM-DD.csv
+
+    The file includes all source columns plus:
+        _flag_id — internal ID, keep this when re-importing
+        _flag_reason — why the row was flagged, for reference only
 
     Returns the number of rows exported.
     Raises ValueError if no flagged rows exist for the table.
@@ -54,14 +66,29 @@ def export_flagged(
     if source_df.empty:
         raise ValueError(f"Table '{table_name}' is empty")
 
-    # Join on row_index (DuckDB rowid-equivalent stored at flag time)
-    source_df["_row_index"] = source_df.index
-    merged = flagged.merge(
-        source_df,
-        left_on="row_index",
-        right_on="_row_index",
-        how="left",
-    ).drop(columns=["_row_index", "row_index"])
+    if primary_key and primary_key in source_df.columns:
+        # CHANGED: stable join on primary key — immune to row insertion/deletion
+        # We stored the primary key value at flag time via row_index, so we
+        # first map row_index → primary_key using the current table, then join.
+        source_df["_row_index"] = source_df.index
+        idx_to_key = source_df.set_index("_row_index")[primary_key].to_dict()
+        flagged["_pk_value"] = flagged["row_index"].map(idx_to_key)
+
+        merged = flagged.merge(
+            source_df.drop(columns=["_row_index"]),
+            left_on="_pk_value",
+            right_on=primary_key,
+            how="left",
+        ).drop(columns=["_pk_value", "row_index"])
+    else:
+        # Fallback: row_index join
+        source_df["_row_index"] = source_df.index
+        merged = flagged.merge(
+            source_df,
+            left_on="row_index",
+            right_on="_row_index",
+            how="left"
+        ).drop(columns=["_row_index", "row_index"])
 
     # Put annotation columns first so they're visible without scrolling
     cols = ["_flag_id", "_flag_reason"] + [
@@ -93,8 +120,7 @@ def import_corrections(
     corrections_path: str,
     primary_key: str,
 ) -> dict:
-    """
-    Read a corrected CSV and UPDATE matching rows in the table by primary key.
+    """Read a corrected CSV and UPDATE matching rows in the table by primary key.
     Clears resolved entries from flagged_rows.
 
     The corrections file is expected to be the output of export_flagged —
@@ -115,7 +141,7 @@ def import_corrections(
     if not path.exists():
         raise FileNotFoundError(f"Corrections file not found: {corrections_path}")
 
-    df = pd.read_csv(path)
+    df = load_file(path)
 
     if primary_key not in df.columns:
         raise ValueError(
@@ -147,17 +173,43 @@ def import_corrections(
             f"table columns: {sorted(table_cols)}"
         )
 
-    updated = 0
-    for _, row in df.iterrows():
-        key_val = row[primary_key]
-        set_clause = ", ".join([f'"{col}" = ?' for col in update_cols])
-        values = [row[col] for col in update_cols] + [key_val]
-
-        conn.execute(
-            f'UPDATE "{table_name}" SET {set_clause} WHERE "{primary_key}" = ?',
-            values,
+    # CHANGED: warn about keys in the corrections file that don't exist in the table
+    existing_keys = set(
+        conn.execute(f'SELECT DISTINCT "{primary_key}" FROM "{table_name}"')
+        .df()[primary_key]
+        .tolist()
+    )
+    correction_keys = set(df[primary_key].dropna().tolist())
+    not_found_keys = correction_keys - existing_keys
+    not_found = len(not_found_keys)
+    if not_found_keys:
+        print(
+            f"  [warn] {not_found} key(s) in corrections file not found in "
+            f"'{table_name}': {sorted(not_found_keys)[:5]}"
+            + (" ..." if not_found > 5 else "")
         )
-        updated += 1
+
+    # CHANGED: batched UPDATE via staging table instead of row-by-row Python loop.
+    # Register the corrections DataFrame as a temporary view, then issue a single
+    # UPDATE ... FROM ... JOIN which DuckDB executes in one pass.
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _corrections_staging AS SELECT * FROM df LIMIT 0"
+    )
+    conn.execute("DELETE FROM _corrections_staging")
+    conn.execute("INSERT INTO _corrections_staging SELECT * FROM df")
+
+    set_clause = ", ".join(
+        [f'"{col}" = _corrections_staging."{col}"' for col in update_cols]
+    )
+    conn.execute(f"""
+        UPDATE "{table_name}"
+        SET {set_clause}
+        FROM _corrections_staging
+        WHERE "{table_name}"."{primary_key}" = _corrections_staging."{primary_key}"
+    """)
+    conn.execute("DROP TABLE IF EXISTS _corrections_staging")
+
+    updated = len(df) - not_found
 
     # Clear resolved flagged_rows entries
     flagged_cleared = 0
@@ -172,4 +224,4 @@ def import_corrections(
             flag_ids,
         )
 
-    return {"updated": updated, "flagged_cleared": flagged_cleared}
+    return {"updated": updated, "flagged_cleared": flagged_cleared, "not_found": not_found}

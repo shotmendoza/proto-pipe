@@ -44,6 +44,7 @@ import pandas as pd  # type: ignore
 # ---------------------------------------------------------------------------
 _SUPPORTED_FILE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 _MAX_DIFF_COLS = 5  # cap reason string to avoid wall-of-text in flagged_rows
+CHUNK_SIZE = 1000
 
 
 def _is_supported_file(path: Path) -> bool:
@@ -194,7 +195,7 @@ def resolve_source(
     return None
 
 
-def _load_file(path: Path) -> pd.DataFrame:
+def load_file(path: Path) -> pd.DataFrame:
     """Load a CSV or Excel file into a DataFrame.
 
     This function supports loading files in CSV or Excel formats. Depending on
@@ -377,7 +378,7 @@ def ingest_directory(
 
         # Load file
         try:
-            df = _load_file(path)
+            df = load_file(path)
         except Exception as exc:
             message = f"Could not load file: {exc}"
             print(f"[fail] '{path.name}': {message}")

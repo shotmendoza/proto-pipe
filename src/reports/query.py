@@ -13,6 +13,7 @@ Two query paths:
                  CLI overrides can replace per-column filter values at runtime.
 """
 import calendar
+import re
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
@@ -178,9 +179,8 @@ def init_report_runs_table(conn: duckdb.DuckDBPyConnection) -> None:
 # Dynamic date token resolution
 # ---------------------------------------------------------------------------
 def resolve_date_token(value: str) -> str:
-    """
-    Resolve a dynamic date token to a YYYY-MM-DD string.
-    If the value is not a recognised token, return it unchanged
+    """Resolve a dynamic date token to a YYYY-MM-DD string.
+    If the value is not a recognized token, return it unchanged
     (so hardcoded dates like "2026-01-01" pass through safely).
 
     Supported tokens:
@@ -239,7 +239,6 @@ def resolve_date_token(value: str) -> str:
 
     # today±Nd
     if v.startswith("today"):
-        import re
         m = re.fullmatch(r"today([+-])(\d+)d", v)
         if m:
             sign, days = m.group(1), int(m.group(2))
@@ -268,13 +267,28 @@ def resolve_filter_dates(filters: dict) -> dict:
     return resolved
 
 
+# ---------------------------------------------------------------------------
+# sql_file execution
+# ---------------------------------------------------------------------------
+# Matches a statement separator NOT inside a string literal.
+# Simple approach: strip trailing semicolons from the whole SQL, then
+# check that no mid-statement semicolons remain (which would indicate
+# multiple statements).
+_SEMICOLON_RE = re.compile(r";")
+
+
 def execute_sql_file(
     conn: duckdb.DuckDBPyConnection,
     sql_file: str,
 ) -> pd.DataFrame:
-    """
-    Load a .sql file and execute it against the connection.
-    The file is expected to contain a single SELECT statement.
+    """Load a .sql file and execute it against the connection.
+
+    Validates that the file contains exactly one SELECT statement:
+    - Trailing semicolons are stripped automatically.
+    - A semicolon anywhere else in the file raises ValueError, because
+      it almost certainly means two statements were written (e.g. a SET
+      followed by a SELECT), which DuckDB will reject with a cryptic error.
+
     Date logic is written directly in the SQL using DuckDB functions.
     """
     path = Path(sql_file)
@@ -284,5 +298,17 @@ def execute_sql_file(
     sql = path.read_text().strip()
     if not sql:
         raise ValueError(f"SQL file is empty: {sql_file}")
+
+    # Strip a single trailing semicolon if present
+    if sql.endswith(";"):
+        sql = sql[:-1].rstrip()
+
+    # If a semicolon still remains, there are multiple statements
+    if ";" in sql:
+        raise ValueError(
+            f"SQL file contains multiple statements (found ';' after stripping "
+            f"trailing semicolon): {sql_file}\n"
+            f"Each sql_file must contain exactly one SELECT statement."
+        )
 
     return conn.execute(sql).df()

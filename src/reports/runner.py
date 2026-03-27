@@ -6,7 +6,7 @@ import duckdb
 import pandas as pd
 
 from src.checks.runner import run_checks
-from src.io.pipeline import load_from_duckdb
+from src.io.data import load_from_duckdb
 from src.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from src.pipelines.watermark import WatermarkStore, _watermark_lock
 from src.registry.base import CheckRegistry, ReportRegistry
@@ -38,7 +38,6 @@ def run_report(
     source_config = report_config["source"]
     options = report_config.get("options", {})
     parallel_checks = options.get("parallel", False)
-    check_names = report_config["resolved_checks"]
 
     last_run_at = watermark_store.get(report_name)
     df = load_from_duckdb(source_config, last_run_at)
@@ -47,26 +46,33 @@ def run_report(
         print(f"[{report_name}] No new data, skipping.")
         return {"report": report_name, "status": "skipped"}
 
+    context = {"df": df}
+    check_names = report_config["resolved_checks"]
+
     try:
         results = run_checks(
             check_names,
             check_registry,
-            {"df": df},
+            context,
             parallel=parallel_checks,
         )
     except Exception as exc:
         # Watermark not advanced — rows will be retried next run
         return {"report": report_name, "status": "failed", "error": str(exc)}
 
-    _advance_watermark(report_name, source_config["timestamp_col"], df, watermark_store)
+    any_failed = any(result["status"] == "failed" for result in results.values())
+    if any_failed:
+        print(f"[{report_name}] One or more checks failed — watermark not advanced.")
+        return {"report": report_name, "status": "completed", "results": results}
 
+    _advance_watermark(report_name, source_config["timestamp_col"], df, watermark_store)
     return {"report": report_name, "status": "completed", "results": results}
 
 
 def _advance_watermark(
         report_name: str,
         timestamp_col: str,
-        df,
+        df: pd.DataFrame,
         watermark_store: WatermarkStore,
 ) -> None:
     """Advance the report watermark to the latest timestamp in the loaded data."""
