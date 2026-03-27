@@ -558,10 +558,10 @@ class TestImportCorrectionsNotFound:
 
 class TestWatermarkOnlyAdvancesOnFullPass:
     def test_watermark_held_when_check_fails(self):
-        from runner import run_report
+        from src.reports.runner import run_report
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
-        check_registry  = MagicMock()
+        check_registry = MagicMock()
         check_registry.run.side_effect = ValueError("check failed")
         report_config = {
             "name": "test_report",
@@ -578,10 +578,10 @@ class TestWatermarkOnlyAdvancesOnFullPass:
         assert result["results"]["failing_check"]["status"] == "failed"
 
     def test_watermark_advances_when_all_pass(self):
-        from runner import run_report
+        from src.reports.runner import run_report
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
-        check_registry  = MagicMock()
+        check_registry = MagicMock()
         check_registry.run.return_value = {"status": "ok"}
         report_config = {
             "name": "test_report",
