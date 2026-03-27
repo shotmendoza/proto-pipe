@@ -453,6 +453,39 @@ class TestCheckNullOverwritesIdempotent:
         conn.close()
         assert flagged == CHUNK_SIZE + 3
 
+    def test_returns_zero_when_no_duplicates(self, tmp_path):
+        """Table with all unique primary keys returns 0."""
+        db = _make_db(tmp_path)
+        conn = duckdb.connect(db)
+        _init_flagged_rows(conn)
+        df = pd.DataFrame(
+            [
+                {"order_id": "ORD-1", "price": 100.0},
+                {"order_id": "ORD-2", "price": 200.0},
+                {"order_id": "ORD-3", "price": 300.0},
+            ]
+        )
+        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
+        result = check_null_overwrites(conn, "sales", "order_id")
+        conn.close()
+        assert result == 0
+
+    def test_identical_duplicate_rows_not_flagged(self, tmp_path):
+        """Two rows with the same primary key but identical content produce no flag."""
+        db = _make_db(tmp_path)
+        conn = duckdb.connect(db)
+        _init_flagged_rows(conn)
+        df = pd.DataFrame(
+            [
+                {"order_id": "ORD-1", "price": 100.0},
+                {"order_id": "ORD-1", "price": 100.0},  # exact duplicate
+            ]
+        )
+        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
+        result = check_null_overwrites(conn, "sales", "order_id")
+        conn.close()
+        assert result == 0
+
 
 # ---------------------------------------------------------------------------
 # TestExportFlaggedJoin
@@ -462,14 +495,14 @@ class TestExportFlaggedJoin:
     def _make_conn(self):
         conn = duckdb.connect(":memory:")
         conn.execute("""
-            CREATE TABLE sales (order_id VARCHAR, price DOUBLE, region VARCHAR)
-        """)
+                     CREATE TABLE sales (order_id VARCHAR, price DOUBLE, region VARCHAR)
+                     """)
         conn.execute("""
-            INSERT INTO sales VALUES
-                ('ORD-1', 100.0, 'EMEA'),
-                ('ORD-2', 200.0, 'APAC'),
-                ('ORD-3', 300.0, 'LATAM')
-        """)
+                     INSERT INTO sales VALUES
+                                           ('ORD-1', 100.0, 'EMEA'),
+                                           ('ORD-2', 200.0, 'APAC'),
+                                           ('ORD-3', 300.0, 'LATAM')
+                     """)
         _init_flagged_rows(conn)
         return conn
 
@@ -477,11 +510,11 @@ class TestExportFlaggedJoin:
         conn = self._make_conn()
         _flag(conn, "sales", "ORD-2", "price out of range")
         output = str(tmp_path / "flagged.csv")
-        count  = export_flagged(conn, "sales", output, primary_key="order_id")
+        count = export_flagged(conn, "sales", output, primary_key="order_id")
         assert count == 1
         assert Path(output).exists()
         df = pd.read_csv(output)
-        assert "_flag_id"     in df.columns
+        assert "_flag_id" in df.columns
         assert "_flag_reason" in df.columns
         assert df["order_id"].iloc[0] == "ORD-2"
 
@@ -506,11 +539,21 @@ class TestExportFlaggedJoin:
     def test_raises_when_no_flags(self, tmp_path):
         conn = self._make_conn()
         with pytest.raises(ValueError, match="No flagged rows found"):
-            export_flagged(conn, "sales", str(tmp_path / "out.csv"), primary_key="order_id")
+            export_flagged(
+                conn, "sales", str(tmp_path / "out.csv"), primary_key="order_id"
+            )
+
+    def test_raises_when_primary_key_is_none(self, tmp_path):
+        """export_flagged requires primary_key — None raises immediately."""
+        conn = self._make_conn()
+        _flag(conn, "sales", "ORD-1", "test")
+        with pytest.raises(ValueError, match="primary_key is required"):
+            export_flagged(conn, "sales", str(tmp_path / "out.csv"), primary_key=None)
 
     def test_dated_filename(self, tmp_path):
         from datetime import date
-        path  = dated_export_path(str(tmp_path), "sales")
+
+        path = dated_export_path(str(tmp_path), "sales")
         today = date.today().isoformat()
         assert today in path
         assert path.endswith(".csv")
@@ -690,15 +733,162 @@ class TestFullRoundTripWithExport:
         result = import_corrections(conn, "sales", export_path, "order_id")
         conn.close()
 
-        assert result["updated"]         >= 1
+        assert result["updated"] >= 1
         assert result["flagged_cleared"] == 1
 
-        conn  = duckdb.connect(db)
+        conn = duckdb.connect(db)
         price = conn.execute(
             "SELECT price FROM sales WHERE order_id = 'ORD-1'"
         ).fetchone()[0]
         remaining = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
         conn.close()
 
-        assert price     == 75.0
+        assert price == 75.0
         assert remaining == 0
+
+
+# ---------------------------------------------------------------------------
+# TestSQLFlagMode — classify query path in _handle_duplicates
+# ---------------------------------------------------------------------------
+class TestSQLFlagMode:
+    """The flag mode classify query runs in pure SQL — no iterrows on the
+    incoming DataFrame. These tests verify correctness of the SQL path."""
+
+    def _setup(self, tmp_path):
+        db = _make_db(tmp_path)
+        inc = _make_incoming(tmp_path)
+        _write_csv(
+            inc / "sales_jan.csv",
+            [
+                {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
+                {"order_id": "ORD-2", "price": 200.0, "updated_at": "2026-01-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        _init_flagged_rows(conn)
+        conn.close()
+        return db, inc
+
+    def test_new_key_inserted(self, tmp_path):
+        db, inc = self._setup(tmp_path)
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {"order_id": "ORD-NEW", "price": 50.0, "updated_at": "2026-02-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        count = conn.execute(
+            "SELECT count(*) FROM sales WHERE order_id = 'ORD-NEW'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 1
+
+    def test_identical_row_not_inserted_not_flagged(self, tmp_path):
+        """Same key, same content — silently dropped, no flag, no duplicate row."""
+        db, inc = self._setup(tmp_path)
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+        flags = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
+        conn.close()
+        assert count == 2  # no new row inserted
+        assert flags == 0  # no flag raised
+
+    def test_conflict_reason_names_changed_column(self, tmp_path):
+        """The reason string built in SQL names the column that changed."""
+        db, inc = self._setup(tmp_path)
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        reason = conn.execute("SELECT reason FROM flagged_rows").fetchone()[0]
+        conn.close()
+        assert "price" in reason
+        assert "100.0" in reason
+        assert "-50.0" in reason
+
+    def test_conflict_id_is_md5_of_pk(self, tmp_path):
+        """The flag id equals md5(pk_value) so export_flagged can join on it."""
+        db, inc = self._setup(tmp_path)
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        stored_id = conn.execute("SELECT id FROM flagged_rows").fetchone()[0]
+        conn.close()
+        assert stored_id == _expected_flag_id("ORD-1")
+
+    def test_mixed_chunk_new_identical_conflict(self, tmp_path):
+        """A single file containing all three categories is handled correctly."""
+        db, inc = self._setup(tmp_path)
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {
+                    "order_id": "ORD-1",
+                    "price": -50.0,
+                    "updated_at": "2026-02-01",
+                },  # conflict
+                {
+                    "order_id": "ORD-2",
+                    "price": 200.0,
+                    "updated_at": "2026-01-01",
+                },  # identical
+                {
+                    "order_id": "ORD-NEW",
+                    "price": 300.0,
+                    "updated_at": "2026-02-01",
+                },  # new
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+        flags = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
+        ord1 = conn.execute(
+            "SELECT price FROM sales WHERE order_id = 'ORD-1'"
+        ).fetchone()[0]
+        new_count = conn.execute(
+            "SELECT count(*) FROM sales WHERE order_id = 'ORD-NEW'"
+        ).fetchone()[0]
+        conn.close()
+        assert count == 3  # ORD-1, ORD-2, ORD-NEW
+        assert flags == 1  # only ORD-1 conflicted
+        assert ord1 == 100.0  # original preserved
+        assert new_count == 1  # new row inserted
+
+    def test_conflict_row_exportable_after_flag(self, tmp_path):
+        """A flagged row can be immediately exported via export_flagged."""
+        db, inc = self._setup(tmp_path)
+        _write_csv(
+            inc / "sales_feb.csv",
+            [
+                {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
+            ],
+        )
+        ingest_directory(str(inc), _sources(), db)
+        conn = duckdb.connect(db)
+        output = str(tmp_path / "flagged.csv")
+        count = export_flagged(conn, "sales", output, primary_key="order_id")
+        conn.close()
+        assert count == 1
+        df = pd.read_csv(output)
+        assert df["order_id"].iloc[0] == "ORD-1"
+        assert df["price"].iloc[0] == 100.0  # original price in table

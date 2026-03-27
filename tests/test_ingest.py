@@ -70,6 +70,34 @@ class TestStructuralChecks:
         source = {}
         assert _structural_checks(sales_df, source) == []
 
+    def test_null_primary_key_in_file_fails(self, sales_df):
+        """File with NULL values in the primary key column is rejected."""
+        df = sales_df.copy()
+        df.loc[0, "order_id"] = None
+        source = {"primary_key": "order_id", "timestamp_col": "updated_at"}
+        issues = _structural_checks(df, source)
+        assert any("NULL" in i for i in issues)
+
+    def test_null_primary_key_message_includes_count(self, sales_df):
+        df = sales_df.copy()
+        df.loc[0, "order_id"] = None
+        df.loc[2, "order_id"] = None
+        source = {"primary_key": "order_id", "timestamp_col": "updated_at"}
+        issues = _structural_checks(df, source)
+        assert any("2" in i for i in issues)
+
+    def test_no_primary_key_defined_ignores_nulls(self, sales_df):
+        """Source without primary_key skips the null key check entirely."""
+        df = sales_df.copy()
+        df.loc[0, "order_id"] = None
+        source = {"timestamp_col": "updated_at"}
+        assert _structural_checks(df, source) == []
+
+    def test_primary_key_col_not_in_df_ignores_null_check(self, sales_df):
+        """If the pk column isn't in the file, null check is skipped (different error path)."""
+        source = {"primary_key": "nonexistent_col", "timestamp_col": "updated_at"}
+        assert _structural_checks(sales_df, source) == []
+
 
 # ---------------------------------------------------------------------------
 # init_db

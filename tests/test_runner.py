@@ -192,3 +192,44 @@ class TestRunAllReports:
         seq_statuses = {r["report"]: r["status"] for r in seq_results}
         par_statuses = {r["report"]: r["status"] for r in par_results}
         assert seq_statuses == par_statuses
+
+
+class TestWatermarkNotAdvancedOnCheckFailedStatus:
+    def test_watermark_not_advanced_when_check_raises(
+        self, pipeline_db, sales_df, check_registry, watermark_store
+    ):
+        """Watermark is held when check_registry.run raises an exception."""
+
+        def always_raises(context):
+            raise RuntimeError("simulated check failure")
+
+        _seed_table(pipeline_db, "sales", sales_df)
+        check_registry.register("bad_check", always_raises)
+        config = _make_report_config(pipeline_db, "sales", ["bad_check"])
+
+        run_report(config, check_registry, watermark_store)
+
+        # Check failed — watermark must not have advanced
+        assert watermark_store.get("sales_validation") is None
+
+    def test_watermark_not_advanced_when_any_check_fails(
+        self, pipeline_db, sales_df, check_registry, watermark_store
+    ):
+        """If one check fails and another passes, watermark is still held."""
+        from src.checks.built_in import check_nulls
+
+        def always_raises(context):
+            raise RuntimeError("simulated check failure")
+
+        _seed_table(pipeline_db, "sales", sales_df)
+        check_registry.register("null_check", check_nulls)
+        check_registry.register("bad_check", always_raises)
+        config = _make_report_config(pipeline_db, "sales", ["null_check", "bad_check"])
+
+        result = run_report(config, check_registry, watermark_store)
+
+        assert result["status"] == "completed"
+        assert result["results"]["null_check"]["status"] == "passed"
+        assert result["results"]["bad_check"]["status"] == "failed"
+        # Watermark must not advance when any check failed
+        assert watermark_store.get("sales_validation") is None
