@@ -119,6 +119,66 @@ what data the deliverable will produce.
 
 ---
 
+## Shared views
+
+If multiple deliverables need the same transformation logic — standardising
+region codes, zeroing out negatives, joining a lookup table — define it once
+as a view in `config/views_config.yaml` and reference it by name in any SQL file.
+
+```yaml
+# config/views_config.yaml
+views:
+  - name: "clean_sales"
+    sql_file: "config/sql/views/clean_sales.sql"
+```
+
+```sql
+-- config/sql/views/clean_sales.sql
+SELECT
+    order_id,
+    CASE
+        WHEN region = 'Europe' THEN 'EMEA'
+        WHEN region = 'Asia'   THEN 'APAC'
+        ELSE region
+    END AS region,
+    GREATEST(price, 0) AS price,
+    order_date
+FROM sales
+```
+
+Any deliverable SQL file can then reference the view like a table:
+
+```sql
+-- config/sql/carrier_a_sales.sql
+SELECT order_id, price, region
+FROM clean_sales                   -- transformation already applied
+WHERE region = 'EMEA'
+```
+
+Views can also join other views:
+
+```sql
+-- config/sql/carrier_a_sales.sql
+SELECT cs.order_id, cs.price, cb.commission_rate
+FROM clean_sales cs
+JOIN carrier_base cb ON cs.order_id = cb.order_id
+WHERE cs.region = 'EMEA'
+```
+
+**Creation order matters** — if a view references another view, list the
+dependency first in `views_config.yaml`.
+
+Views are created by `vp db-init` and refreshed by `vp refresh-views`.
+They are also refreshed automatically during `vp run-all` before deliverables
+are produced, so changes to a view SQL file are always picked up.
+
+```bash
+vp refresh-views                              # manually refresh after editing a view SQL file
+vp run-all --deliverable carrier_a_pack       # auto-refreshes views before writing output
+```
+
+---
+
 ## Dynamic date tokens (filter path only)
 
 When using `filters:` instead of `sql_file:`, date values support
