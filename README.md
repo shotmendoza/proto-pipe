@@ -30,6 +30,8 @@ uv add protp-pipe
 
 # From a GitHub repository
 pip install git+https://github.com/shotmendoza/protp-pipe.git
+
+uv add "git+https://github.com/shotmendoza/protp-pipe"
 ```
 
 ---
