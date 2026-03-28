@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from src import custom_check, _DECORATED_CHECKS
+from proto_pipe.checks.helpers import custom_check, _DECORATED_CHECKS
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ class TestLoadCustomChecksModule:
     def test_registers_decorated_function(self, tmp_path, check_registry):
         module_path = tmp_path / "my_checks.py"
         _write_module(module_path, """
-from src.checks.helpers import custom_check
+from proto_pipe.checks.helpers import custom_check
 
 @custom_check("margin_check")
 def check_margin(context, col="margin", threshold=0.2):
@@ -73,7 +73,7 @@ def check_margin(context, col="margin", threshold=0.2):
     below = df[df[col] < threshold]
     return {"violations": len(below)}
 """)
-        from src import load_custom_checks_module
+        from proto_pipe.io.registry import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
         assert "margin_check" in check_registry.available()
@@ -81,7 +81,7 @@ def check_margin(context, col="margin", threshold=0.2):
     def test_custom_check_is_runnable(self, tmp_path, check_registry):
         module_path = tmp_path / "my_checks.py"
         _write_module(module_path, """
-from src.checks.helpers import custom_check
+from proto_pipe.checks.helpers import custom_check
 
 @custom_check("pct_check")
 def check_pct(context, col="pct"):
@@ -89,7 +89,7 @@ def check_pct(context, col="pct"):
     bad = df[df[col] > 1.0]
     return {"violations": len(bad)}
 """)
-        from src import load_custom_checks_module
+        from proto_pipe.io.registry import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
         df = pd.DataFrame({"pct": [0.5, 1.5, 0.9]})
@@ -97,14 +97,14 @@ def check_pct(context, col="pct"):
         assert result["violations"] == 1
 
     def test_missing_module_exits(self, tmp_path, check_registry):
-        from src import load_custom_checks_module
+        from proto_pipe.io.registry import load_custom_checks_module
         with pytest.raises(SystemExit):
             load_custom_checks_module(str(tmp_path / "nonexistent.py"), check_registry)
 
     def test_module_with_syntax_error_exits(self, tmp_path, check_registry):
         module_path = tmp_path / "bad_checks.py"
         _write_module(module_path, "def broken(:\n    pass\n")
-        from src import load_custom_checks_module
+        from proto_pipe.io.registry import load_custom_checks_module
         with pytest.raises(SystemExit):
             load_custom_checks_module(str(module_path), check_registry)
 
@@ -118,7 +118,7 @@ def check_pct(context, col="pct"):
         original = dict(_DECORATED_CHECKS)
         _DECORATED_CHECKS.clear()
 
-        from src import load_custom_checks_module
+        from proto_pipe.io.registry import load_custom_checks_module
         try:
             load_custom_checks_module(str(module_path), check_registry)
         finally:
@@ -140,14 +140,14 @@ class TestCustomCheckEndToEnd:
         """
         module_path = tmp_path / "e2e_checks.py"
         _write_module(module_path, """
-from src.checks.helpers import custom_check
+from proto_pipe.checks.helpers import custom_check
 
 @custom_check("e2e_custom_check")
 def check_e2e(context):
     df = context["df"]
     return {"row_count": len(df)}
 """)
-        from src import (
+        from proto_pipe.io.registry import (
             load_custom_checks_module,
             register_from_config,
         )

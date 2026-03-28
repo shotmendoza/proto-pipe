@@ -1,4 +1,4 @@
-"""Tests for src.reports.runner
+"""Tests for proto_pipe.reports.runner
 
 Covers:
 - run_report: completes when data is present
@@ -21,12 +21,12 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src import check_nulls, check_range
-from src import register_from_config
-from src import WatermarkStore
-from src import CheckRegistry, ReportRegistry
-from src import run_report, run_all_reports
-from src import (
+from proto_pipe.checks.built_in import check_nulls, check_range
+from proto_pipe.io.registry import register_from_config
+from proto_pipe.pipelines.watermark import WatermarkStore
+from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.reports.runner import run_report, run_all_reports
+from proto_pipe.reports.validation_flags import (
     count_validation_flags,
     detail_df,
     init_validation_flags_table,
@@ -333,7 +333,7 @@ class TestRunAllReports:
         _init_pipeline_db(pipeline_db)
         _seed_table(pipeline_db, "sales", sales_df)
 
-        from src import register_custom_check
+        from proto_pipe import register_custom_check
 
         def check_negative_price(ctx, col="price"):
             df = ctx["df"]

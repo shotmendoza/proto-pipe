@@ -1,4 +1,4 @@
-"""Tests for src.checks.runner
+"""Tests for proto_pipe.checks.runner
 
 Covers:
 - run_check_safe: returns passed on success
@@ -23,10 +23,10 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src import check_nulls, check_range
-from src import run_check_safe, run_checks, run_checks_and_flag
-from src import CheckRegistry
-from src import (
+from proto_pipe.checks.built_in import check_nulls, check_range
+from proto_pipe.checks.runner import run_check_safe, run_checks, run_checks_and_flag
+from proto_pipe.registry.base import CheckRegistry
+from proto_pipe.reports.validation_flags import (
     count_validation_flags,
     detail_df,
     init_validation_flags_table,

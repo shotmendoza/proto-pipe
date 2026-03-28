@@ -12,7 +12,7 @@ Covers:
 
 import pytest
 
-from src import (
+from proto_pipe.checks.built_in import (
     check_nulls,
     check_range,
     check_schema,

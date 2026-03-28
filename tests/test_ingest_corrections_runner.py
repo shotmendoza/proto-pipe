@@ -36,12 +36,12 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.proto_pipe.io.ingest import (
+from proto_pipe.io.ingest import (
     ingest_directory, _handle_duplicates, check_null_overwrites,
     _init_ingest_log, CHUNK_SIZE,
     flag_id_for, _write_flag,
 )
-from src.proto_pipe.reports.corrections import export_flagged, import_corrections, dated_export_path
+from proto_pipe.reports.corrections import export_flagged, import_corrections, dated_export_path
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +643,7 @@ class TestImportCorrectionsNotFound:
 
 class TestWatermarkOnlyAdvancesOnFullPass:
     def test_watermark_held_when_check_fails(self):
-        from src.proto_pipe.reports.runner import run_report
+        from proto_pipe.reports.runner import run_report
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
         check_registry = MagicMock()
@@ -654,7 +654,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
             "options": {"parallel": False},
             "resolved_checks": ["failing_check"],
         }
-        with patch("src.reports.runner.load_from_duckdb") as mock_load:
+        with patch("proto_pipe.reports.runner.load_from_duckdb") as mock_load:
             mock_load.return_value = pd.DataFrame([
                 {"order_id": "ORD-1", "updated_at": "2026-01-01"}
             ])
@@ -663,7 +663,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
         assert result["results"]["failing_check"]["status"] == "failed"
 
     def test_watermark_advances_when_all_pass(self):
-        from src.proto_pipe.reports.runner import run_report
+        from proto_pipe.reports.runner import run_report
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
         check_registry = MagicMock()
@@ -674,7 +674,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
             "options": {"parallel": False},
             "resolved_checks": ["passing_check"],
         }
-        with patch("src.reports.runner.load_from_duckdb") as mock_load:
+        with patch("proto_pipe.reports.runner.load_from_duckdb") as mock_load:
             mock_load.return_value = pd.DataFrame([
                 {"order_id": "ORD-1",
                  "updated_at": pd.Timestamp("2026-01-01", tz="UTC")}

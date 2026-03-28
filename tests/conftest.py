@@ -352,17 +352,17 @@ def populated_db(pipeline_db, sales_df, inventory_df) -> str:
 
 @pytest.fixture()
 def check_registry():
-    from src import CheckRegistry
+    from proto_pipe.registry.base import CheckRegistry
     return CheckRegistry()
 
 
 @pytest.fixture()
 def report_registry():
-    from src import ReportRegistry
+    from proto_pipe.registry.base import ReportRegistry
     return ReportRegistry()
 
 
 @pytest.fixture()
 def watermark_store(watermark_db):
-    from src import WatermarkStore
+    from proto_pipe.pipelines.watermark import WatermarkStore
     return WatermarkStore(watermark_db)

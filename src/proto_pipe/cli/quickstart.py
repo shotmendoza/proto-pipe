@@ -5,9 +5,9 @@ from pathlib import Path
 
 import click
 
-from src.proto_pipe.cli.helpers import config_path_or_override, config_settings
-from src.proto_pipe.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
-from src.proto_pipe.reports.validation_flags import init_validation_flags_table
+from proto_pipe.cli.helpers import config_path_or_override, config_settings
+from proto_pipe.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
+from proto_pipe.reports.validation_flags import init_validation_flags_table
 
 _TEMPLATES_DIR = files("proto_pipe") / "templates"
 
@@ -87,11 +87,11 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
     """
     import duckdb
 
-    from src.proto_pipe.io.ingest import init_db
-    from src.proto_pipe.io.registry import load_config
-    from src.proto_pipe.pipelines.watermark import WatermarkStore
-    from src.proto_pipe.reports.query import init_report_runs_table
-    from src.proto_pipe.reports.views import load_views_config, create_views
+    from proto_pipe.io.ingest import init_db
+    from proto_pipe.io.registry import load_config
+    from proto_pipe.pipelines.watermark import WatermarkStore
+    from proto_pipe.reports.query import init_report_runs_table
+    from proto_pipe.reports.views import load_views_config, create_views
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)

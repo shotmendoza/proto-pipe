@@ -3,7 +3,7 @@
 import click
 
 from .helpers import config_path_or_override, load_custom_checks
-from src.proto_pipe.reports.validation_flags import count_validation_flags, summary_df
+from proto_pipe.reports.validation_flags import count_validation_flags, summary_df
 
 # ---------------------------------------------------------------------------
 # validate
@@ -32,10 +32,10 @@ def validate(pipeline_db, watermark_db, reports_config, table):
       vp validate
       vp validate --table sales
     """
-    from src.proto_pipe.io.registry import load_config, register_from_config
-    from src.proto_pipe.registry.base import check_registry, report_registry
-    from src.proto_pipe.pipelines.watermark import WatermarkStore
-    from src.proto_pipe.reports.runner import run_all_reports
+    from proto_pipe.io.registry import load_config, register_from_config
+    from proto_pipe.registry.base import check_registry, report_registry
+    from proto_pipe.pipelines.watermark import WatermarkStore
+    from proto_pipe.reports.runner import run_all_reports
 
     import duckdb
 
@@ -106,7 +106,7 @@ def checks():
     Example:
       vp checks
     """
-    from src.proto_pipe.checks.built_in import BUILT_IN_CHECKS
+    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
 
     descriptions = {
         "null_check": ("No params required", "Checks all columns for null values"),
@@ -159,7 +159,7 @@ def export_validation(report, output, pipeline_db):
     from pathlib import Path
     import duckdb
 
-    from src.proto_pipe.reports.validation_flags import export_validation_report
+    from proto_pipe.reports.validation_flags import export_validation_report
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     out_dir = config_path_or_override("output_dir")

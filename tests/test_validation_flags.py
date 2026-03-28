@@ -1,4 +1,4 @@
-"""Tests for src.reports.validation_flags
+"""Tests for proto_pipe.reports.validation_flags
 
 Covers:
 - _extract_flagged_rows: mask mode (flag_when=True default, flag_when=False, no pk_col)
@@ -31,7 +31,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src import (
+from proto_pipe.reports.validation_flags import (
     _extract_flagged_rows,
     clear_validation_flags,
     count_validation_flags,

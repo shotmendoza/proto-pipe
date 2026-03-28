@@ -5,7 +5,7 @@ from pathlib import Path
 
 import click
 
-from .helpers import config_path_or_override
+from proto_pipe.cli.helpers import config_path_or_override
 
 
 def _resolve_primary_key(
@@ -17,7 +17,7 @@ def _resolve_primary_key(
     Returns the key string if found, or None after printing an error message.
     The caller should return early when this returns None.
     """
-    from src.proto_pipe.io.registry import load_config
+    from proto_pipe.io.registry import load_config
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     try:
@@ -254,9 +254,9 @@ def export_flagged(table, key, output, pipeline_db, sources_config):
       vp export-flagged --table sales --key order_id
     """
     import duckdb
-    from src.proto_pipe.reports.corrections import export_flagged as _export, dated_export_path
+    from proto_pipe.reports.corrections import export_flagged as _export, dated_export_path
 
-    primary_key = key or _resolve_primary_key(table, key, sources_config)
+    primary_key = key or _resolve_primary_key(table, sources_config)
     if not primary_key:
         return
 
@@ -300,8 +300,8 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
     """
     import duckdb
 
-    from src.proto_pipe.reports.corrections import import_corrections as _import
-    from src.proto_pipe.io.registry import load_config
+    from proto_pipe.reports.corrections import import_corrections as _import
+    from proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)
@@ -312,7 +312,7 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
         return
 
     # Resolve primary key: --key overrides sources_config.yaml
-    primary_key = key or _resolve_primary_key(table, key, sources_config)
+    primary_key = key or _resolve_primary_key(table, sources_config)
     if not primary_key:
         _config = load_config(src_cfg)
         sources = {s["target_table"]: s for s in _config["sources"]}
@@ -360,8 +360,8 @@ def check_null_overwrites_cmd(table, pipeline_db, sources_config):
     """
     import duckdb
 
-    from src.proto_pipe.io.ingest import check_null_overwrites
-    from src.proto_pipe.io.registry import load_config
+    from proto_pipe.io.ingest import check_null_overwrites
+    from proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)
@@ -373,7 +373,7 @@ def check_null_overwrites_cmd(table, pipeline_db, sources_config):
         click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
         return
 
-    primary_key = _resolve_primary_key(table, None, sources_config)
+    primary_key = _resolve_primary_key(table, sources_config)
     if not primary_key:
         click.echo(
             f"  [error] No primary_key defined for '{table}' in sources_config.yaml\n"

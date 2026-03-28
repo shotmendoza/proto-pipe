@@ -27,7 +27,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd  # type: ignore
 
-from src.proto_pipe.io.ingest import load_file
+from proto_pipe.io.ingest import load_file
 
 
 # ---------------------------------------------------------------------------

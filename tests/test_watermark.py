@@ -11,7 +11,7 @@ Covers:
 
 from datetime import datetime, timezone
 
-from src import WatermarkStore
+from proto_pipe.pipelines.watermark import WatermarkStore
 
 TS_A = datetime(2026, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
 TS_B = datetime(2026, 2, 10,  9, 0, 0, tzinfo=timezone.utc)

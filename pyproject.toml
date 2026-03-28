@@ -28,3 +28,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 validation_pipeline = ["templates/*.yaml"]
+
+[tool.mypy]
+mypy_path = "src"
+explicit_package_bases = true

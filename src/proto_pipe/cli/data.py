@@ -42,9 +42,9 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
       vp ingest --mode replace
       vp ingest --validate
     """
-    from src.proto_pipe.io.registry import load_config, register_from_config
-    from src.proto_pipe.io.ingest import ingest_directory
-    from src.proto_pipe.registry.base import check_registry, report_registry
+    from proto_pipe.io.registry import load_config, register_from_config
+    from proto_pipe.io.ingest import ingest_directory
+    from proto_pipe.registry.base import check_registry, report_registry
 
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -148,15 +148,15 @@ def ingest_log(status, table, limit, pipeline_db):
             rows_str = (
                 f" ({int(row['rows'])} rows)" if row["rows"] and row["rows"] > 0 else ""
             )
-            click.echo(f"  {mark} {row['filename']}{table_str}{rows_str}")
-            click.echo(f"    {row['status']}  {row['ingested_at']}")
+            click.echo(f"{mark} {row['filename']}{table_str}{rows_str}")
+            click.echo(f"{row['status']}  {row['ingested_at']}")
             if row["message"]:
-                click.echo(f"    reason: {row['message']}")
+                click.echo(f"reason: {row['message']}")
             click.echo()
 
     except Exception as e:
         click.echo(f"[error] Could not read ingest_log: {e}")
-        click.echo("  Has `vp db-init` been run yet?")
+        click.echo("Has `vp db-init` been run yet?")
     finally:
         conn.close()
 
@@ -201,14 +201,14 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     """
     import duckdb
 
-    from src.proto_pipe.io.ingest import (
+    from proto_pipe.io.ingest import (
         load_file,
         _init_ingest_log,
         _table_exists,
         _auto_migrate,
         _log_ingest,
     )
-    from src.proto_pipe.io.registry import load_config
+    from proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)

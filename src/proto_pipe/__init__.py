@@ -1,4 +1,4 @@
-from src.proto_pipe.checks.helpers import custom_check, register_custom_check
+from proto_pipe.checks.helpers import custom_check, register_custom_check
 
 
 __all__ = [

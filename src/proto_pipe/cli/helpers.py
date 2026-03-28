@@ -1,5 +1,5 @@
-from src.proto_pipe.io.settings import load_settings
-from src.proto_pipe.registry.base import CheckRegistry
+from proto_pipe.io.settings import load_settings
+from proto_pipe.registry.base import CheckRegistry
 
 
 def config_settings():
@@ -36,7 +36,7 @@ def load_custom_checks(check_registry: CheckRegistry) -> None:
     :param check_registry: The registry where custom checks will be loaded.
     :return: None
     """
-    from src.proto_pipe.io.registry import load_custom_checks_module
+    from proto_pipe.io.registry import load_custom_checks_module
 
     module_path = config_settings().get("custom_checks_module")
     if module_path:
