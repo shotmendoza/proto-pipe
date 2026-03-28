@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.registry.base import CheckRegistry
+from src.proto_pipe.registry.base import CheckRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ def run_checks_and_flag(
     if not pipeline_db or not report_name:
         return results
 
-    from src.reports.validation_flags import (
+    from src.proto_pipe.reports.validation_flags import (
         _extract_flagged_rows,
         write_validation_flags,
     )

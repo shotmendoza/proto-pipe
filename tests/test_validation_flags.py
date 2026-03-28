@@ -31,9 +31,8 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.reports.validation_flags import (
+from src import (
     _extract_flagged_rows,
-    _summarise_result,
     clear_validation_flags,
     count_validation_flags,
     detail_df,

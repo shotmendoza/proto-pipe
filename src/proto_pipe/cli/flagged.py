@@ -17,7 +17,7 @@ def _resolve_primary_key(
     Returns the key string if found, or None after printing an error message.
     The caller should return early when this returns None.
     """
-    from src.io.registry import load_config
+    from src.proto_pipe.io.registry import load_config
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     try:
@@ -254,7 +254,7 @@ def export_flagged(table, key, output, pipeline_db, sources_config):
       vp export-flagged --table sales --key order_id
     """
     import duckdb
-    from src.reports.corrections import export_flagged as _export, dated_export_path
+    from src.proto_pipe.reports.corrections import export_flagged as _export, dated_export_path
 
     primary_key = key or _resolve_primary_key(table, key, sources_config)
     if not primary_key:
@@ -300,8 +300,8 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
     """
     import duckdb
 
-    from src.reports.corrections import import_corrections as _import
-    from src.io.registry import load_config
+    from src.proto_pipe.reports.corrections import import_corrections as _import
+    from src.proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)
@@ -360,8 +360,8 @@ def check_null_overwrites_cmd(table, pipeline_db, sources_config):
     """
     import duckdb
 
-    from src.io.ingest import check_null_overwrites
-    from src.io.registry import load_config
+    from src.proto_pipe.io.ingest import check_null_overwrites
+    from src.proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)

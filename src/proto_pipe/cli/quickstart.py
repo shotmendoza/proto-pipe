@@ -1,14 +1,15 @@
 """Setup commands — init, db-init, config."""
 import shutil
+from importlib.resources import files
 from pathlib import Path
 
 import click
 
-from src.cli.helpers import config_path_or_override, config_settings
-from src.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
-from src.reports.validation_flags import init_validation_flags_table
+from src.proto_pipe.cli.helpers import config_path_or_override, config_settings
+from src.proto_pipe.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
+from src.proto_pipe.reports.validation_flags import init_validation_flags_table
 
-_TEMPLATES_DIR = Path(__file__).parent.parent / "config"
+_TEMPLATES_DIR = files("proto_pipe") / "templates"
 
 
 # ---------------------------------------------------------------------------
@@ -42,15 +43,15 @@ def init(output: str, force: bool):
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
 
-    files = {
+    _files = {
         _TEMPLATES_DIR / "reports_config.yaml": out / "reports_config.yaml",
         _TEMPLATES_DIR / "sources_config.yaml": out / "sources_config.yaml",
         _TEMPLATES_DIR / "deliverables_config.yaml": out / "deliverables_config.yaml",
-        _TEMPLATES_DIR / "pipeline.yaml": Path("../pipeline.yaml"),
+        _TEMPLATES_DIR / "pipeline.yaml": Path("pipeline.yaml"),
         _TEMPLATES_DIR / "views_config.yaml": out / "views_config.yaml",
     }
 
-    for src, dest in files.items():
+    for src, dest in _files.items():
         if dest.exists() and not force:
             click.echo(f"  [skip] {dest} already exists (use --force to overwrite)")
             continue
@@ -58,11 +59,11 @@ def init(output: str, force: bool):
         click.echo(f"  [ok]   {dest}")
 
     click.echo("\nNext steps:")
-    click.echo("  1. Edit pipeline.yaml to set your paths")
-    click.echo(f"  2. Edit {out}/sources_config.yaml to match your file naming conventions")
-    click.echo(f"  3. Edit {out}/reports_config.yaml to define your reports and checks")
-    click.echo(f"  4. Edit {out}/views_config.yaml to define shared transformation views")
-    click.echo("  5. Run: vp db-init")
+    click.echo("1. Edit pipeline.yaml to set your paths")
+    click.echo(f"2. Edit {out}/sources_config.yaml to match your file naming conventions")
+    click.echo(f"3. Edit {out}/reports_config.yaml to define your reports and checks")
+    click.echo(f"4. Edit {out}/views_config.yaml to define shared transformation views")
+    click.echo("5. Run: vp db-init")
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +87,11 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
     """
     import duckdb
 
-    from src.io.ingest import init_db
-    from src.io.registry import load_config
-    from src.pipelines.watermark import WatermarkStore
-    from src.reports.query import init_report_runs_table
-    from src.reports.views import load_views_config, create_views
+    from src.proto_pipe.io.ingest import init_db
+    from src.proto_pipe.io.registry import load_config
+    from src.proto_pipe.pipelines.watermark import WatermarkStore
+    from src.proto_pipe.reports.query import init_report_runs_table
+    from src.proto_pipe.reports.views import load_views_config, create_views
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)

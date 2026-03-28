@@ -5,12 +5,12 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.checks.runner import run_checks, run_checks_and_flag
-from src.io.data import load_from_duckdb
-from src.io.registry import resolve_filename, write_xlsx_sheet, write_csv
-from src.pipelines.watermark import WatermarkStore, _watermark_lock
-from src.registry.base import CheckRegistry, ReportRegistry
-from src.reports.query import _log_run, init_report_runs_table
+from src.proto_pipe.checks.runner import run_checks, run_checks_and_flag
+from src.proto_pipe.io.data import load_from_duckdb
+from src.proto_pipe.io.registry import resolve_filename, write_xlsx_sheet, write_csv
+from src.proto_pipe.pipelines.watermark import WatermarkStore, _watermark_lock
+from src.proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from src.proto_pipe.reports.query import _log_run, init_report_runs_table
 
 
 # ---------------------------------------------------------------------------

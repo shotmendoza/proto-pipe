@@ -14,8 +14,8 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from src.checks.built_in import BUILT_IN_CHECKS
-from src.registry.base import CheckRegistry, ReportRegistry
+from src.proto_pipe.checks.built_in import BUILT_IN_CHECKS
+from src.proto_pipe.registry.base import CheckRegistry, ReportRegistry
 
 
 def load_config(config_path: str | PathLike) -> dict:
@@ -207,7 +207,7 @@ def load_custom_checks_module(
                     a clear message is printed and the pipeline exits rather than
                     proceeding with missing checks.
     """
-    from src.checks.helpers import (
+    from src.proto_pipe.checks.helpers import (
         _DECORATED_CHECKS,
         register_custom_check,
     )

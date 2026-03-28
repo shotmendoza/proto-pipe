@@ -15,10 +15,10 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.io.ingest import _already_ingested, _init_ingest_log, _log_ingest, flag_id_for
-from src.reports.corrections import import_corrections, export_flagged
-from src.reports.views import create_views, refresh_views, load_views_config, _load_sql
-from src.reports.validation_flags import init_validation_flags_table
+from src import _already_ingested, _init_ingest_log, _log_ingest, flag_id_for
+from src import import_corrections, export_flagged
+from src import create_views, refresh_views, load_views_config, _load_sql
+from src import init_validation_flags_table
 
 
 # ---------------------------------------------------------------------------

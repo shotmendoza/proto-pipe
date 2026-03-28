@@ -5,10 +5,8 @@ description = "A basic cli data pipeline"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "black>=26.3.1",
     "click>=8.3.1",
     "duckdb>=1.5.1",
-    "mypy>=1.19.1",
     "openpyxl>=3.1.5",
     "pandas>=3.0.1",
     "pytz>=2026.1.post1",
@@ -16,14 +14,17 @@ dependencies = [
 ]
 
 [project.scripts]
-vp = "src.cli:cli"
+vp = "proto_pipe.cli:cli"
 
 [dependency-groups]
 dev = [
+    "black>=26.3.1",
     "mypy>=1.19.1",
     "pytest>=9.0.2",
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]
+
+[tool.setuptools.package-data]
+validation_pipeline = ["templates/*.yaml"]

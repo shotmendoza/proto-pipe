@@ -10,7 +10,7 @@ Covers:
 import duckdb
 import pandas as pd
 
-from src.io.ingest import (
+from src import (
     resolve_source,
     _structural_checks,
     init_db,

@@ -12,12 +12,12 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.io.ingest import ingest_directory
-from src.io.registry import register_from_config
-from src.pipelines.watermark import WatermarkStore
-from src.registry.base import CheckRegistry, ReportRegistry
-from src.reports.query import query_table
-from src.reports.runner import run_deliverable, run_all_reports
+from src import ingest_directory
+from src import register_from_config
+from src import WatermarkStore
+from src import CheckRegistry, ReportRegistry
+from src import query_table
+from src import run_deliverable, run_all_reports
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +283,8 @@ class TestCustomCheckInPipeline:
         sources_config,
         reports_config,
     ):
-        from src.checks.helpers import custom_check
-        from src.checks.built_in import BUILT_IN_CHECKS
+        from src import custom_check
+        from src import BUILT_IN_CHECKS
 
         @custom_check("quantity_positive")
         def check_quantity(context):

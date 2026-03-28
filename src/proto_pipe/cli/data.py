@@ -42,9 +42,9 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
       vp ingest --mode replace
       vp ingest --validate
     """
-    from src.io.registry import load_config, register_from_config
-    from src.io.ingest import ingest_directory
-    from src.registry.base import check_registry, report_registry
+    from src.proto_pipe.io.registry import load_config, register_from_config
+    from src.proto_pipe.io.ingest import ingest_directory
+    from src.proto_pipe.registry.base import check_registry, report_registry
 
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -201,14 +201,14 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     """
     import duckdb
 
-    from src.io.ingest import (
+    from src.proto_pipe.io.ingest import (
         load_file,
         _init_ingest_log,
         _table_exists,
         _auto_migrate,
         _log_ingest,
     )
-    from src.io.registry import load_config
+    from src.proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)

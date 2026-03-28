@@ -20,14 +20,13 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
-import pytest
 
-from src.checks.built_in import check_nulls, check_range
-from src.io.registry import register_from_config
-from src.pipelines.watermark import WatermarkStore
-from src.registry.base import CheckRegistry, ReportRegistry
-from src.reports.runner import run_report, run_all_reports
-from src.reports.validation_flags import (
+from src import check_nulls, check_range
+from src import register_from_config
+from src import WatermarkStore
+from src import CheckRegistry, ReportRegistry
+from src import run_report, run_all_reports
+from src import (
     count_validation_flags,
     detail_df,
     init_validation_flags_table,
@@ -334,7 +333,7 @@ class TestRunAllReports:
         _init_pipeline_db(pipeline_db)
         _seed_table(pipeline_db, "sales", sales_df)
 
-        from src.checks.helpers import register_custom_check
+        from src import register_custom_check
 
         def check_negative_price(ctx, col="price"):
             df = ctx["df"]

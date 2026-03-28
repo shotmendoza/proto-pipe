@@ -36,12 +36,12 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.io.ingest import (
+from src.proto_pipe.io.ingest import (
     ingest_directory, _handle_duplicates, check_null_overwrites,
     _init_ingest_log, CHUNK_SIZE,
     flag_id_for, _write_flag,
 )
-from src.reports.corrections import export_flagged, import_corrections, dated_export_path
+from src.proto_pipe.reports.corrections import export_flagged, import_corrections, dated_export_path
 
 
 # ---------------------------------------------------------------------------
@@ -551,8 +551,6 @@ class TestExportFlaggedJoin:
             export_flagged(conn, "sales", str(tmp_path / "out.csv"), primary_key=None)
 
     def test_dated_filename(self, tmp_path):
-        from datetime import date
-
         path = dated_export_path(str(tmp_path), "sales")
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         assert today in path
@@ -645,7 +643,7 @@ class TestImportCorrectionsNotFound:
 
 class TestWatermarkOnlyAdvancesOnFullPass:
     def test_watermark_held_when_check_fails(self):
-        from src.reports.runner import run_report
+        from src.proto_pipe.reports.runner import run_report
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
         check_registry = MagicMock()
@@ -665,7 +663,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
         assert result["results"]["failing_check"]["status"] == "failed"
 
     def test_watermark_advances_when_all_pass(self):
-        from src.reports.runner import run_report
+        from src.proto_pipe.reports.runner import run_report
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
         check_registry = MagicMock()

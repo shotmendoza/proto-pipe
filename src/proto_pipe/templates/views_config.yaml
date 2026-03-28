@@ -1,0 +1,15 @@
+# views_config.yaml
+# Defines shared transformation views available to all deliverable SQL files.
+# Views are created in the order listed — if a view references another view,
+# list the dependency first.
+
+views:
+  - name: "clean_sales"
+    sql_file: "config/sql/views/clean_sales.sql"
+
+  - name: "clean_regions"
+    sql_file: "config/sql/views/clean_regions.sql"
+
+  # This view references clean_sales and clean_regions above — must come after them
+  - name: "carrier_sales_base"
+    sql_file: "config/sql/views/carrier_sales_base.sql"

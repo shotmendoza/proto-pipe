@@ -38,9 +38,9 @@ def pull_report(
     """
     import duckdb
 
-    from src.io.registry import load_config
-    from src.reports.runner import run_deliverable
-    from src.reports.query import query_table
+    from src.proto_pipe.io.registry import load_config
+    from src.proto_pipe.reports.runner import run_deliverable
+    from src.proto_pipe.reports.query import query_table
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     del_cfg = config_path_or_override("deliverables_config", deliverables_config)
@@ -145,14 +145,14 @@ def run_all(
       vp run-all --deliverable monthly_pack
       vp run-all --deliverable monthly_pack --ignore-flagged
     """
-    from src.pipelines.watermark import WatermarkStore
-    from src.registry.base import check_registry, report_registry
-    from src.io.registry import load_config, register_from_config
-    from src.reports.runner import run_all_reports
-    from src.reports.runner import run_deliverable
-    from src.reports.query import query_table
-    from src.io.ingest import ingest_directory
-    from src.reports.views import refresh_views, load_views_config
+    from src.proto_pipe.pipelines.watermark import WatermarkStore
+    from src.proto_pipe.registry.base import check_registry, report_registry
+    from src.proto_pipe.io.registry import load_config, register_from_config
+    from src.proto_pipe.reports.runner import run_all_reports
+    from src.proto_pipe.reports.runner import run_deliverable
+    from src.proto_pipe.reports.query import query_table
+    from src.proto_pipe.io.ingest import ingest_directory
+    from src.proto_pipe.reports.views import refresh_views, load_views_config
 
     import duckdb
 
@@ -185,7 +185,7 @@ def run_all(
 
     # TODO: This can be split into its own function, just like 3B
     # Step 3a — Ingest conflicts (flagged_rows) — hard block
-    from src.reports.validation_flags import count_validation_flags
+    from src.proto_pipe.reports.validation_flags import count_validation_flags
     ingest_conflict_count = conn.execute(
         "SELECT count(*) FROM flagged_rows"
     ).fetchone()[0]
@@ -286,7 +286,7 @@ def refresh_views_cmd(pipeline_db, views_config):
     """
     import duckdb
 
-    from src.reports.views import load_views_config, refresh_views
+    from src.proto_pipe.reports.views import load_views_config, refresh_views
 
     p_db = config_path_or_override("pipeline_db",  pipeline_db)
     v_cfg = config_path_or_override("views_config", views_config)

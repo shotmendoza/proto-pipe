@@ -1,0 +1,63 @@
+# pipeline.yaml
+# -------------
+# Project-level path settings for the validation pipeline.
+#
+# Every path here can be overridden at runtime with a CLI flag
+# (e.g. --pipeline-db, --incoming-dir). This file just sets the defaults
+# so you don't have to pass flags on every command.
+#
+# Run `vp config show` to see the current resolved values.
+# Run `vp config set <key> <value>` to update a value without editing this file.
+#
+# All paths can be absolute or relative. Relative paths are resolved from
+# the directory where you run `vp`, not from where this file lives.
+# Using absolute paths (e.g. /Volumes/SharedDrive/...) avoids ambiguity.
+#
+# Keys marked [required to update] have defaults that will likely be wrong
+# for your project. Update them before running `vp db-init`.
+# Keys marked [optional] work fine with the defaults for most setups.
+
+paths:
+
+  # [optional] Path to sources_config.yaml.
+  # Defines which files to ingest and what tables they map to.
+  # Only change this if your config folder lives somewhere other than config/.
+  sources_config: "config/sources_config.yaml"
+
+  # [optional] Path to reports_config.yaml.
+  # Defines validation checks and which tables they run against.
+  # Only change this if your config folder lives somewhere other than config/.
+  reports_config: "config/reports_config.yaml"
+
+  # [optional] Path to deliverables_config.yaml.
+  # Defines output files — which reports to include, format, filters.
+  # Only change this if your config folder lives somewhere other than config/.
+  deliverables_config: "config/deliverables_config.yaml"
+
+  # [optional] Path to views_config.yaml.
+  # Defines shared SQL views used across deliverables.
+  # Only change this if your config folder lives somewhere other than config/.
+  views_config: "config/views_config.yaml"
+
+  # [optional] Path to the main DuckDB database file.
+  # This is where ingested tables, flagged rows, and report run history live.
+  # Created automatically by `vp db-init`. Safe to leave as-is.
+  pipeline_db: "data/pipeline.db"
+
+  # [optional] Path to the watermark DuckDB database file.
+  # Tracks the last successful validation run per report so only new rows
+  # are checked on subsequent runs. Created automatically by `vp db-init`.
+  # Safe to leave as-is.
+  watermark_db: "data/watermarks.db"
+
+  # [required to update] Directory where incoming source files arrive.
+  # Point this at the shared folder where your data files are dropped.
+  # `vp ingest` scans this directory and loads any files that match a
+  # pattern defined in sources_config.yaml.
+  # Example: "/Volumes/SharedDrive/data/incoming/"
+  incoming_dir: "data/incoming/"
+
+  # [optional] Directory where deliverable output files are written.
+  # `vp pull-report` writes CSV and Excel files here.
+  # Can be overridden per deliverable in deliverables_config.yaml.
+  output_dir: "output/reports/"

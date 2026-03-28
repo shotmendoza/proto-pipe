@@ -1,0 +1,33 @@
+deliverables:
+  - name: "monthly_sales_pack"
+    format: xlsx                              # xlsx = one file, multiple sheets
+    filename_template: "sales_{date}.xlsx"    # {date} = YYYY-MM-DD of run
+    output_dir: "output/reports/"             # overrides pipeline.yaml if set
+    reports:
+      - name: "daily_sales_validation"
+        sheet: "Sales"
+        filters:                              # default filters, CLI can override
+          date_filters:
+            - col: "order_date"
+              from: "2026-01-01"
+              to:   "2026-03-31"
+          field_filters:
+            - col: "region"
+              values: ["EMEA", "APAC"]
+
+      - name: "inventory_validation"
+        sheet: "Inventory"
+        filters:
+          date_filters:
+            - col: "updated_at"
+              from: "2026-01-01"
+
+  - name: "ops_daily_drop"
+    format: csv                               # csv = one file per report
+    filename_template: "{report_name}_{date}.csv"
+    reports:
+      - name: "daily_sales_validation"
+        filters:
+          date_filters:
+            - col: "order_date"
+              from: "2026-03-01"

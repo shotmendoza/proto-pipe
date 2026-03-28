@@ -12,7 +12,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.reports.query import (
+from src import (
     build_filter_clause,
     query_table,
     _merge_filters,

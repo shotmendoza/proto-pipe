@@ -23,10 +23,10 @@ import duckdb
 import pandas as pd
 import pytest
 
-from src.checks.built_in import check_nulls, check_range
-from src.checks.runner import run_check_safe, run_checks, run_checks_and_flag
-from src.registry.base import CheckRegistry
-from src.reports.validation_flags import (
+from src import check_nulls, check_range
+from src import run_check_safe, run_checks, run_checks_and_flag
+from src import CheckRegistry
+from src import (
     count_validation_flags,
     detail_df,
     init_validation_flags_table,
