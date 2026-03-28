@@ -6,6 +6,7 @@ import click
 
 from src.cli.helpers import config_path_or_override, config_settings
 from src.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
+from src.reports.validation_flags import init_validation_flags_table
 
 _TEMPLATES_DIR = Path(__file__).parent.parent / "config"
 
@@ -115,6 +116,7 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
             flagged_at   TIMESTAMPTZ NOT NULL
         )
     """)
+    init_validation_flags_table(conn)
     init_report_runs_table(conn)
     click.echo("[ok] flagged_rows and report_runs tables ready")
 

@@ -13,6 +13,10 @@ def run_check_safe(
 ) -> dict:
     """Run a single check, catching exceptions so one failure doesn't halt the report.
 
+    Returns:
+    {"status": "passed", "result": <dict>}
+    {"status": "failed", "error": <str>}
+
     :param registry: a registry instance that will run the checks in parallel
     :param check_name: Name of the check that is being run
     :param context: A dictionary containing a `df` key, with a DataFrame value
@@ -54,4 +58,84 @@ def run_checks(
         for future in as_completed(futures):
             name = futures[future]
             results[name] = future.result()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Batch execution with validation flag writing
+# ---------------------------------------------------------------------------
+
+
+def run_checks_and_flag(
+    check_names: list[str],
+    registry: CheckRegistry,
+    context: dict,
+    parallel: bool = False,
+    pipeline_db: str | None = None,
+    report_name: str | None = None,
+    table_name: str | None = None,
+    pk_col: str | None = None,
+) -> dict:
+    """Run checks and write per-row validation flags to pipeline.db.
+
+    Wraps run_checks. After all checks complete, inspects each result and
+    writes entries to the validation_flags table for any check that produced
+    identifiable failing rows (mask or violation_indices) or a summary failure.
+
+    When pipeline_db / report_name are not provided, behaves identically to
+    run_checks — no flags are written. Safe to call in tests without a DB.
+
+    Args:
+        check_names:  Names of registered checks to run.
+        registry:     CheckRegistry instance.
+        context:      Dict with "df" key (the watermark-filtered DataFrame).
+        parallel:     Run checks in threads if True.
+        pipeline_db:  Path to pipeline.db. Required for flag writing.
+        report_name:  Name of the report being validated.
+        table_name:   Source table name.
+        pk_col:       Primary key column name for the source, or None.
+
+    Returns:
+        Dict of {check_name: outcome} — same shape as run_checks.
+    """
+    results = run_checks(check_names, registry, context, parallel=parallel)
+
+    # Skip flag writing if not configured
+    if not pipeline_db or not report_name:
+        return results
+
+    from src.reports.validation_flags import (
+        _extract_flagged_rows,
+        write_validation_flags,
+    )
+    import duckdb
+    import pandas as pd
+    from typing import Any
+
+    df: pd.DataFrame = context["df"]
+    conn = duckdb.connect(pipeline_db)
+    try:
+        for check_name, outcome in results.items():
+            if outcome["status"] == "failed":
+                # Check raised — write one summary flag
+                flag_rows = [{"pk_value": None, "reason": outcome["error"]}]
+            else:
+                result_dict: dict[str, Any] = outcome.get("result", {})
+                flag_rows = _extract_flagged_rows(
+                    result=result_dict,
+                    df=df,
+                    pk_col=pk_col,
+                )
+
+            write_validation_flags(
+                conn=conn,
+                report_name=report_name,
+                check_name=check_name,
+                table_name=table_name or "",
+                pk_col=pk_col,
+                flag_rows=flag_rows,
+            )
+    finally:
+        conn.close()
+
     return results

@@ -139,6 +139,11 @@ def run_all(
     Stops before pull-report if flagged rows exist, unless --ignore-flagged is set.
     Auto-fixed rows are applied during validate. Complex cases are written to
     the flagged_rows table for manual review.
+
+    \b
+    Example:
+      vp run-all --deliverable monthly_pack
+      vp run-all --deliverable monthly_pack --ignore-flagged
     """
     from src.pipelines.watermark import WatermarkStore
     from src.registry.base import check_registry, report_registry
@@ -171,34 +176,57 @@ def run_all(
     load_custom_checks(check_registry)
     register_from_config(rep_config, check_registry, report_registry)
     watermark_store = WatermarkStore(w_db)
-    run_all_reports(report_registry, check_registry, watermark_store)
+    # Pass pipeline_db so the runner writes per-row validation flags
+    run_all_reports(report_registry, check_registry, watermark_store, pipeline_db=p_db)
 
     # Check for flagged rows before producing deliverable
     conn = duckdb.connect(p_db)
     flagged_count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
 
-    if flagged_count > 0 and not ignore_flagged:
+    # TODO: This can be split into its own function, just like 3B
+    # Step 3a — Ingest conflicts (flagged_rows) — hard block
+    from src.reports.validation_flags import count_validation_flags
+    ingest_conflict_count = conn.execute(
+        "SELECT count(*) FROM flagged_rows"
+    ).fetchone()[0]
+
+    if ingest_conflict_count > 0 and not ignore_flagged:
         conn.close()
-        click.echo(f"\n⚠ {flagged_count} flagged row(s) require manual review before producing deliverables.")
-        click.echo("Use: vp export-flagged --table <name>  to export them for correction.")
-        click.echo("Query the flagged_rows table in your pipeline DB to review.")
+        click.echo(
+            f"\n⚠  {ingest_conflict_count} ingest conflict(s) require review before producing deliverables."
+        )
+        click.echo(
+            "These are rows that arrived with conflicting values for existing records."
+        )
+        click.echo(
+            "Run: vp flagged-summary — to see a breakdown by table"
+        )
+        click.echo("Run: vp export-flagged --table <n> — to export for correction")
         click.echo("Re-run with --ignore-flagged to produce the deliverable anyway.")
         return
 
-    # Step 3 — Refresh views (NEW)
+    # Step 3b — Validation flags — warn only, deliverable still produced
+    val_flag_count = count_validation_flags(conn)
+    if val_flag_count > 0:
+        click.echo(
+            f"\n⚠  {val_flag_count} validation flag(s) found. Deliverable will still be produced."
+        )
+        click.echo("Run: vp export-validation to review flagged records.")
+
+    # Step 4 — Refresh views
     click.echo("\n── Refresh Views ───────────────────────────")
     views = load_views_config(v_cfg)
     if views:
         try:
             refresh_views(conn, views)
         except Exception as e:
-            click.echo(f"  [error] Could not refresh views: {e}")
+            click.echo(f"[error] Could not refresh views: {e}")
             conn.close()
             return
     else:
-        click.echo("  [skip] No views defined")
+        click.echo("[skip] No views defined")
 
-    # Step 4 — Pull report
+    # Step 5 — Pull report
     if deliverable:
         click.echo("\n── Pull Report ─────────────────────────────")
         del_config = load_config(del_cfg)
@@ -211,6 +239,7 @@ def run_all(
 
         d = deliverables[deliverable]
         report_dataframes = {}
+        rdefs = {r["name"]: r for r in rep_config.get("reports", [])}
 
         for report_cfg in d["reports"]:
             rname = report_cfg["name"]
@@ -224,7 +253,6 @@ def run_all(
                 except Exception as e:
                     click.echo(f"[error] sql_file failed for '{rname}': {e}")
             else:
-                rdefs = {r["name"]: r for r in rep_config.get("reports", [])}
                 if rname not in rdefs:
                     continue
                 table = rdefs[rname]["source"]["table"]

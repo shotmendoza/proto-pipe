@@ -104,7 +104,10 @@ def export_flagged(
     return len(source_df)
 
 
-def dated_export_path(output_dir: str, table_name: str) -> str:
+def dated_export_path(
+        output_dir: str,
+        table_name: str
+) -> str:
     """Build the default export filename including today's date.
     Format: flagged_<table>_YYYY-MM-DD.csv
     """

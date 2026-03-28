@@ -3,7 +3,7 @@
 import click
 
 from .helpers import config_path_or_override, load_custom_checks
-
+from ..reports.validation_flags import count_validation_flags, summary_df
 
 # ---------------------------------------------------------------------------
 # validate
@@ -11,10 +11,10 @@ from .helpers import config_path_or_override, load_custom_checks
 
 
 @click.command()
-@click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
-@click.option("--watermark-db",   default=None, help="Override watermark DB path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--watermark-db", default=None, help="Override watermark DB path.")
 @click.option("--reports-config", default=None, help="Override reports config path.")
-@click.option("--table",          default=None, help="Run checks for one table only.")
+@click.option("--table", default=None, help="Run checks for one table only.")
 def validate(pipeline_db, watermark_db, reports_config, table):
     """Run all registered checks against ingested tables.
 
@@ -37,6 +37,8 @@ def validate(pipeline_db, watermark_db, reports_config, table):
     from src.pipelines.watermark import WatermarkStore
     from src.reports.runner import run_all_reports
 
+    import duckdb
+
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     w_db = config_path_or_override("watermark_db", watermark_db)
     rep_cfg = config_path_or_override("reports_config", reports_config)
@@ -58,7 +60,12 @@ def validate(pipeline_db, watermark_db, reports_config, table):
         reports = report_registry.all()
 
     click.echo(f"\nRunning validation across {len(reports)} report(s)...")
-    results = run_all_reports(report_registry, check_registry, watermark_store)
+    results = run_all_reports(
+        report_registry,
+        check_registry,
+        watermark_store,
+        pipeline_db=p_db
+    )
 
     for r in results:
         status = r["status"]
@@ -69,6 +76,23 @@ def validate(pipeline_db, watermark_db, reports_config, table):
                 click.echo(f"{mark} {check_name}")
                 if outcome["status"] == "failed":
                     click.echo(f"{outcome['error']}")
+
+        # Summarise validation flags written during this run
+    conn = duckdb.connect(p_db)
+    try:
+        total_flags = count_validation_flags(conn)
+        if total_flags > 0:
+            summ = summary_df(conn)
+            click.echo(
+                f"\n  ⚠  {total_flags} validation flag(s) across {summ['report_name'].nunique()} report(s)."
+            )
+            click.echo(
+                "  Run: vp export-validation  to export a detail + summary report."
+            )
+        else:
+            click.echo("\n  ✓  No validation flags.")
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +124,75 @@ def checks():
 
 
 # ---------------------------------------------------------------------------
+# export-validation
+# ---------------------------------------------------------------------------
+
+
+@click.command("export-validation")
+@click.option(
+    "--report", default=None, help="Export flags for one report only. Omit for all."
+)
+@click.option(
+    "--output",
+    default=None,
+    help="Output path. Defaults to validation_<report>_<date>.xlsx in output_dir.",
+)
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def export_validation(report, output, pipeline_db):
+    """Export validation flags to a two-sheet Excel file.
+
+    Sheet 'Detail' — one row per flagged record, with the source record's
+                       ID column named after the actual primary key field.
+    Sheet 'Summary' — one row per check, with total failure counts.
+
+    Validation flags are warnings — they do not block deliverables. Use this
+    report to identify which records need to be corrected at the source,
+    then re-ingest and re-validate.
+
+    \b
+    Examples:
+      vp export-validation
+      vp export-validation --report daily_sales_validation
+      vp export-validation --output /tmp/sales_validation.xlsx
+    """
+    from datetime import date
+    from pathlib import Path
+    import duckdb
+
+    from src.reports.validation_flags import export_validation_report
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    out_dir = config_path_or_override("output_dir")
+
+    if output:
+        output_path = output
+    else:
+        today = date.today().isoformat()
+        stem = f"validation_{report}_{today}" if report else f"validation_{today}"
+        output_path = str(Path(out_dir) / f"{stem}.xlsx")
+
+    conn = duckdb.connect(p_db)
+    try:
+        detail_rows, summary_rows = export_validation_report(conn, output_path, report)
+        click.echo(f"[ok] {detail_rows} flagged record(s) exported to: {output_path}")
+        click.echo(
+            f"Detail: {detail_rows} row(s)  |  Summary: {summary_rows} check(s)"
+        )
+        click.echo(
+            f"\nR"
+            f"eview the Detail sheet to identify which records need correction."
+        )
+        click.echo(f"Fix them at the source, re-ingest, and re-validate.")
+    except ValueError as e:
+        click.echo(f"[error] {e}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 def validation_commands(cli):
     cli.add_command(validate)
     cli.add_command(checks)
+    cli.add_command(export_validation)

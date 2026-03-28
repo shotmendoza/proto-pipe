@@ -5,7 +5,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from src.checks.runner import run_checks
+from src.checks.runner import run_checks, run_checks_and_flag
 from src.io.data import load_from_duckdb
 from src.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from src.pipelines.watermark import WatermarkStore, _watermark_lock
@@ -20,10 +20,14 @@ def run_report(
         report_config: dict,
         check_registry: CheckRegistry,
         watermark_store: WatermarkStore,
+        pipeline_db: str | None = None,
 ) -> dict:
     """Executes a full report process, involving data loading, checks resolution,
     execution of checks, and watermark management for persisted state tracking.
 
+    :param pipeline_db: Path to pipeline.db. When provided, validation flags
+                         are written for each check result. Optional — omit in
+                         tests that don't need flag writing.
     :param check_registry:
     :param report_config: Configuration for the report execution. Contains the report name,
         source information, options, and defined checks.
@@ -33,39 +37,62 @@ def run_report(
 
     :return: A dictionary with the executed report details, including the name of
         the report, its final status, and the results of any checks run.
+
+    Returns:
+        {
+            "report": str,
+            "status": "completed" | "skipped" | "error",
+            "results": {check_name: outcome, ...}, # present when completed
+            "error": str, # present when status=error
+        }
     """
     report_name = report_config["name"]
     source_config = report_config["source"]
     options = report_config.get("options", {})
     parallel_checks = options.get("parallel", False)
 
+    pk_col = source_config.get("primary_key")
+    table_name = source_config.get("table", "")
+
     last_run_at = watermark_store.get(report_name)
-    df = load_from_duckdb(source_config, last_run_at)
+
+    try:
+        df = load_from_duckdb(source_config, last_run_at)
+    except Exception as e:
+        return {"report": report_name, "status": "error", "error": str(e)}
 
     if df.empty:
-        print(f"[{report_name}] No new data, skipping.")
         return {"report": report_name, "status": "skipped"}
 
     context = {"df": df}
     check_names = report_config["resolved_checks"]
 
-    try:
-        results = run_checks(
-            check_names,
-            check_registry,
-            context,
+    if pipeline_db:
+        results = run_checks_and_flag(
+            check_names=check_names,
+            registry=check_registry,
+            context=context,
             parallel=parallel_checks,
+            pipeline_db=pipeline_db,
+            report_name=report_name,
+            table_name=table_name,
+            pk_col=pk_col,
         )
-    except Exception as exc:
-        # Watermark not advanced — rows will be retried next run
-        return {"report": report_name, "status": "failed", "error": str(exc)}
+    else:
+        results = run_checks(check_names, check_registry, context, parallel=parallel_checks)
 
-    any_failed = any(result["status"] == "failed" for result in results.values())
-    if any_failed:
-        print(f"[{report_name}] One or more checks failed — watermark not advanced.")
-        return {"report": report_name, "status": "completed", "results": results}
-
-    _advance_watermark(report_name, source_config["timestamp_col"], df, watermark_store)
+    # Advance watermark only when every check passed. A failed check means
+    # some rows were not fully validated — we want them re-checked next run.
+    all_passed = all(v["status"] == "passed" for v in results.values())
+    if all_passed:
+        ts_col = source_config.get("timestamp_col")
+        if ts_col and ts_col in df.columns:
+            max_ts = df[ts_col].max()
+            if not isinstance(max_ts, datetime):
+                max_ts = datetime.fromisoformat(str(max_ts)).replace(
+                    tzinfo=timezone.utc
+                )
+            watermark_store.set(report_name, max_ts)
     return {"report": report_name, "status": "completed", "results": results}
 
 
@@ -157,11 +184,14 @@ def run_all_reports(
     check_registry: CheckRegistry,
     watermark_store: WatermarkStore,
     parallel_reports: bool = True,
+    pipeline_db: str | None = None,
 ) -> list[dict]:
     """Execute all reports based on the inputs provided and returns their results. The function
     supports both sequential and parallel execution of reports, depending on the
     `parallel_reports` flag.
 
+    :param pipeline_db: Path to pipeline.db. Passed through to run_report
+                          for validation flag writing
     :param report_registry: The registry contains all the report definitions.
     :param check_registry: The registry holding all the checks to be executed for the reports.
     :param watermark_store: The storage handling watermarking for report processing.
@@ -172,7 +202,7 @@ def run_all_reports(
 
     if not parallel_reports:
         return [
-            run_report(r, check_registry, watermark_store)
+            run_report(r, check_registry, watermark_store, pipeline_db=pipeline_db)
             for r in reports
         ]
 
@@ -183,7 +213,8 @@ def run_all_reports(
                 run_report,
                 r,
                 check_registry,
-                watermark_store
+                watermark_store,
+                pipeline_db=pipeline_db,
             ): r["name"] for r in reports
         }
         for future in as_completed(futures):

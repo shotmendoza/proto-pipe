@@ -554,7 +554,7 @@ class TestExportFlaggedJoin:
         from datetime import date
 
         path = dated_export_path(str(tmp_path), "sales")
-        today = date.today().isoformat()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         assert today in path
         assert path.endswith(".csv")
 
