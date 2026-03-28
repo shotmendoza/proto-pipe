@@ -1,4 +1,4 @@
-# validation-pipeline
+# ProtoPipe
 
 A config-driven data validation and reporting pipeline backed by DuckDB.
 Ingest CSV and Excel files, run checks, and produce deliverable reports —
