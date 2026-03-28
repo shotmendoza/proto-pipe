@@ -30,7 +30,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-validation_pipeline = ["templates/*.yaml"]
+proto_pipe = ["templates/*.yaml"]
 
 [tool.mypy]
 mypy_path = "src"
