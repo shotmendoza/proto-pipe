@@ -334,12 +334,13 @@ class TestRunAllReports:
         _init_pipeline_db(pipeline_db)
         _seed_table(pipeline_db, "sales", sales_df)
 
-        # Register a check that returns a mask so we get row-level flags
+        from src.checks.helpers import register_custom_check
+
         def check_negative_price(ctx, col="price"):
             df = ctx["df"]
             return {"mask": df[col] < 0}
 
-        check_registry.register("neg_price", check_negative_price)
+        register_custom_check("neg_price", check_negative_price, check_registry)
 
         config = {
             "templates": {},

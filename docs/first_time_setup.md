@@ -6,10 +6,39 @@ installed and access to the shared folder where your data files live.
 
 ---
 
+## Terminology
+
+Before diving in, here's what the pipeline means by each term:
+
+| Term | What it is |
+|---|---|
+| **Source** | A raw file pulled from a data source — an unformatted CSV or Excel file sitting in a directory. Sources are defined in `sources_config.yaml` and loaded into DuckDB by `vp ingest`. |
+| **Report** | A validated version of a source table. Checks run against reports to identify bad rows, which are flagged for review. Correcting flagged rows keeps the report tables in the database accurate. |
+| **Deliverable** | A transformed, formatted version of one or more reports — shaped for a specific stakeholder with their expected column names and layout. Defined in `deliverables_config.yaml` and written to disk by `vp pull-report`. |
+
+---
+
 ## 1. Install the pipeline
+
+**With pip:**
 
 ```bash
 pip install validation-pipeline
+```
+
+**With uv (recommended):**
+
+```bash
+uv add validation-pipeline
+```
+
+**From a GitHub repository (for development or internal forks):**
+
+```bash
+pip install git+https://github.com/your-org/validation-pipeline.git
+
+# With uv
+uv add git+https://github.com/your-org/validation-pipeline.git
 ```
 
 Verify it installed correctly:
@@ -57,22 +86,9 @@ my-pipeline/
 
 ## 4. Set your paths in pipeline.yaml
 
-Open `pipeline.yaml`. By default it looks like this:
-
-```yaml
-paths:
-  sources_config:       "config/sources_config.yaml"
-  reports_config:       "config/reports_config.yaml"
-  deliverables_config:  "config/deliverables_config.yaml"
-  views_config:         "config/views_config.yaml"
-  pipeline_db:          "data/pipeline.db"
-  watermark_db:         "data/watermarks.db"
-  incoming_dir:         "data/incoming/"
-  output_dir:           "output/reports/"
-```
-
-The most important path to update is `incoming_dir` — point it at the shared
-folder where your data files arrive:
+Open `pipeline.yaml`. Each key is annotated with whether it needs to be
+updated or can stay at its default. The most important one to change is
+`incoming_dir` — point it at the folder where your source files arrive:
 
 ```bash
 vp config set incoming_dir /Volumes/SharedDrive/data/incoming/
@@ -122,7 +138,7 @@ empty table for each source you defined. You'll see output like:
 ```
 Initialising pipeline DB: data/pipeline.db
   [ok]   Created table 'sales'
-  [ok]   flagged_rows and report_runs tables ready
+  [ok]   flagged_rows, validation_flags, and report_runs tables ready
 
 Initialising watermark DB: data/watermarks.db
   [ok]   Watermark table ready
@@ -134,7 +150,7 @@ Safe to re-run — existing tables are never overwritten.
 
 ## 7. Drop your first file and ingest it
 
-Copy or move a data file into your `incoming_dir`. Then run:
+Copy or move a source file into your `incoming_dir`. Then run:
 
 ```bash
 vp ingest
@@ -150,15 +166,19 @@ Ingesting from: data/incoming/
   1 loaded, 0 skipped, 0 failed — see ingest_log for details.
 ```
 
-Files that have already been successfully ingested are skipped automatically
-on subsequent runs — you don't need to move or delete them from the folder.
+Source files that have already been successfully ingested are skipped
+automatically on subsequent runs — you don't need to move or delete them.
 
 If a file fails, it stays in the incoming folder and is retried on the next
-run. Check the reason with:
+run. To see the reason for any failure:
 
-```sql
-SELECT filename, status, message FROM ingest_log ORDER BY ingested_at DESC;
+```bash
+vp ingest-log --status failed
 ```
+
+Any rows that arrive with a conflicting value for an existing record are
+written to the `flagged_rows` table. These ingest conflicts must be resolved
+before a deliverable can be produced. See `docs/reviewing_flagged_rows.md`.
 
 ---
 
@@ -192,7 +212,7 @@ reports:
 ```
 
 See `docs/adding_reports.md` for the full key reference and all available
-built-in checks.
+built-in checks. See `docs/adding_checks.md` to write your own.
 
 ---
 
@@ -211,14 +231,19 @@ Running validation across 1 report(s)...
     ✓ standard_null_check
     ✗ price_range_check
       Column 'price' not found in DataFrame
+
+  ⚠  3 validation flag(s) across 1 report(s).
+  Run: vp export-validation  to export a detail + summary report.
 ```
 
 A `✓` means the check returned without raising. A `✗` means it raised an
 exception — the error message tells you why.
 
-If checks flag bad rows, they are written to the `flagged_rows` table.
-Run `vp flagged-summary` to see a count of open flags before proceeding.
-See `docs/reviewing_flagged_rows.md` for how to review and correct them.
+Any rows that fail a check are written to the `validation_flags` table.
+Validation flags are **warnings only** — they do not block a deliverable from
+being produced. Run `vp export-validation` to get a two-sheet Excel file
+(Detail: one row per flagged record; Summary: one row per check) to review
+what needs fixing. See `docs/reviewing_flagged_rows.md` for the full workflow.
 
 ---
 
@@ -245,7 +270,7 @@ deliverables:
 ```
 
 See `docs/adding_deliverables.md` for the full key reference, including how
-to use SQL files for joins and carrier-specific logic.
+to use SQL files for joins and carrier-specific column shaping.
 
 ---
 
@@ -262,6 +287,10 @@ Output is written to `output/reports/` (or the `output_dir` you configured):
   [ok] output/reports/monthly_pack_2026-03-26.xlsx (1243 total rows)
 ```
 
+Validation flags do not block this step. If there are open ingest conflicts
+in `flagged_rows`, the deliverable is blocked until they are resolved (or
+`--ignore-flagged` is passed).
+
 ---
 
 ## 12. Run everything at once
@@ -273,9 +302,9 @@ vp run-all --deliverable monthly_pack
 ```
 
 This runs ingest → validate → refresh views → pull report in sequence.
-If flagged rows exist, it stops before producing the deliverable and tells
-you how many rows need review. Pass `--ignore-flagged` to produce the
-deliverable anyway.
+If ingest conflicts exist in `flagged_rows`, it stops before producing the
+deliverable. Validation flags in `validation_flags` print a warning but do
+not stop the run. Pass `--ignore-flagged` to bypass ingest conflict blocking.
 
 ---
 
@@ -291,13 +320,20 @@ New files dropped into the incoming folder are picked up automatically.
 Files already ingested are skipped. The deliverable is written to the output
 folder with the current date in the filename.
 
-If the run stops due to flagged rows:
+If the run stops due to ingest conflicts:
 
 ```bash
-vp flagged-summary                          # see what needs attention
-vp export-flagged --table sales             # export for correction
-vp import-corrections flagged_sales.csv --table sales   # apply fixes
-vp run-all --deliverable monthly_pack       # re-run clean
+vp flagged-summary                                              # see what needs attention
+vp export-flagged --table sales                                 # export for correction
+vp import-corrections flagged_sales_2026-03-26.csv --table sales  # apply fixes
+vp run-all --deliverable monthly_pack                           # re-run clean
+```
+
+If the run completes but prints a validation warning:
+
+```bash
+vp export-validation          # export Detail + Summary sheets
+                              # fix records at the source, re-ingest, re-validate
 ```
 
 ---
@@ -307,19 +343,21 @@ vp run-all --deliverable monthly_pack       # re-run clean
 | Task | Command |
 |---|---|
 | First-time setup | `vp init` then `vp db-init` |
-| Load new files | `vp ingest` |
+| Load new source files | `vp ingest` |
+| Check why a file failed to load | `vp ingest-log --status failed` |
 | Run checks | `vp validate` |
-| Produce a deliverable | `vp pull-report <name>` |
-| Run everything | `vp run-all --deliverable <name>` |
+| Produce a deliverable | `vp pull-report <n>` |
+| Run everything | `vp run-all --deliverable <n>` |
 | Check current paths | `vp config show` |
 | Update a path | `vp config set <key> <value>` |
 | List available checks | `vp checks` |
-| Check for flagged rows | `vp flagged-summary` |
-| View flagged rows | `vp flagged-list --table <n>` |
-| Export flagged for correction | `vp export-flagged --table <n>` |
+| Review ingest conflicts | `vp flagged-summary` |
+| View ingest conflict rows | `vp flagged-list --table <n>` |
+| Export ingest conflicts for correction | `vp export-flagged --table <n>` |
 | Apply corrections | `vp import-corrections <file> --table <n>` |
-| Clear flags without correcting | `vp flagged-clear --table <n>` |
+| Clear ingest conflicts | `vp flagged-clear --table <n>` |
 | Scan for duplicate conflicts | `vp check-null-overwrites --table <n>` |
+| Export validation flags for review | `vp export-validation` |
 | Refresh views manually | `vp refresh-views` |
-| Review failed ingests | Query `ingest_log` in pipeline.db |
-| Review flagged rows | See `docs/reviewing_flagged_rows.md` |
+| Review ingest conflict workflow | See `docs/reviewing_flagged_rows.md` |
+| Write a custom check | See `docs/adding_checks.md` |

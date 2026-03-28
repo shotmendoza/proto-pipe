@@ -386,6 +386,28 @@ class TestExportValidationReport:
         assert "Detail" in wb.sheet_names
         assert "Summary" in wb.sheet_names
 
+    def test_detail_contains_flag_id_column(self, conn, tmp_path):
+        write_validation_flags(conn, "r", "c", "t", "order_id",
+                               [{"pk_value": "ORD-001", "reason": "bad"}])
+
+        out_path = str(tmp_path / "v.xlsx")
+        export_validation_report(conn, out_path)
+
+        det = pd.read_excel(out_path, sheet_name="Detail")
+        assert "_flag_id" in det.columns
+
+    def test_flag_id_is_first_column_in_detail(self, conn, tmp_path):
+        # _flag_id must be first so users see it and know not to edit it —
+        # same convention as export_flagged for ingest conflicts.
+        write_validation_flags(conn, "r", "c", "t", "order_id",
+                               [{"pk_value": "ORD-001", "reason": "bad"}])
+
+        out_path = str(tmp_path / "v.xlsx")
+        export_validation_report(conn, out_path)
+
+        det = pd.read_excel(out_path, sheet_name="Detail")
+        assert det.columns[0] == "_flag_id"
+
     def test_detail_renames_pk_col_when_all_flags_share_same_pk_col(self, conn, tmp_path):
         write_validation_flags(conn, "r", "c", "t", "order_id",
                                [{"pk_value": "ORD-001", "reason": "bad"}])
@@ -435,3 +457,18 @@ class TestExportValidationReport:
         export_validation_report(conn, out_path)
 
         assert Path(out_path).exists()
+
+    def test_flag_id_values_match_validation_flags_table(self, conn, tmp_path):
+        # The _flag_id in the export must match the id column in validation_flags
+        # so that import_corrections can use it to clear the right rows.
+        write_validation_flags(conn, "r", "c", "t", "order_id",
+                               [{"pk_value": "ORD-001", "reason": "bad"}])
+
+        out_path = str(tmp_path / "v.xlsx")
+        export_validation_report(conn, out_path)
+
+        det = pd.read_excel(out_path, sheet_name="Detail")
+        exported_id = det["_flag_id"].iloc[0]
+
+        stored_id = conn.execute("SELECT id FROM validation_flags").fetchone()[0]
+        assert exported_id == stored_id

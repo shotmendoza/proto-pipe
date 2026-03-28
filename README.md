@@ -6,10 +6,30 @@ all driven by YAML with no code changes required for new sources or reports.
 
 ---
 
+## How it works
+
+```
+Source files  →  Ingest  →  Report tables  →  Validate  →  Deliverables
+(CSV / Excel)    (DuckDB)   (per source)       (checks)     (CSV / Excel)
+```
+
+**Sources** are raw files dropped into a directory. **Reports** are the
+validated versions of those tables — checks run against them and any failing
+rows are flagged. **Deliverables** are formatted outputs combining one or
+more reports into a file for stakeholders.
+
+---
+
 ## Installation
 
 ```bash
 pip install validation-pipeline
+
+# Or with uv
+uv add validation-pipeline
+
+# From a GitHub repository
+pip install git+https://github.com/your-org/validation-pipeline.git
 ```
 
 ---
@@ -27,7 +47,7 @@ vp init
 #    config/views_config.yaml          — shared transformation views (optional)
 #    pipeline.yaml                     — path defaults
 
-# 3. Create DuckDB databases, bootstrap tables, and create views
+# 3. Create DuckDB databases, bootstrap tables
 vp db-init
 
 # 4. Drop files into data/incoming/ then run
@@ -46,19 +66,25 @@ vp run-all --deliverable <deliverable-name>
 | Command | Description |
 |---|---|
 | `init` | Scaffold config files into your project |
-| `db-init` | Create DuckDB files, bootstrap tables, and create views |
+| `db-init` | Create DuckDB files, bootstrap tables |
 | `config show` | Print current path settings from pipeline.yaml |
 | `config set <key> <value>` | Update a path setting |
-| `ingest` | Load files from incoming dir into DuckDB. Already-ingested files are skipped automatically. |
+| `ingest` | Load source files from incoming dir into DuckDB. Already-ingested files are skipped. |
 | `ingest --validate` | Load files and run checks immediately after |
-| `validate` | Run registered checks against ingested tables |
+| `ingest-log` | Show recent ingest attempts. Use `--status failed` to see failures. |
+| `validate` | Run registered checks against ingested tables. Flags written to `validation_flags`. |
 | `update-table <table> <file>` | Re-ingest a specific file into a specific table |
-| `pull-report <name>` | Query tables with filters and write deliverable output |
+| `pull-report <name>` | Query tables and write deliverable output |
 | `run-all` | Chain ingest → validate → refresh-views → pull-report |
 | `checks` | List all available built-in checks |
 | `refresh-views` | Drop and recreate all views from views_config.yaml |
-| `export-flagged --table <name>` | Export flagged rows to CSV for manual correction |
-| `import-corrections <file> --table <name>` | Apply a corrected CSV back to the source table |
+| `flagged-summary` | Count open ingest conflicts by table and reason |
+| `flagged-list --table <n>` | Print ingest conflict rows inline in the terminal |
+| `flagged-clear --table <n>` | Clear ingest conflicts without correcting |
+| `export-flagged --table <n>` | Export ingest conflict rows to CSV for correction |
+| `import-corrections <file> --table <n>` | Apply a corrected CSV back to the source table |
+| `check-null-overwrites --table <n>` | Manually scan a table for duplicate conflicts |
+| `export-validation` | Export validation flags to a two-sheet Excel file (Detail + Summary) |
 
 ---
 
@@ -89,88 +115,47 @@ your-project/
 
 ```
 ├── README.md
-├── config
-│       ├── deliverables_config.yaml
-│       ├── pipeline.yaml
-│       ├── reports_config.yaml
-│       ├── sources_config.yaml
-│       └── views_config.yaml
-├── docs
-│       ├── adding_checks.md
-│       ├── adding_deliverables.md
-│       ├── adding_reports.md
-│       ├── first_time_setup.md
-│       └── reviewing_flagged_rows.md
+├── config/
+│   ├── deliverables_config.yaml
+│   ├── pipeline.yaml
+│   ├── reports_config.yaml
+│   ├── sources_config.yaml
+│   └── views_config.yaml
+├── docs/
+│   ├── adding_checks.md
+│   ├── adding_deliverables.md
+│   ├── adding_reports.md
+│   ├── first_time_setup.md
+│   └── reviewing_flagged_rows.md
 ├── pyproject.toml
-├── src
-│        ├── __init__.py
-│        ├── __pycache__
-│        ├── checks
-│        │       ├── __init__.py
-│        │       ├── __pycache__
-│        │       ├── built_in.py
-│        │       ├── helpers.py
-│        │       └── runner.py
-│        ├── cli.py
-│        ├── io
-│        │       ├── __init__.py
-│        │       ├── __pycache__
-│        │       ├── data.py
-│        │       ├── ingest.py
-│        │       ├── registry.py
-│        │       └── settings.py
-│        ├── main.py
-│        ├── pipelines
-│        │       ├── __init__.py
-│        │       ├── __pycache__
-│        │       └── watermark.py
-│        ├── registry
-│        │       ├── __init__.py
-│        │       ├── __pycache__
-│        │       └── base.py
-│        └── reports
-│            ├── __init__.py
-│            ├── __pycache__
-│            ├── corrections.py
-│            ├── query.py
-│            ├── runner.py
-│            └── views.py
-├── tests
-│        ├── __init__.py
-│        ├── __pycache__
-│        │       ├── __init__.cpython-313.pyc
-│        │       ├── conftest.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_checks.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_checks.cpython-313.pyc
-│        │       ├── test_custom_checks.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_custom_checks.cpython-313.pyc
-│        │       ├── test_deliverables.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_deliverables.cpython-313.pyc
-│        │       ├── test_ingest.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_ingest.cpython-313.pyc
-│        │       ├── test_ingest_chunking.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_ingest_corrections.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_ingest_corrections_runner.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_query.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_query.cpython-313.pyc
-│        │       ├── test_runner.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_runner.cpython-313.pyc
-│        │       ├── test_views_corrections_ingest.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_watermark.cpython-313-pytest-9.0.2.pyc
-│        │       ├── test_watermark.cpython-313.pyc
-│        │       ├── test_workflow.cpython-313-pytest-9.0.2.pyc
-│        │       └── test_workflow.cpython-313.pyc
-│        ├── conftest.py
-│        ├── test_checks.py
-│        ├── test_custom_checks.py
-│        ├── test_deliverables.py
-│        ├── test_ingest.py
-│        ├── test_ingest_corrections_runner.py
-│        ├── test_query.py
-│        ├── test_runner.py
-│        ├── test_views_corrections_ingest.py
-│        ├── test_watermark.py
-│        └── test_workflow.py
+└── src/
+    ├── __init__.py
+    ├── checks/
+    │   ├── built_in.py
+    │   ├── helpers.py
+    │   └── runner.py
+    ├── cli/
+    │   ├── __init__.py
+    │   ├── data.py
+    │   ├── flagged.py
+    │   ├── reports.py
+    │   ├── setup.py
+    │   └── validation.py
+    ├── io/
+    │   ├── data.py
+    │   ├── ingest.py
+    │   ├── registry.py
+    │   └── settings.py
+    ├── pipelines/
+    │   └── watermark.py
+    ├── registry/
+    │   └── base.py
+    └── reports/
+        ├── corrections.py
+        ├── query.py
+        ├── runner.py
+        ├── validation_flags.py
+        └── views.py
 ```
 
 ---
@@ -183,15 +168,32 @@ The pipeline creates and manages these tables automatically:
 |---|---|---|
 | `<source_table>` | pipeline.db | One table per source defined in sources_config.yaml |
 | `ingest_log` | pipeline.db | Record of every file ingested, including failures and skips |
-| `flagged_rows` | pipeline.db | Rows flagged by checks for manual review and correction |
+| `flagged_rows` | pipeline.db | Ingest conflicts — rows that arrived with changed values for an existing record. Blocks deliverables. |
+| `validation_flags` | pipeline.db | Validation failures — rows that failed a check. Warning only, does not block deliverables. |
 | `report_runs` | pipeline.db | Record of every deliverable produced |
 | `watermarks` | watermarks.db | Last processed timestamp per report |
 
 ---
 
+## Flagging: two separate tables
+
+The pipeline separates ingest problems from validation problems:
+
+**Ingest conflicts** (`flagged_rows`) — a row arrived whose primary key
+already exists but whose content changed. The incoming row is held back until
+you decide whether to accept or discard it. Open ingest conflicts block
+deliverable production.
+
+**Validation flags** (`validation_flags`) — a check found bad data in an
+already-ingested row. The row is in the report table but fails a quality
+rule. These are warnings — the deliverable is still produced, but the export
+shows which records need fixing at the source.
+
+---
+
 ## Adding a New Source
 
-1. Add a pattern entry to `config/sources_config.yaml`:
+Add a pattern entry to `config/sources_config.yaml`:
 
 ```yaml
 sources:
@@ -204,9 +206,9 @@ sources:
     primary_key: "order_id"     # used by import-corrections to match corrected rows
 ```
 
-2. Drop a matching file into `data/incoming/` and run `vp ingest`.
-   The table is created automatically on first ingest — no `db-init` needed again.
-   Files already ingested are skipped on subsequent runs.
+Drop a matching file into `data/incoming/` and run `vp ingest`. The table is
+created automatically on first ingest. Files already ingested are skipped on
+subsequent runs.
 
 ---
 
@@ -229,29 +231,40 @@ See `docs/adding_deliverables.md` for full key reference.
 ## Adding a Custom Check
 
 ```python
-from validation_pipeline import check_registry
-from validation_pipeline.checks.registry_helpers import register_custom_check
+from validation_pipeline import custom_check
 
+@custom_check("margin_check")
 def check_margin(context, col="margin", threshold=0.2):
     df = context["df"]
     below = df[df[col] < threshold]
     if not below.empty:
         raise ValueError(f"{len(below)} rows below margin threshold {threshold}")
     return {"violations": 0, "threshold": threshold}
-
-register_custom_check("margin_check", check_margin, check_registry)
 ```
 
-Call `register_custom_check` before loading your config.
-See `docs/adding_checks.md` for full details.
+Point the pipeline at your module in `pipeline.yaml`:
+
+```yaml
+custom_checks_module: "my_checks.py"
+```
+
+For row-level flags, return a boolean mask alongside your result:
+
+```python
+@custom_check("no_negatives")
+def check_no_negatives(context, col="price"):
+    df = context["df"]
+    return {"mask": df[col] < 0}   # one flag per failing row
+```
+
+See `docs/adding_checks.md` for full details and registration options.
 
 ---
 
 ## Shared Transformation Views
 
-Define reusable SQL transformations in `config/views_config.yaml` and reference
-them by name in any deliverable SQL file. Useful when multiple carriers or
-deliverables need the same column standardisation or join logic.
+Define reusable SQL transformations in `config/views_config.yaml` and
+reference them by name in any deliverable SQL file.
 
 ```yaml
 # config/views_config.yaml
@@ -272,22 +285,31 @@ Views are created by `vp db-init` and refreshed by `vp refresh-views`.
 
 ---
 
-## Correcting Flagged Rows
+## Correcting Ingest Conflicts
 
-When validation flags bad data, export the flagged rows, fix them, and import
-the corrections back — the fix is applied directly to the DuckDB table.
+When ingest flags conflicting rows, export them, fix the values, and import
+the corrections back:
 
 ```bash
-# Export flagged rows for a table to CSV
 vp export-flagged --table sales
-
-# Edit the CSV to fix the values, then re-import
+# edit the CSV
 vp import-corrections output/reports/flagged_sales.csv --table sales
 ```
 
 The corrected rows are updated in the table and cleared from `flagged_rows`.
-The primary key used for matching is defined in `sources_config.yaml` under
+The primary key for matching is defined in `sources_config.yaml` under
 `primary_key`, or overridden at runtime with `--key`.
+
+## Reviewing Validation Flags
+
+When validation flags bad records, export the report and fix the data at source:
+
+```bash
+vp export-validation                # Detail + Summary sheets
+# fix data at source, re-ingest, re-validate
+```
+
+See `docs/reviewing_flagged_rows.md` for both workflows in full.
 
 ---
 

@@ -216,17 +216,43 @@ def import_corrections(
 
     updated = len(df) - not_found
 
-    # Clear resolved flagged_rows entries
+    # Clear resolved entries from both flag tables.
+    # _flag_id values from export_flagged point at flagged_rows (ingest conflicts).
+    # _flag_id values from export_validation_report point at validation_flags.
+    # We try both — each DELETE is a no-op if the id doesn't exist in that table.
     flagged_cleared = 0
+    validation_cleared = 0
     if flag_ids:
         placeholders = ", ".join(["?"] * len(flag_ids))
+
         flagged_cleared = conn.execute(
             f"SELECT count(*) FROM flagged_rows WHERE id IN ({placeholders})",
             flag_ids,
         ).fetchone()[0]
-        conn.execute(
-            f"DELETE FROM flagged_rows WHERE id IN ({placeholders})",
-            flag_ids,
-        )
+        if flagged_cleared:
+            conn.execute(
+                f"DELETE FROM flagged_rows WHERE id IN ({placeholders})",
+                flag_ids,
+            )
 
-    return {"updated": updated, "flagged_cleared": flagged_cleared, "not_found": not_found}
+        try:
+            validation_cleared = conn.execute(
+                f"SELECT count(*) FROM validation_flags WHERE id IN ({placeholders})",
+                flag_ids,
+            ).fetchone()[0]
+            if validation_cleared:
+                conn.execute(
+                    f"DELETE FROM validation_flags WHERE id IN ({placeholders})",
+                    flag_ids,
+                )
+        except Exception as exc:
+            # validation_flags table may not exist in older pipeline DBs —
+            # skip silently rather than failing the whole correction.
+            validation_cleared = 0
+
+    return {
+        "updated": updated,
+        "flagged_cleared": flagged_cleared,
+        "validation_cleared": validation_cleared,
+        "not_found": not_found,
+    }

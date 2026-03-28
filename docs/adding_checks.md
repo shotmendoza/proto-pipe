@@ -33,6 +33,45 @@ def check_no_negatives(context: dict, col: str) -> dict:
 
 ---
 
+## Row-level flagging
+
+The pipeline inspects each check's return dict to decide how to write
+validation flags. The return shape determines whether flags are row-level
+(one flag per bad record) or a single summary flag for the whole check run.
+
+**Boolean mask** — return a `pd.Series[bool]` under the key `"mask"`, and
+set `"flag_when"` to indicate which boolean value means a row failed.
+`flag_when` defaults to `True` if omitted.
+
+```python
+# Flag rows where price is negative
+def check_no_negatives(context, col="price"):
+    df = context["df"]
+    return {
+        "mask": df[col] < 0,   # True where the row is bad
+        "flag_when": True,      # flag rows where mask == True (default, can omit)
+    }
+
+# Flag rows where is_active is False
+def check_all_active(context):
+    df = context["df"]
+    return {
+        "mask": df["is_active"],
+        "flag_when": False,     # flag rows where mask == False
+    }
+```
+
+Each flagged row gets its own entry in `validation_flags`, keyed on the
+record's primary key value. The `vp export-validation` Detail sheet will
+show one row per flagged record with the check name and reason.
+
+**Summary** — if the return dict contains neither `"mask"` nor
+`"violation_indices"`, one summary flag is written for the entire check run.
+This is how the built-in `null_check`, `schema_check`, and `duplicate_check`
+work today — they report an aggregate result rather than individual rows.
+
+---
+
 ## Option 1 — The `@custom_check` decorator (recommended)
 
 The cleanest way to register a custom check. Decorate your function with
@@ -45,7 +84,7 @@ registers all decorated functions automatically on startup.
 ```python
 # my_checks.py
 
-from src.checks.helpers import custom_check
+from validation_pipeline import custom_check
 
 
 @custom_check("margin_check")
@@ -75,8 +114,7 @@ when you're building checks programmatically rather than from a module file.
 ```python
 # my_checks.py (or anywhere that runs before the pipeline starts)
 
-from src.registry.base import check_registry
-from src.checks.helpers import register_custom_check
+from validation_pipeline import custom_check, register_custom_check, check_registry
 
 
 def check_margin(context: dict, col: str = "margin", threshold: float = 0.2) -> dict:
@@ -92,6 +130,13 @@ register_custom_check("margin_check", check_margin, check_registry)
 
 Call `register_custom_check` **before** `load_config` / `register_from_config`
 so the config loader can find the function by name.
+
+> **Note:** Do not use `check_registry.register()` directly for checks you
+> want to reference from `reports_config.yaml`. The config loader resolves
+> check names through the internal `BUILT_IN_CHECKS` registry, which only
+> `register_custom_check` and `@custom_check` update. Using
+> `check_registry.register()` alone will cause a `ValueError` at config
+> load time.
 
 ---
 
@@ -146,17 +191,16 @@ templates:
 
 ## Built-in checks reference
 
-| Name               | Params                                          | Raises when...                              |
-|--------------------|-------------------------------------------------|---------------------------------------------|
-| `null_check`       | none                                            | never — informational only                  |
-| `range_check`      | `col`, `min_val`, `max_val`                     | column not found in the DataFrame           |
-| `schema_check`     | `expected_cols` (list)                          | never — informational only                  |
-| `duplicate_check`  | `subset` (optional list)                        | never — informational only                  |
+| Name               | Params                                          | Raises when...              | Flag type   |
+|--------------------|-------------------------------------------------|-----------------------------|-------------|
+| `null_check`       | none                                            | never                       | summary     |
+| `range_check`      | `col`, `min_val`, `max_val`                     | column not found            | row-level   |
+| `schema_check`     | `expected_cols` (list)                          | never                       | summary     |
+| `duplicate_check`  | `subset` (optional list)                        | never                       | summary     |
 
-> **Note:** the built-ins return results but do not raise on bad data — they
-> report what they found without stopping the pipeline. If you want a check
-> to be marked `failed` (and surface an error message in `vp validate`),
-> write a custom check that raises on the condition you care about.
+> **Note:** Built-ins that are marked "summary" report an aggregate result
+> without identifying specific rows. If you need row-level flags, write a
+> custom check that returns a `"mask"` key.
 
 ---
 
@@ -179,3 +223,6 @@ This lists all built-ins. Custom checks registered via decorator or
   slice of new rows for that report (watermark-filtered).
 - If `parallel: true` is set on the report, checks run in threads.
   Make sure your check function is thread-safe (no shared mutable state).
+- Validation flags are warnings — they do not block a deliverable from being
+  produced. Use `vp export-validation` to review them after `vp validate`.
+- 

@@ -125,6 +125,7 @@ def run_checks_and_flag(
                     result=result_dict,
                     df=df,
                     pk_col=pk_col,
+                    check_name=check_name,
                 )
 
             write_validation_flags(

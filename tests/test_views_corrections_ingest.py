@@ -18,11 +18,27 @@ import pytest
 from src.io.ingest import _already_ingested, _init_ingest_log, _log_ingest, flag_id_for
 from src.reports.corrections import import_corrections, export_flagged
 from src.reports.views import create_views, refresh_views, load_views_config, _load_sql
+from src.reports.validation_flags import init_validation_flags_table
 
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
+
+def _validation_flag_row(
+    conn, table_name: str, pk_value: str, check_name: str, reason: str
+) -> str:
+    """Insert a validation_flags entry and return its id."""
+    import uuid
+    flag_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"test_report:{check_name}:{pk_value}"))
+    conn.execute("""
+        INSERT INTO validation_flags
+            (id, report_name, check_name, table_name, pk_col, pk_value, reason, flagged_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (id) DO NOTHING
+    """, [flag_id, "test_report", check_name, table_name,
+          "order_id", pk_value, reason, datetime.now(timezone.utc)])
+    return flag_id
 
 @pytest.fixture
 def conn():
@@ -66,6 +82,13 @@ def conn_with_ingest_log(conn):
     """Connection with ingest_log table bootstrapped."""
     _init_ingest_log(conn)
     return conn
+
+
+@pytest.fixture
+def conn_with_sales_and_validation(conn_with_sales):
+    """conn_with_sales extended with the validation_flags table."""
+    init_validation_flags_table(conn_with_sales)
+    return conn_with_sales
 
 
 def _write_sql_file(tmp_path: Path, filename: str, sql: str) -> str:
@@ -384,17 +407,28 @@ class TestExportFlagged:
 # corrections.py — import_corrections
 # ===========================================================================
 
+
 class TestImportCorrections:
-    def _make_corrections_csv(self, tmp_path, rows: list[dict], filename="corrections.csv") -> str:
+    def _make_corrections_csv(
+        self, tmp_path, rows: list[dict], filename="corrections.csv"
+    ) -> str:
         df = pd.DataFrame(rows)
         p = tmp_path / filename
         df.to_csv(p, index=False)
         return str(p)
 
     def test_updates_row_by_primary_key(self, conn_with_sales, tmp_path):
-        path = self._make_corrections_csv(tmp_path, [
-            {"order_id": "ORD-002", "price": 75.0, "region": "APAC", "status": "active"}
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
         import_corrections(conn_with_sales, "sales", path, "order_id")
         result = conn_with_sales.execute(
             "SELECT price FROM sales WHERE order_id = 'ORD-002'"
@@ -402,9 +436,17 @@ class TestImportCorrections:
         assert result[0] == 75.0
 
     def test_only_updates_specified_rows(self, conn_with_sales, tmp_path):
-        path = self._make_corrections_csv(tmp_path, [
-            {"order_id": "ORD-002", "price": 75.0, "region": "APAC", "status": "active"}
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
         import_corrections(conn_with_sales, "sales", path, "order_id")
         # ORD-001 should be untouched
         result = conn_with_sales.execute(
@@ -413,32 +455,38 @@ class TestImportCorrections:
         assert result[0] == 100.0
 
     def test_strips_annotation_columns_before_update(self, conn_with_sales, tmp_path):
-        path = self._make_corrections_csv(tmp_path, [
-            {
-                "_flag_id":     "some-uuid",
-                "_flag_reason": "negative price",
-                "order_id":     "ORD-002",
-                "price":        75.0,
-                "region":       "APAC",
-                "status":       "active",
-            }
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": "some-uuid",
+                    "_flag_reason": "negative price",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
         # Should not raise even though _flag_id/_flag_reason are not table columns
         result = import_corrections(conn_with_sales, "sales", path, "order_id")
         assert result["updated"] == 1
 
     def test_clears_flagged_rows_by_flag_id(self, conn_with_sales, tmp_path):
         flag_id = _flag_row(conn_with_sales, "sales", "ORD-002", "negative price")
-        path = self._make_corrections_csv(tmp_path, [
-            {
-                "_flag_id": flag_id,
-                "_flag_reason": "negative price",
-                "order_id": "ORD-002",
-                "price": 75.0,
-                "region": "APAC",
-                "status": "active",
-            }
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": flag_id,
+                    "_flag_reason": "negative price",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
         result = import_corrections(conn_with_sales, "sales", path, "order_id")
         assert result["flagged_cleared"] == 1
         remaining = conn_with_sales.execute(
@@ -447,66 +495,226 @@ class TestImportCorrections:
         assert remaining == 0
 
     def test_returns_correct_updated_count(self, conn_with_sales, tmp_path):
-        path = self._make_corrections_csv(tmp_path, [
-            {"order_id": "ORD-001", "price": 110.0, "region": "EMEA", "status": "active"},
-            {"order_id": "ORD-002", "price": 75.0,  "region": "APAC", "status": "active"},
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "order_id": "ORD-001",
+                    "price": 110.0,
+                    "region": "EMEA",
+                    "status": "active",
+                },
+                {
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                },
+            ],
+        )
         result = import_corrections(conn_with_sales, "sales", path, "order_id")
         assert result["updated"] == 2
 
-    def test_returns_zero_flagged_cleared_when_no_flag_id_col(self, conn_with_sales, tmp_path):
+    def test_returns_zero_flagged_cleared_when_no_flag_id_col(
+        self, conn_with_sales, tmp_path
+    ):
         # Corrections file without _flag_id — no flags to clear
-        path = self._make_corrections_csv(tmp_path, [
-            {"order_id": "ORD-002", "price": 75.0, "region": "APAC", "status": "active"}
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
         result = import_corrections(conn_with_sales, "sales", path, "order_id")
         assert result["flagged_cleared"] == 0
 
     def test_raises_file_not_found(self, conn_with_sales, tmp_path):
         with pytest.raises(FileNotFoundError, match="Corrections file not found"):
-            import_corrections(conn_with_sales, "sales",
-                               str(tmp_path / "missing.csv"), "order_id")
+            import_corrections(
+                conn_with_sales, "sales", str(tmp_path / "missing.csv"), "order_id"
+            )
 
     def test_raises_if_primary_key_missing_from_file(self, conn_with_sales, tmp_path):
-        path = self._make_corrections_csv(tmp_path, [
-            {"price": 75.0, "region": "APAC"}   # order_id missing
-        ])
+        path = self._make_corrections_csv(
+            tmp_path, [{"price": 75.0, "region": "APAC"}]  # order_id missing
+        )
         with pytest.raises(ValueError, match="Primary key column 'order_id' not found"):
             import_corrections(conn_with_sales, "sales", path, "order_id")
 
     def test_raises_if_no_updatable_columns(self, conn_with_sales, tmp_path):
         # File only has the primary key — nothing to update
-        path = self._make_corrections_csv(tmp_path, [
-            {"order_id": "ORD-002"}
-        ])
+        path = self._make_corrections_csv(tmp_path, [{"order_id": "ORD-002"}])
         with pytest.raises(ValueError, match="No updatable columns found"):
             import_corrections(conn_with_sales, "sales", path, "order_id")
 
     def test_ignores_file_columns_not_in_table(self, conn_with_sales, tmp_path):
         # Extra column in the file that doesn't exist in the table
-        path = self._make_corrections_csv(tmp_path, [
-            {"order_id": "ORD-002", "price": 75.0, "region": "APAC",
-             "status": "active", "nonexistent_col": "ignored"}
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                    "nonexistent_col": "ignored",
+                }
+            ],
+        )
         # Should not raise — nonexistent_col is silently skipped
         result = import_corrections(conn_with_sales, "sales", path, "order_id")
         assert result["updated"] == 1
 
-    def test_partial_corrections_dont_affect_unflagged_rows(self, conn_with_sales, tmp_path):
+    def test_partial_corrections_dont_affect_unflagged_rows(
+        self, conn_with_sales, tmp_path
+    ):
         flag_id = _flag_row(conn_with_sales, "sales", "ORD-002", "bad price")
-        path = self._make_corrections_csv(tmp_path, [
-            {
-                "_flag_id": flag_id, "_flag_reason": "bad price",
-                "order_id": "ORD-002", "price": 75.0,
-                "region": "APAC", "status": "active",
-            }
-        ])
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": flag_id,
+                    "_flag_reason": "bad price",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
         import_corrections(conn_with_sales, "sales", path, "order_id")
         # ORD-003 untouched
         result = conn_with_sales.execute(
             "SELECT price FROM sales WHERE order_id = 'ORD-003'"
         ).fetchone()
         assert result[0] == 200.0
+
+    def test_returns_validation_cleared_zero_when_no_validation_flags_table(
+        self, conn_with_sales, tmp_path
+    ):
+        # conn_with_sales has flagged_rows but not validation_flags —
+        # import_corrections should not raise, validation_cleared should be 0.
+        flag_id = _flag_row(conn_with_sales, "sales", "ORD-002", "bad price")
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": flag_id,
+                    "_flag_reason": "bad price",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
+        result = import_corrections(conn_with_sales, "sales", path, "order_id")
+        assert result["flagged_cleared"] == 1
+        # validation_flags table doesn't exist in this fixture — expect 0 or key absent
+        assert result.get("validation_cleared", 0) == 0
+
+    def test_clears_validation_flags_by_flag_id(
+        self, conn_with_sales_and_validation, tmp_path
+    ):
+        conn = conn_with_sales_and_validation
+        # Write a validation flag for ORD-002
+        val_flag_id = _validation_flag_row(
+            conn, "sales", "ORD-002", "price_check", "price negative"
+        )
+
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": val_flag_id,
+                    "_flag_reason": "price negative",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
+        result = import_corrections(conn, "sales", path, "order_id")
+
+        assert result["updated"] == 1
+        assert result["validation_cleared"] == 1
+        assert result["flagged_cleared"] == 0
+        remaining = conn.execute("SELECT count(*) FROM validation_flags").fetchone()[0]
+        assert remaining == 0
+
+    def test_clears_only_matching_validation_flags(
+        self, conn_with_sales_and_validation, tmp_path
+    ):
+        conn = conn_with_sales_and_validation
+        # Flag two rows; only correct one of them
+        val_flag_id = _validation_flag_row(
+            conn, "sales", "ORD-002", "price_check", "bad"
+        )
+        _validation_flag_row(conn, "sales", "ORD-004", "price_check", "bad")
+
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": val_flag_id,
+                    "_flag_reason": "bad",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                }
+            ],
+        )
+        result = import_corrections(conn, "sales", path, "order_id")
+
+        assert result["validation_cleared"] == 1
+        remaining = conn.execute("SELECT count(*) FROM validation_flags").fetchone()[0]
+        assert remaining == 1  # ORD-004 still flagged
+
+    def test_clears_flagged_rows_and_validation_flags_independently(
+        self, conn_with_sales_and_validation, tmp_path
+    ):
+        conn = conn_with_sales_and_validation
+        # ORD-001 has an ingest conflict; ORD-002 has a validation flag
+        ingest_flag_id = _flag_row(conn, "sales", "ORD-001", "ingest conflict")
+        val_flag_id = _validation_flag_row(
+            conn, "sales", "ORD-002", "price_check", "bad"
+        )
+
+        path = self._make_corrections_csv(
+            tmp_path,
+            [
+                {
+                    "_flag_id": ingest_flag_id,
+                    "_flag_reason": "ingest conflict",
+                    "order_id": "ORD-001",
+                    "price": 100.0,
+                    "region": "EMEA",
+                    "status": "active",
+                },
+                {
+                    "_flag_id": val_flag_id,
+                    "_flag_reason": "bad",
+                    "order_id": "ORD-002",
+                    "price": 75.0,
+                    "region": "APAC",
+                    "status": "active",
+                },
+            ],
+        )
+        result = import_corrections(conn, "sales", path, "order_id")
+
+        assert result["updated"] == 2
+        assert result["flagged_cleared"] == 1
+        assert result["validation_cleared"] == 1
+        assert conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM validation_flags").fetchone()[0] == 0
 
 
 # ===========================================================================

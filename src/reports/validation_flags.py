@@ -263,6 +263,7 @@ def detail_df(
     """Return a detail DataFrame: one row per flagged row."""
     query = """
         SELECT
+            id AS _flag_id,
             report_name,
             check_name,
             table_name,
@@ -341,6 +342,22 @@ def export_validation_report(
         det = det.drop(columns=["pk_col"]).rename(columns={"pk_value": pk_col_name})
     else:
         det = det.rename(columns={"pk_value": "record_id"}).drop(columns=["pk_col"])
+
+    # _flag_id must be the first column — same pattern as export_flagged — so that
+    # import_corrections can use it to clear resolved flags from validation_flags.
+    # Users should leave this column untouched when fixing values.
+    cols = ["_flag_id"] + [c for c in det.columns if c != "_flag_id"]
+    det = det[cols]
+
+    # Excel does not support timezone-aware datetimes. Strip tz from any
+    # datetime columns in both frames before writing.
+    def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
+        for col in df.select_dtypes(include=["datetimetz"]).columns:
+            df[col] = df[col].dt.tz_localize(None)
+        return df
+
+    det = _strip_tz(det)
+    summ = _strip_tz(summ)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:

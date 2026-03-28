@@ -330,7 +330,10 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
     try:
         result = _import(conn, table, str(path), primary_key)
         click.echo(f"[ok] {result['updated']} row(s) updated in '{table}'")
-        click.echo(f"[ok] {result['flagged_cleared']} flag(s) cleared from flagged_rows")
+        if result["flagged_cleared"]:
+            click.echo(f"[ok] {result['flagged_cleared']} ingest conflict(s) cleared from flagged_rows")
+        if result["validation_cleared"]:
+            click.echo(f"[ok] {result['validation_cleared']} validation flag(s) cleared from validation_flags")
     except (ValueError, FileNotFoundError) as e:
         click.echo(f"[error] {e}")
     finally:
