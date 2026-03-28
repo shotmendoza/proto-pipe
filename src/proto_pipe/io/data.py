@@ -28,7 +28,7 @@ def load_from_duckdb(
     """
     conn = duckdb.connect(source["path"])
     table = source["table"]
-    ts_col = source["timestamp_col"]
+    ts_col = source.get("timestamp_col") or "_ingested_at"
 
     if last_run:
         query = f'SELECT * FROM "{table}" WHERE "{ts_col}"::TIMESTAMPTZ > ?'

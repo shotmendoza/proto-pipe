@@ -12,7 +12,7 @@ from os import PathLike
 from pathlib import Path
 
 import pandas as pd
-import yaml
+from ruamel.yaml import YAML
 
 from proto_pipe.checks.built_in import BUILT_IN_CHECKS
 from proto_pipe.registry.base import CheckRegistry, ReportRegistry
@@ -25,7 +25,15 @@ def load_config(config_path: str | PathLike) -> dict:
     :return: the config dict
     """
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        yaml = YAML()
+        return yaml.load(f) or {}
+
+
+def write_config(config: dict, config_path: str | PathLike) -> None:
+    """Writes a YAML config file, based on the given path and config dict"""
+    with open(config_path, "w") as f:
+        yaml = YAML()
+        yaml.dump(config, f)
 
 
 def _build_check_keys(
@@ -72,7 +80,10 @@ def resolve_check(
     if name not in templates:
         raise ValueError(f"Unknown template '{name}'")
     resolved = templates[name].copy()
-    resolved["params"] = resolved.get("params", {}).copy()
+    resolved["params"] = {
+        **resolved.get("params", {}),
+        **check.get("params", {}),  # check-level param override template params
+    }
     return resolved
 
 
@@ -264,4 +275,7 @@ def write_xlsx_sheet(dfs: dict[str, pd.DataFrame], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         for sheet_name, df in dfs.items():
+            df = df.copy()
+            for col in df.select_dtypes(include=["datetimetz"]).columns:
+                df[col] = df[col].dt.tz_localize(None)
             df.to_excel(writer, sheet_name=sheet_name, index=False)

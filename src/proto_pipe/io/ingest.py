@@ -338,35 +338,32 @@ def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame)
 # DB initialisation
 # ---------------------------------------------------------------------------
 
-def init_db(db_path: str, sources: list[dict]) -> None:
-    """Initializes a database and ensures the presence of target tables specified in the sources.
+def init_db(db_path: str) -> None:
+    """Initializes the database by creating the necessary directory structure
+    and establishing a connection to the database file. This function also
+    prepares the ingest log for future use. The connection to the database
+    is closed after the initialization process is completed.
 
-    This function creates the directory for the database file if it does not exist. It then establishes
-    a connection to the database, initializes the ingest log, and iterates over the provided list of
-    source definitions. For each source, if the target table does not already exist in the database,
-    the function creates it.
-
-    :param db_path: Path to the database file.
+    :param db_path: The path to the database file to be initialized.
     :type db_path: str
-    :param sources: A list of source definitions, each containing information about
-        the target table to be created in the database.
-    :type sources: list[dict]
-
     :return: None
     """
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(db_path)
-    _init_ingest_log(conn)
+    with duckdb.connect(db_path) as conn:
+        _init_ingest_log(conn)
 
-    for source in sources:
-        table = source["target_table"]
-        if _table_exists(conn, table):
-            print(f"  [skip] Table '{table}' already exists")
-            continue
-        conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" (_placeholder VARCHAR)')
-        print(f"  [ok]   Created table '{table}'")
 
-    conn.close()
+def init_source_tables(db_path: str, sources: list[dict]):
+    """Creates placeholder tables for the user-defined tables,
+    given source definitions from the config."""
+    with duckdb.connect(db_path) as conn:
+        for source in sources:
+            table = source["target_table"]
+            if _table_exists(conn, table):
+                print(f"[skip] Table '{table}' already exists")
+                continue
+            conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" (_placeholder VARCHAR)')
+            print(f"[ok] Created table '{table}'")
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +442,10 @@ def ingest_directory(
         table = source["target_table"]
         primary_key = source.get("primary_key")
         on_duplicate = source.get("on_duplicate", "flag" if primary_key else "append")
+
+        # Adding the pipeline tracking column
+        # `_` denotes a pipeline run column, not a real column in the table.
+        df["_ingested_at"] = datetime.now(timezone.utc)
 
         # Load into DuckDB
         if mode == "replace" or not _table_exists(conn, table):
@@ -684,14 +685,15 @@ def _handle_duplicates(
         return df, 0, 0
 
     non_null_df = df[df[primary_key].notna()].copy()
-    null_rows = df[df[primary_key].isna()].copy()
 
     if non_null_df.empty:
         return df, 0, 0
 
     comparable_cols = [
         column for column in non_null_df.columns
-        if column != primary_key and column in _get_existing_columns(conn, table)
+        if column != primary_key and
+        column in _get_existing_columns(conn, table) and not
+        str(column).startswith("_")
     ]
 
     rows_to_insert: list[tuple] = []

@@ -43,27 +43,39 @@ def init(output: str, force: bool):
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
 
+    # [Templates] Copying the config templates so that the user can modify them
     _files = {
+        _TEMPLATES_DIR / "pipeline.yaml": Path("pipeline.yaml"),
         _TEMPLATES_DIR / "reports_config.yaml": out / "reports_config.yaml",
         _TEMPLATES_DIR / "sources_config.yaml": out / "sources_config.yaml",
         _TEMPLATES_DIR / "deliverables_config.yaml": out / "deliverables_config.yaml",
-        _TEMPLATES_DIR / "pipeline.yaml": Path("pipeline.yaml"),
         _TEMPLATES_DIR / "views_config.yaml": out / "views_config.yaml",
     }
 
     for src, dest in _files.items():
         if dest.exists() and not force:
-            click.echo(f"  [skip] {dest} already exists (use --force to overwrite)")
+            click.echo(f"[skip] {dest} already exists (use --force to overwrite)")
             continue
         shutil.copy(src, dest)
-        click.echo(f"  [ok]   {dest}")
+        click.echo(f"[ok] {dest}")
 
+    # [Next Steps] Let the user know what to do next
     click.echo("\nNext steps:")
-    click.echo("1. Edit pipeline.yaml to set your paths")
-    click.echo(f"2. Edit {out}/sources_config.yaml to match your file naming conventions")
-    click.echo(f"3. Edit {out}/reports_config.yaml to define your reports and checks")
-    click.echo(f"4. Edit {out}/views_config.yaml to define shared transformation views")
-    click.echo("5. Run: vp db-init")
+    click.echo("1. Edit `pipeline.yaml` to confirm your paths")
+    click.echo("2. Run: `vp db-init`")
+    click.echo("Additionally, you can ru n`vp docs` to read through the docs.")
+
+
+# ---------------------------------------------------------------------------
+# docs page
+# ---------------------------------------------------------------------------
+@click.command()
+def docs():
+    """Open the proto-pipe documentation in your browser."""
+    import webbrowser
+    url = "https://shotmendoza.github.io/proto-pipe"
+    webbrowser.open(url)
+    click.echo(f"Opening docs: {url}")
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +84,7 @@ def init(output: str, force: bool):
 @click.command("db-init")
 @click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
 @click.option("--watermark-db",   default=None, help="Override watermark DB path.")
-@click.option("--sources-config", default=None, help="Override sources config path.")
-@click.option("--views-config",   default=None, help="Override views config path.")
-def db_init(pipeline_db, watermark_db, sources_config, views_config):
+def db_init(pipeline_db, watermark_db):
     """Create DuckDB files and bootstrap tables from sources_config.yaml.
 
     Safe to re-run — existing tables are never overwritten. Also creates
@@ -88,25 +98,16 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
     import duckdb
 
     from proto_pipe.io.ingest import init_db
-    from proto_pipe.io.registry import load_config
     from proto_pipe.pipelines.watermark import WatermarkStore
     from proto_pipe.reports.query import init_report_runs_table
-    from proto_pipe.reports.views import load_views_config, create_views
 
-    src_cfg = config_path_or_override("sources_config", sources_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     w_db = config_path_or_override("watermark_db", watermark_db)
-    v_cfg = config_path_or_override("views_config", views_config)
 
     click.echo(f"\nInitialising pipeline DB: {p_db}")
-    try:
-        _config = load_config(src_cfg)
-        init_db(p_db, _config["sources"])
-    except FileNotFoundError:
-        click.echo(f"[error] Could not find sources config at '{src_cfg}'")
-        click.echo("Run `vp init` first.")
-        return
+    init_db(p_db)
 
+    # [Create Infrastructure Tables] Create the report run and flagged tables
     conn = duckdb.connect(p_db)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS flagged_rows (
@@ -117,27 +118,31 @@ def db_init(pipeline_db, watermark_db, sources_config, views_config):
             flagged_at   TIMESTAMPTZ NOT NULL
         )
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS check_params_history (
+        id          VARCHAR PRIMARY KEY,
+        check_name  VARCHAR NOT NULL,
+        report_name VARCHAR NOT NULL,
+        table_name  VARCHAR NOT NULL,
+        param_name  VARCHAR NOT NULL,
+        param_value VARCHAR,
+        recorded_at TIMESTAMPTZ NOT NULL
+    )
+""")
     init_validation_flags_table(conn)
     init_report_runs_table(conn)
-    click.echo("[ok] flagged_rows and report_runs tables ready")
-
-    views = load_views_config(v_cfg)
-    if views:
-        click.echo(f"\nCreating views from: {v_cfg}")
-        try:
-            create_views(conn, views, replace=False, skip_missing_tables=True)
-        except Exception as e:
-            click.echo(f"[error] Could not create views: {e}")
-    else:
-        click.echo(f"[skip] No views defined in {v_cfg}")
-
+    click.echo("[ok] Infrastructure tables ready (Report Runs + Flagged Tables)")
     conn.close()
 
+    # [Create Watermark Table] Create the watermark table for most recents
     click.echo(f"\nInitialising watermark DB: {w_db}")
     Path(w_db).parent.mkdir(parents=True, exist_ok=True)
     WatermarkStore(w_db)
     click.echo("[ok] Watermark table ready")
-    click.echo("\nAll done. You're ready to run the pipeline.")
+
+    click.echo("\nNext steps:")
+    click.echo("1. Run: vp new-source (define your data sources)")
+    click.echo("2. Run: vp ingest (load files into the pipeline)")
 
 
 # ---------------------------------------------------------------------------
@@ -201,3 +206,4 @@ def setup_commands(cli: click.Group):
     cli.add_command(init)
     cli.add_command(db_init)
     cli.add_command(config)
+    cli.add_command(docs)

@@ -11,7 +11,6 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 import pytest
-import yaml
 
 # ---------------------------------------------------------------------------
 # Canonical fake data
@@ -316,6 +315,8 @@ def deliverables_config(tmp_path) -> dict:
 
 @pytest.fixture()
 def sources_config_path(tmp_path, sources_config) -> Path:
+    from ruamel.yaml import YAML
+    yaml = YAML()
     path = tmp_path / "sources_config.yaml"
     path.write_text(yaml.dump(sources_config))
     return path
@@ -324,6 +325,8 @@ def sources_config_path(tmp_path, sources_config) -> Path:
 @pytest.fixture()
 def reports_config_path(tmp_path, reports_config, pipeline_db) -> Path:
     # Patch source paths to point at the temp pipeline_db
+    from ruamel.yaml import YAML
+    yaml = YAML()
     cfg = reports_config.copy()
     for r in cfg["reports"]:
         r["source"]["path"] = pipeline_db

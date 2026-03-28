@@ -2,8 +2,9 @@
 
 import click
 
-from .helpers import config_path_or_override, load_custom_checks
 from proto_pipe.reports.validation_flags import count_validation_flags, summary_df
+from .helpers import config_path_or_override, load_custom_checks
+
 
 # ---------------------------------------------------------------------------
 # validate
@@ -54,7 +55,7 @@ def validate(pipeline_db, watermark_db, reports_config, table):
             if r.get("source", {}).get("table") == table
         ]
         if not reports:
-            click.echo(f"  [warn] No reports registered for table '{table}'")
+            click.echo(f"[warn] No reports registered for table '{table}'")
             return
     else:
         reports = report_registry.all()

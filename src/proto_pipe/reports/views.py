@@ -16,7 +16,8 @@ Usage:
 from pathlib import Path
 
 import duckdb
-import yaml  # type: ignore
+
+from proto_pipe.io.registry import load_config
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,5 @@ def load_views_config(views_config_path: str) -> list[dict]:
     path = Path(views_config_path)
     if not path.exists():
         return []
-    with open(path) as f:
-        config = yaml.safe_load(f) or {}
+    config = load_config(path)
     return config.get("views", [])

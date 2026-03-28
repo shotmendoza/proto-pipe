@@ -2,11 +2,12 @@
 
 import click
 
-from .quickstart import setup_commands
 from .data import data_commands
-from .validation import validation_commands
-from .reports import reports_commands
 from .flagged import flagged_commands
+from .quickstart import setup_commands
+from .reports import reports_commands
+from .scaffold import scaffold_commands
+from .validation import validation_commands
 
 
 @click.group()
@@ -20,3 +21,4 @@ data_commands(cli)
 validation_commands(cli)
 reports_commands(cli)
 flagged_commands(cli)
+scaffold_commands(cli)

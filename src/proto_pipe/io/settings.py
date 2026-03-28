@@ -7,7 +7,7 @@ re-enter paths. Individual flags can still override at runtime.
 
 from pathlib import Path
 
-import yaml
+from proto_pipe.io.registry import load_config, write_config
 
 # Default location — can be overridden via PIPELINE_SETTINGS env var
 DEFAULT_SETTINGS_PATH = Path("pipeline.yaml")
@@ -22,6 +22,7 @@ _DEFAULTS = {
         "watermark_db": "data/watermarks.db",
         "incoming_dir": "data/incoming/",
         "output_dir": "output/reports/",
+        "sql_dir": "sql/",
     }
 }
 
@@ -41,8 +42,7 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     """
     if not path.exists():
         return _DEFAULTS.copy()
-    with open(path) as f:
-        loaded = yaml.safe_load(f) or {}
+    loaded = load_config(path)
     # Merge with defaults so missing keys don't cause KeyErrors
     merged = _DEFAULTS.copy()
     merged["paths"].update(loaded.get("paths", {}))
@@ -58,8 +58,7 @@ def save_settings(settings: dict, path: Path = DEFAULT_SETTINGS_PATH) -> None:
     :param path: The file path where the settings should be saved. Defaults to the global constant DEFAULT_SETTINGS_PATH
     :return: None
     """
-    with open(path, "w") as f:
-        yaml.dump(settings, f, default_flow_style=False, sort_keys=False)
+    write_config(config=settings, config_path=path)
 
 
 def get_path(key: str, path: Path = DEFAULT_SETTINGS_PATH) -> str:

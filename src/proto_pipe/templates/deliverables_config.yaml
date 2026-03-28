@@ -1,3 +1,31 @@
+# deliverables:
+#  - name: "my_export" # Unique name — used on the CLI:
+#                                              #   vp pull-report my_export
+#    format: xlsx                              # "xlsx", "csv"
+#
+#    filename_template: "export_{date}.xlsx"   # {date} = YYYY-MM-DD of run, {report_name} = report name (csv only)
+#
+#    output_dir: "output/custom/" # Optional. Overrides pipeline.yaml output_dir.
+#
+#    reports:
+#      - name: "my_report" # Must match a name in reports_config.yaml
+#        sheet: "My Sheet"                     # xlsx only. Defaults to report name if omitted.
+#
+#        # --- Query path A: SQL file ---
+#        sql_file: "config/sql/my_report.sql" # Path to a .sql file.
+#                                              # Executes directly — filters ignored.
+#                                              # Date logic lives inside the SQL.
+#
+#        # --- Query path B: filters (used when sql_file is absent) ---
+#        filters:
+#          date_filters:
+#            - col: "order_date"
+#              from: "start_of_month" # Optional. Supports dynamic tokens.
+#              to:   "end_of_last_month" # Optional. Supports dynamic tokens.
+#          field_filters:
+#            - col: "region"
+#              values: ["EMEA", "APAC"]
+
 deliverables:
   - name: "monthly_sales_pack"
     format: xlsx                              # xlsx = one file, multiple sheets

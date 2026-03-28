@@ -110,9 +110,14 @@ def _write_sql_file(tmp_path: Path, filename: str, sql: str) -> str:
 
 def _write_views_config(tmp_path: Path, views: list[dict]) -> str:
     """Write a views_config.yaml and return its path."""
-    import yaml
+    from ruamel.yaml import YAML
+    import io
+    yaml = YAML()
+    stream = io.StringIO()
+
     p = tmp_path / "views_config.yaml"
-    p.write_text(yaml.dump({"views": views}))
+    yaml.dump({"views": views}, stream)
+    p.write_text(stream.getvalue())
     return str(p)
 
 

@@ -27,8 +27,12 @@ class CheckRegistry:
 
     """
     def __init__(self):
-        self._checks: dict[str, Callable] = {}
         """The checks / functions that have been registered. Key-Value pair of function name, function"""
+        self._checks: dict[str, Callable] = {}
+
+    def get(self, name: str) -> Callable | None:
+        """Return the registered function for a check name, or None if not found."""
+        return self._checks.get(name)
 
     def register(self, name: str, func: Callable) -> None:
         """registers a function into the registry
@@ -84,6 +88,10 @@ class ReportRegistry:
     def __init__(self):
         self._reports: dict[str, dict] = {}
         """The reports that have been registered. Key-Value pair of report name, report config"""
+
+    def get_or_none(self, name: str) -> dict | None:
+        """Returns the report configuration for a given name, or None if not found."""
+        return self._reports.get(name)
 
     def register(self, name: str, report_config: dict) -> None:
         """Registers a new report configuration.

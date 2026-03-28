@@ -15,7 +15,8 @@ from proto_pipe.io.ingest import (
     _structural_checks,
     init_db,
     _table_exists,
-    ingest_directory
+    ingest_directory,
+    init_source_tables,
 )
 
 
@@ -104,21 +105,25 @@ class TestStructuralChecks:
 
 class TestInitDb:
     def test_creates_tables(self, pipeline_db, sources_config):
-        init_db(pipeline_db, sources_config["sources"])
+        init_db(pipeline_db)
+        init_source_tables(pipeline_db, sources_config["sources"])
         conn = duckdb.connect(pipeline_db)
         assert _table_exists(conn, "sales")
         assert _table_exists(conn, "inventory")
         conn.close()
 
     def test_creates_ingest_log(self, pipeline_db, sources_config):
-        init_db(pipeline_db, sources_config["sources"])
+        init_db(pipeline_db)
+        init_source_tables(pipeline_db, sources_config["sources"])
         conn = duckdb.connect(pipeline_db)
         assert _table_exists(conn, "ingest_log")
         conn.close()
 
     def test_idempotent(self, pipeline_db, sources_config):
-        init_db(pipeline_db, sources_config["sources"])
-        init_db(pipeline_db, sources_config["sources"])  # should not raise
+        init_db(pipeline_db)
+        init_source_tables(pipeline_db, sources_config["sources"])
+        init_db(pipeline_db)
+        init_source_tables(pipeline_db, sources_config["sources"])  # should not raise
         conn = duckdb.connect(pipeline_db)
         assert _table_exists(conn, "sales")
         conn.close()
@@ -291,3 +296,37 @@ class TestIngestFailures:
         )
         assert summary["sales_empty.csv"]["status"] == "failed"
         assert summary["sales_2026-03.csv"]["status"] == "ok"
+
+
+    # Add these two methods to the existing TestIngestDirectory class in test_ingest.py
+
+    def test_ingested_at_column_added(self, pipeline_db, incoming_dir, sources_config, sales_df):
+        """_ingested_at column is added to every ingested row."""
+        path = incoming_dir / "sales_2026-03.csv"
+        sales_df.to_csv(path, index=False)
+
+        init_db(pipeline_db)
+        ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        conn = duckdb.connect(pipeline_db)
+        cols = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'sales'"
+        ).df()["column_name"].tolist()
+        conn.close()
+        assert "_ingested_at" in cols
+
+
+    def test_ingested_at_not_null(self, pipeline_db, incoming_dir, sources_config, sales_df):
+        """_ingested_at is non-null for all ingested rows."""
+        path = incoming_dir / "sales_2026-03.csv"
+        sales_df.to_csv(path, index=False)
+
+        init_db(pipeline_db)
+        ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        conn = duckdb.connect(pipeline_db)
+        null_count = conn.execute(
+            "SELECT count(*) FROM sales WHERE _ingested_at IS NULL"
+        ).fetchone()[0]
+        conn.close()
+        assert null_count == 0
