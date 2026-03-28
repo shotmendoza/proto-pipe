@@ -23,13 +23,13 @@ more reports into a file for stakeholders.
 ## Installation
 
 ```bash
-pip install validation-pipeline
+pip install protp-pipe
 
 # Or with uv
-uv add validation-pipeline
+uv add protp-pipe
 
 # From a GitHub repository
-pip install git+https://github.com/your-org/validation-pipeline.git
+pip install git+https://github.com/shotmendoza/protp-pipe.git
 ```
 
 ---
