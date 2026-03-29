@@ -33,7 +33,6 @@ def _get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
 
 
 def _display_rich_table(df, title: str) -> None:
-    """Render a DataFrame as a rich table in the terminal."""
     from rich.console import Console
     from rich.table import Table
 
@@ -52,8 +51,9 @@ def _display_rich_table(df, title: str) -> None:
     for _, row in df.iterrows():
         table.add_row(*[str(v) if v is not None else "" for v in row])
 
-    console.print(table)
-    console.print(f"[dim]{len(df)} row(s) shown[/dim]")
+    with console.pager():
+        console.print(table)
+        console.print(f"[dim]{len(df)} row(s) shown[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -293,30 +293,24 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
                 df, title=f"{table_name} ({len(df)} rows)", pk_col=pk_col
             )
             if edited_df is not None and not edited_df.equals(df):
-                # Apply corrections via import_corrections workflow
                 from proto_pipe.reports.corrections import import_corrections
                 import tempfile
                 import os
 
-                with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
-                    tmp_path = tmp.name
+                with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+                    corrections_path = f.name
                 try:
-                    edited_df.to_csv(tmp_path, index=False)
-                    src_cfg = settings["paths"]["sources_config"]
-                    sources = load_config(src_cfg).get("sources", [])
-                    source = next(
-                        (s for s in sources if s["target_table"] == table_name), None
-                    )
-                    if source and pk_col:
-                        import_corrections(conn, tmp_path, table_name, pk_col)
-                        click.echo(f"[ok] Changes saved to '{table_name}'")
+                    edited_df.to_csv(corrections_path, index=False)
+                    if pk_col:
+                        import_corrections(conn, corrections_path, table_name, pk_col)
+                        click.echo(f"  [ok] Changes saved to '{table_name}'")
                     else:
                         click.echo(
                             f"[warn] No primary key found for '{table_name}'"
-                            f" — changes not saved. Edit {src_cfg} to define one."
+                            f" — changes not saved."
                         )
                 finally:
-                    os.unlink(tmp_path)
+                    os.unlink(corrections_path)
         else:
             reviewer.show(df, title=f"{table_name} ({len(df)} rows)", pk_col=pk_col)
 
