@@ -840,7 +840,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
 # ---------------------------------------------------------------------------
 # Deliverable Scaffolding
 # ----------------------------------------------------------
-@click.command("new_view")
+@click.command("new-view")
 @click.option("--name", required=True, help="Name for the new deliverable (e.g. carrier_a_report).")
 @click.option("--output-dir", default=None, help="Override SQL output directory.")
 def new_view(name: str, output_dir: str):

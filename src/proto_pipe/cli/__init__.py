@@ -11,7 +11,7 @@ from .validation import validation_commands
 from .table import table_commands
 
 
-@click.group()
+@click.group(context_settings={"max_content_width": 120})
 def cli():
     """Validation pipeline — manage your config and pipeline."""
     pass
