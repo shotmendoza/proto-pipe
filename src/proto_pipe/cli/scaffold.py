@@ -278,6 +278,9 @@ def new_source(sources_config, incoming_dir):
     Example:
       vp new-source
     """
+    from fnmatch import fnmatch
+    from proto_pipe.io.ingest import load_file
+
     src_cfg = config_path_or_override("sources_config", sources_config)
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
 
@@ -289,10 +292,6 @@ def new_source(sources_config, incoming_dir):
     # Scan incoming dir
     files = _scan_incoming(inc_dir)
     if files:
-        click.echo(f"\nFiles found in {inc_dir}:")
-        for f in files:
-            click.echo(f"  {f}")
-
         selected_file = questionary.select(
             "Which file are you configuring a source for?",
             choices=files + ["None of these — define manually"],
@@ -301,17 +300,13 @@ def new_source(sources_config, incoming_dir):
         if selected_file == "None of these — define manually":
             selected_file = None
         elif selected_file:
-            from fnmatch import fnmatch
-
             suggested_pattern = _suggest_pattern(selected_file)
             matching = [f for f in files if fnmatch(f, suggested_pattern)]
             if len(matching) > 1:
                 click.echo(
-                    f"\nThese files all match the pattern '{suggested_pattern}':"
+                    f"\n  {len(matching)} files match the pattern '{suggested_pattern}'"
+                    f" — they will all be ingested into the same table.\n"
                 )
-                for f in matching:
-                    click.echo(f"    {f}")
-                click.echo(f"They will all be ingested into the same table.\n")
     else:
         click.echo(
             f"\nNo files found in '{inc_dir}'.\n"
@@ -321,15 +316,28 @@ def new_source(sources_config, incoming_dir):
         selected_file = None
 
     # Name
-    name = questionary.text("Source name (e.g. sales):").ask()
+    name = questionary.text(
+        "Source name — a label for this data source"
+        " (e.g. 'sales' for sales reports, 'inventory' for stock files):"
+    ).ask()
     if not name:
         click.echo("Cancelled.")
         return
 
+    if name in existing_names:
+        overwrite = questionary.confirm(
+            f"Source '{name}' already exists. Edit it?"
+        ).ask()
+        if not overwrite:
+            click.echo("Cancelled.")
+            return
+
     # Pattern
     suggested = _suggest_pattern(selected_file) if selected_file else "*.csv"
     pattern_input = questionary.text(
-        "File pattern(s) — comma separated (e.g. sales_*.csv, Sales_*.xlsx):",
+        "File pattern(s) — the naming convention used for these files, comma separated"
+        " (e.g. sales_*.csv, Sales_*.xlsx).\n  Use * as a wildcard to match dates or"
+        " version numbers in filenames:",
         default=suggested,
     ).ask()
     if not pattern_input:
@@ -339,48 +347,72 @@ def new_source(sources_config, incoming_dir):
 
     # Target table
     table = questionary.text(
-        "Target table name (press Enter to use source name):",
+        "Target table name — the name of the database table these files will be loaded"
+        " into (press Enter to use source name):",
         default=name,
     ).ask()
     table = table.strip() if table else name
 
-    # Primary key
-    primary_key = questionary.text(
-        "Primary key column (leave blank if none):",
-    ).ask()
-    primary_key = primary_key.strip() if primary_key else None
+    # Primary key — show columns from selected file if available
+    file_cols = []
+    if selected_file:
+        try:
+            sample = load_file(Path(inc_dir) / selected_file)
+            file_cols = [c for c in sample.columns if not c.startswith("_")]
+        except Exception:
+            pass
+
+    if file_cols:
+        pk_choice = questionary.select(
+            "Primary key column — the column that uniquely identifies each row."
+            " Select 'None' if not applicable:",
+            choices=file_cols + ["None — no primary key"],
+        ).ask()
+        primary_key = None if pk_choice == "None — no primary key" else pk_choice
+    else:
+        pk_input = questionary.text(
+            "Primary key column — the column that uniquely identifies each row"
+            " (e.g. 'order_id', 'sku'). Leave blank if none:"
+        ).ask()
+        primary_key = pk_input.strip() if pk_input else None
 
     if not primary_key:
         click.echo(
-            "\n[warn] No primary key defined — all rows will be appended "
-            "and duplicates won't be detected."
+            "\n  [warn] No primary key defined — all rows will be appended"
+            " and duplicates won't be detected."
         )
 
     # on_duplicate — only ask if primary key is defined
     on_duplicate = None
     if primary_key:
         on_duplicate = questionary.select(
-            "How should duplicate rows be handled?",
+            "Duplicate row handling — what should happen when a new file contains"
+            " a row whose primary key already exists?",
             choices=[
                 questionary.Choice(
                     "flag   — flag conflicts for manual review (recommended)",
                     value="flag",
                 ),
                 questionary.Choice(
-                    "upsert — replace existing row with incoming row", value="upsert"
+                    "upsert — replace existing row with incoming row",
+                    value="upsert",
                 ),
                 questionary.Choice(
-                    "append — insert all rows, allow duplicates", value="append"
+                    "append — insert all rows, allow duplicates",
+                    value="append",
                 ),
                 questionary.Choice(
-                    "skip   — keep existing row, ignore incoming", value="skip"
+                    "skip   — keep existing row, ignore incoming",
+                    value="skip",
                 ),
             ],
         ).ask()
 
     # Timestamp column
     timestamp_col = questionary.text(
-        "Timestamp column name for incremental runs (leave blank to use _ingested_at):",
+        "Timestamp column — the column that tracks when each row was created or updated"
+        " (e.g. 'updated_at').\n  Used for incremental runs. Leave blank to use"
+        " _ingested_at (the pipeline ingestion time):"
     ).ask()
     timestamp_col = timestamp_col.strip() if timestamp_col else None
 
@@ -406,8 +438,8 @@ def new_source(sources_config, incoming_dir):
 
     click.echo(f"\n[ok] Source '{name}' added to {src_cfg}")
     click.echo("\nNext steps:")
-    click.echo("1. Review the entry in sources_config.yaml if needed")
-    click.echo("2. Run: vp ingest")
+    click.echo("  1. Review the entry in sources_config.yaml if needed")
+    click.echo("  2. Run: vp ingest")
 
 
 # ---------------------------------------------------------------------------
