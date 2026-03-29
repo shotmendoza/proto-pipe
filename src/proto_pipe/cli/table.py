@@ -302,7 +302,7 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
                 try:
                     edited_df.to_csv(corrections_path, index=False)
                     if pk_col:
-                        import_corrections(conn, corrections_path, table_name, pk_col)
+                        import_corrections(conn, table_name, corrections_path, pk_col)
                         click.echo(f"  [ok] Changes saved to '{table_name}'")
                     else:
                         click.echo(
