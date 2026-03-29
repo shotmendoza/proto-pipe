@@ -286,25 +286,40 @@ def new_source(sources_config, incoming_dir):
 
     click.echo("\n── New Source ──────────────────────────────")
 
-    # Scan incoming dir and suggest patterns
+    # Scan incoming dir
     files = _scan_incoming(inc_dir)
     if files:
         click.echo(f"\nFiles found in {inc_dir}:")
         for f in files:
-            click.echo(f"{f} → suggested pattern: {_suggest_pattern(f)}")
+            click.echo(f"  {f}")
+
+        selected_file = questionary.select(
+            "Which file are you configuring a source for?",
+            choices=files + ["None of these — define manually"],
+        ).ask()
+
+        if selected_file == "None of these — define manually":
+            selected_file = None
     else:
         click.echo(
             f"\nNo files found in '{inc_dir}'.\n"
-            f"You can still define a source manually, or add files to\n"
-            f"'{inc_dir}' and re-run this command.\n"
+            f"You can still define a source manually, or add files first.\n"
             f"You can also edit {src_cfg} directly."
         )
+        selected_file = None
 
     # Name
     name = questionary.text("Source name (e.g. sales):").ask()
     if not name:
         click.echo("Cancelled.")
         return
+
+    # Pattern — pre-fill from selected file
+    suggested = _suggest_pattern(selected_file) if selected_file else "*.csv"
+    pattern_input = questionary.text(
+        "File pattern(s) — comma separated (e.g. sales_*.csv, Sales_*.xlsx):",
+        default=suggested,
+    ).ask()
 
     if name in existing_names:
         overwrite = questionary.confirm(
