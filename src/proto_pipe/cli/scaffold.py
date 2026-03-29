@@ -300,6 +300,18 @@ def new_source(sources_config, incoming_dir):
 
         if selected_file == "None of these — define manually":
             selected_file = None
+        elif selected_file:
+            from fnmatch import fnmatch
+
+            suggested_pattern = _suggest_pattern(selected_file)
+            matching = [f for f in files if fnmatch(f, suggested_pattern)]
+            if len(matching) > 1:
+                click.echo(
+                    f"\nThese files all match the pattern '{suggested_pattern}':"
+                )
+                for f in matching:
+                    click.echo(f"    {f}")
+                click.echo(f"They will all be ingested into the same table.\n")
     else:
         click.echo(
             f"\nNo files found in '{inc_dir}'.\n"
@@ -314,23 +326,8 @@ def new_source(sources_config, incoming_dir):
         click.echo("Cancelled.")
         return
 
-    # Pattern — pre-fill from selected file
-    suggested = _suggest_pattern(selected_file) if selected_file else "*.csv"
-    pattern_input = questionary.text(
-        "File pattern(s) — comma separated (e.g. sales_*.csv, Sales_*.xlsx):",
-        default=suggested,
-    ).ask()
-
-    if name in existing_names:
-        overwrite = questionary.confirm(
-            f"Source '{name}' already exists. Edit it?"
-        ).ask()
-        if not overwrite:
-            click.echo("Cancelled.")
-            return
-
     # Pattern
-    suggested = _suggest_pattern(files[0]) if files else "*.csv"
+    suggested = _suggest_pattern(selected_file) if selected_file else "*.csv"
     pattern_input = questionary.text(
         "File pattern(s) — comma separated (e.g. sales_*.csv, Sales_*.xlsx):",
         default=suggested,
