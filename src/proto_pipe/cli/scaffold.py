@@ -408,13 +408,23 @@ def new_source(sources_config, incoming_dir):
             ],
         ).ask()
 
-    # Timestamp column
-    timestamp_col = questionary.text(
-        "Timestamp column — the column that tracks when each row was created or updated"
-        " (e.g. 'updated_at').\n  Used for incremental runs. Leave blank to use"
-        " _ingested_at (the pipeline ingestion time):"
-    ).ask()
-    timestamp_col = timestamp_col.strip() if timestamp_col else None
+        # Timestamp column
+        if file_cols:
+            ts_choice = questionary.select(
+                "Timestamp column — the column that tracks when each row was created or"
+                " updated.\n  Used for incremental runs. Select 'None' to use"
+                " _ingested_at (the pipeline ingestion time):",
+                choices=file_cols + ["None — use _ingested_at"],
+            ).ask()
+            timestamp_col = (
+                None if ts_choice == "None — use _ingested_at" else ts_choice
+            )
+        else:
+            ts_input = questionary.text(
+                "Timestamp column — the column that tracks when each row was created or"
+                " updated (e.g. 'updated_at').\n  Leave blank to use _ingested_at:"
+            ).ask()
+            timestamp_col = ts_input.strip() if ts_input else None
 
     # Build source entry
     source = {
