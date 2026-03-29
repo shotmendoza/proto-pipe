@@ -48,7 +48,7 @@ def _display_rich_table(df, title: str) -> None:
     for col in df.columns:
         table.add_column(str(col), overflow="fold")
 
-    rows = df.astype(str).replace("nan", "").values.tolist()
+    rows = df.fillna("").astype(str).values.tolist()
     for row in rows:
         table.add_row(*row)
 
@@ -126,7 +126,7 @@ class TextualReview(ReviewInterface):
                     else:
                         table.add_column(str(col), key=col, width=None)
 
-                rows = df.astype(str).replace("nan", "").values.tolist()
+                rows = df.fillna("").astype(str).values.tolist()
                 for row in rows:
                     table.add_row(*row)
 
