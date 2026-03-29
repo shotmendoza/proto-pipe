@@ -8,6 +8,7 @@ from .quickstart import setup_commands
 from .reports import reports_commands
 from .scaffold import scaffold_commands
 from .validation import validation_commands
+from .table import table_commands
 
 
 @click.group()
@@ -22,3 +23,4 @@ validation_commands(cli)
 reports_commands(cli)
 flagged_commands(cli)
 scaffold_commands(cli)
+table_commands(cli)
