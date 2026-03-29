@@ -48,8 +48,9 @@ def _display_rich_table(df, title: str) -> None:
     for col in df.columns:
         table.add_column(str(col), overflow="fold")
 
-    for _, row in df.iterrows():
-        table.add_row(*[str(v) if v is not None else "" for v in row])
+    rows = df.astype(str).replace("nan", "").values.tolist()
+    for row in rows:
+        table.add_row(*row)
 
     with console.pager():
         console.print(table)
@@ -115,15 +116,26 @@ class TextualReview(ReviewInterface):
             def on_mount(self) -> None:
                 table = self.query_one(DataTable)
                 table.cursor_type = "cell" if editable else "row"
+                table.zebra_stripes = True
+
                 for col in df.columns:
                     if col == pk_col:
-                        table.add_column(f"[bold yellow]{col}[/bold yellow]", key=col)
+                        table.add_column(
+                            f"[bold yellow]{col}[/bold yellow]", key=col, width=None
+                        )
                     else:
-                        table.add_column(str(col), key=col)
-                for _, row in df.iterrows():
-                    table.add_row(*[str(v) if v is not None else "" for v in row])
+                        table.add_column(str(col), key=col, width=None)
+
+                rows = df.astype(str).replace("nan", "").values.tolist()
+                for row in rows:
+                    table.add_row(*row)
+
                 self.title = title
-                self.sub_title = "Ctrl+S to save  |  Esc to quit" if editable else "Esc to quit"
+                self.sub_title = (
+                    "Ctrl+S to save  |  Esc to quit  |  ← → scroll"
+                    if editable
+                    else "Esc to quit  |  ← → scroll"
+                )
 
             def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
                 if not editable:
