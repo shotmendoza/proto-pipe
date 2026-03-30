@@ -38,6 +38,14 @@ import pandas as pd
 # Table bootstrap
 # ---------------------------------------------------------------------------
 
+def migrate_validation_flags(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add any missing columns to an existing validation_flags table.
+    Safe to call multiple times.
+    """
+    conn.execute(
+        "ALTER TABLE validation_flags ADD COLUMN IF NOT EXISTS args VARCHAR"
+    )
+
 def init_validation_flags_table(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the validation_flags table if it doesn't exist.
 
