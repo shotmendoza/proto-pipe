@@ -21,11 +21,23 @@ class CheckParamInspector:
     """
 
     def __init__(self, func: Callable):
-        # Unwrap partial first, then follow __wrapped__
+        import functools
+
+        # TODO: Check if all these unwraps are necessary
+        # Pass 1: unwrap partial chain
         unwrapped = func
         while isinstance(unwrapped, functools.partial):
             unwrapped = unwrapped.func
-        self.func = inspect.unwrap(unwrapped)
+
+        # Pass 2: follow __wrapped__ (wrap_series_check sets this)
+        unwrapped = inspect.unwrap(unwrapped)
+
+        # Pass 3: unwrap any partial __wrapped__ pointed to
+        while isinstance(unwrapped, functools.partial):
+            unwrapped = unwrapped.func
+
+
+        self.func = unwrapped
         self._sig = inspect.signature(self.func)
         self._source = inspect.getsource(self.func)
 

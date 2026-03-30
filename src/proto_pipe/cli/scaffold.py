@@ -30,16 +30,16 @@ def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.
     fuzzy = [
         c for c in columns
         if c not in substring
-        and SequenceMatcher(None, param_value.lower(), c.lower()).ratio() >= threshold
+           and SequenceMatcher(None, param_value.lower(), c.lower()).ratio() >= threshold
     ]
     return substring + fuzzy
 
 
 def _get_param_suggestions(
-    conn: duckdb.DuckDBPyConnection,
-    check_name: str,
-    param_name: str,
-    table_cols: list[str],
+        conn: duckdb.DuckDBPyConnection,
+        check_name: str,
+        param_name: str,
+        table_cols: list[str],
 ) -> list[str]:
     """Query check_params_history and return similar column suggestions."""
     try:
@@ -218,19 +218,6 @@ def _get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str
         t for t in all_tables
         if t not in _PIPELINE_TABLES and t not in configured
     ]
-
-
-def _get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
-    """Return the params for a check by inspecting its function signature."""
-    func = check_registry.get(check_name)
-    if func is None:
-        return {}
-    sig = inspect.signature(func)
-    return {
-        name: param.default
-        for name, param in sig.parameters.items()
-        if name != "context"
-    }
 
 
 def _get_table_columns(pipeline_db: str, table: str) -> list[str]:
@@ -458,6 +445,179 @@ def new_source(sources_config, incoming_dir):
     click.echo("  2. Run: vp ingest")
 
 
+def _is_list_annotation(ann) -> bool:
+    """True if annotation is list or list[str] or similar."""
+    if ann is list:
+        return True
+    return getattr(ann, "__origin__", None) is list
+
+
+def _get_original_func(check_name: str, check_registry: CheckRegistry):
+    """Return the original unwrapped function from the registry."""
+    import functools
+    func = check_registry.get(check_name)
+    if func is None:
+        return None
+    unwrapped = func
+    while isinstance(unwrapped, functools.partial):
+        unwrapped = unwrapped.func
+    unwrapped = inspect.unwrap(unwrapped)
+    while isinstance(unwrapped, functools.partial):
+        unwrapped = unwrapped.func
+    return unwrapped
+
+
+def _get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
+    """Return the params for a check by inspecting its original function signature."""
+    func = _get_original_func(check_name, check_registry)
+    if func is None:
+        return {}
+    sig = inspect.signature(func)
+    return {
+        name: param.default
+        for name, param in sig.parameters.items()
+        if name != "context"
+    }
+
+
+def _fill_params(
+    selected_checks: list[str],
+    table: str,
+    p_db: str,
+    check_registry: CheckRegistry,
+    multi_select: bool,
+    conn: "duckdb.DuckDBPyConnection",
+    report_name: str,
+) -> tuple[list[dict], bool]:
+    """Fill params for each selected check.
+
+    Returns (check_entries, go_back).
+    go_back=True means the user pressed ESC — caller should return to check selection.
+    """
+    from proto_pipe.checks.inspector import CheckParamInspector
+
+    table_cols = sorted(_get_table_columns(p_db, table))
+
+    checks_with_params = {
+        c: _get_check_params(c, check_registry)
+        for c in selected_checks
+        if _get_check_params(c, check_registry)
+    }
+
+    if not checks_with_params:
+        return [{"name": c} for c in selected_checks], False
+
+    fill = questionary.confirm(
+        "Some checks have parameters. Fill them in now?"
+    ).ask()
+    if fill is None:
+        return [], True  # ESC → go back
+
+    check_entries = []
+
+    for check_name in selected_checks:
+        params = checks_with_params.get(check_name, {})
+
+        if not params or not fill:
+            entry = {"name": check_name}
+            if params:
+                entry["params"] = {k: None for k in params}
+            check_entries.append(entry)
+            continue
+
+        click.echo(f"\nParameters for '{check_name}':")
+
+        original = _get_original_func(check_name, check_registry)
+        inspector = CheckParamInspector(original)
+        eligible = multi_select and inspector.is_multiselect_eligible()
+        col_params = inspector.column_params()
+        sig = inspect.signature(inspector.func)
+
+        filled_params = {}
+        list_selections = {}  # param_name → list of selections (for length validation)
+
+        for param_name, default in params.items():
+            suggestions = _get_param_suggestions(conn, check_name, param_name, table_cols)
+            choices = suggestions + [c for c in table_cols if c not in suggestions]
+
+            ann = sig.parameters[param_name].annotation if param_name in sig.parameters else inspect.Parameter.empty
+
+            if param_name in col_params:
+                if eligible:
+                    click.echo(
+                        f"  ℹ  Selecting multiple columns will run '{check_name}'"
+                        f" once per column."
+                    )
+                    value = questionary.checkbox(
+                        f"{param_name}:",
+                        choices=sorted(choices),
+                    ).ask()
+                    if value is None:
+                        return [], True  # ESC → go back
+                    value = sorted(value)  # alphabetical order
+                    if value:
+                        list_selections[param_name] = value
+                else:
+                    value = questionary.select(
+                        f"{param_name}:",
+                        choices=choices,
+                    ).ask()
+                    if value is None:
+                        return [], True  # ESC → go back
+
+            elif _is_list_annotation(ann) or isinstance(default, list):
+                value = questionary.checkbox(
+                    f"{param_name}:",
+                    choices=sorted(choices),
+                ).ask()
+                if value is None:
+                    return [], True  # ESC → go back
+                value = sorted(value)
+
+            else:
+                suggested_default = (
+                    suggestions[0] if suggestions
+                    else (str(default) if default is not inspect.Parameter.empty else "")
+                )
+                value = questionary.text(
+                    f"{param_name}:",
+                    default=suggested_default,
+                ).ask()
+                if value is None:
+                    return [], True  # ESC → go back
+                if value:
+                    try:
+                        value = int(value) if "." not in value else float(value)
+                    except ValueError:
+                        pass
+
+            filled_params[param_name] = value
+
+        # Validate list param lengths — warn and broadcast if needed
+        if len(list_selections) > 1:
+            lengths = {k: len(v) for k, v in list_selections.items()}
+            max_len = max(lengths.values())
+            for k, v in list_selections.items():
+                if len(v) == 1:
+                    # Broadcast single-length silently
+                    filled_params[k] = v * max_len
+                elif len(v) != max_len:
+                    click.echo(
+                        f"\n  [warn] Multi-select params have unequal lengths: "
+                        + ", ".join(f"'{k}': {l}" for k, l in lengths.items())
+                        + f". Using first {min(lengths.values())} combination(s)."
+                    )
+                    min_len = min(lengths.values())
+                    for kk in list_selections:
+                        filled_params[kk] = filled_params[kk][:min_len]
+                    break
+
+        _record_param_history(conn, check_name, report_name, table, filled_params)
+        check_entries.append({"name": check_name, "params": filled_params})
+
+    return check_entries, False
+
+
 # ---------------------------------------------------------------------------
 # vp new-report
 # ---------------------------------------------------------------------------
@@ -474,190 +634,154 @@ def new_report(reports_config, pipeline_db):
     from proto_pipe.registry.base import CheckRegistry
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
     from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.registry import load_custom_checks_module
+    from proto_pipe.io.settings import load_settings
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
 
     config = load_config(rep_cfg)
+    settings = load_settings()
+    multi_select = settings.get("multi_select_params", True)
 
     # Build a temporary registry with built-ins so we can inspect params
     check_registry = CheckRegistry()
     for name, func in BUILT_IN_CHECKS.items():
         check_registry.register(name, func)
 
-    # Load custom checks if configured
-    from proto_pipe.io.registry import load_custom_checks_module
-    from proto_pipe.io.settings import load_settings
-    settings = load_settings()
     module_path = settings.get("custom_checks_module")
     if module_path:
         load_custom_checks_module(module_path, check_registry)
 
-    click.echo("\n── New Report ──────────────────────────────")
-
-    # Step 1 — pick a table
-    available_tables = _get_unconfigured_tables(p_db, config)
-    if not available_tables:
-        click.echo(
-            "\n  No unconfigured tables found. Either all tables already have "
-            "reports defined, or no tables have been ingested yet.\n"
-            "  Run: vp ingest   to load files first."
-        )
-        return
-
-    table = questionary.select(
-        "Which table should this report run against?",
-        choices=available_tables,
-    ).ask()
-    if not table:
-        click.echo("Cancelled.")
-        return
-
-    # Step 2 — report name
-    default_name = f"{table}_validation"
-    name = questionary.text(
-        "Report name:",
-        default=default_name,
-    ).ask()
-    if not name:
-        click.echo("Cancelled.")
-        return
-
-    # Check for existing report with same name
-    existing_names = [r["name"] for r in config.get("reports", [])]
-    if name in existing_names:
-        overwrite = questionary.confirm(
-            f"Report '{name}' already exists. Edit it?"
-        ).ask()
-        if not overwrite:
-            click.echo("Cancelled.")
-            return
-
-    # Step 3 — multi-select checks
     available_checks = check_registry.available()
     if not available_checks:
         click.echo("\n  [warn] No checks available. Add built-in or custom checks first.")
         return
 
-    selected_checks = questionary.checkbox(
-        "Select checks to run on this report:",
-        choices=available_checks,
-    ).ask()
-    if not selected_checks:
-        click.echo("Cancelled.")
-        return
+    click.echo("\n── New Report ──────────────────────────────")
+    click.echo("  Press ESC at any prompt to go back to the previous step.\n")
 
-    # Step 4 — optionally fill in params
-    checks_with_params = {
-        c: _get_check_params(c, check_registry)
-        for c in selected_checks
-        if _get_check_params(c, check_registry)
-    }
+    # ---------------------------------------------------------------------------
+    # Step machine: TABLE → NAME → CHECKS → PARAMS
+    # None from any questionary call = ESC = go back one step.
+    # ---------------------------------------------------------------------------
+    STEP_TABLE = 0
+    STEP_NAME = 1
+    STEP_CHECKS = 2
+    STEP_PARAMS = 3
+    STEP_DONE = 4
 
-    # For suggestion intelligence
+    state: dict = {}
+    step = STEP_TABLE
+
     conn = duckdb.connect(p_db)
-    check_entries = []
-    if checks_with_params:
-        fill_params = questionary.confirm(
-            "Some checks have parameters. Would you like to fill them in now?"
-        ).ask()
 
-        for check_name in selected_checks:
-            params = checks_with_params.get(check_name, {})
-            if not params or not fill_params:
-                entry = {"name": check_name}
-                if params:
-                    # Write param keys with blank values for manual fill-in
-                    entry["params"] = {k: None for k in params}
-                check_entries.append(entry)
-                continue
+    try:
+        while step < STEP_DONE:
 
-            click.echo(f"\nParameters for '{check_name}':")
-            table_cols = _get_table_columns(p_db, table)
-            filled_params = {}
-
-            for param_name, default in params.items():
-                # Get suggestions from history
-                suggestions = _get_param_suggestions(
-                    conn, check_name, param_name, table_cols
-                )
-
-                if param_name == "col" or "col" in param_name.lower():
-                    # Prioritize suggested columns, then show all
-                    choices = suggestions + [
-                        c for c in table_cols if c not in suggestions
-                    ]
-
-                    value = questionary.select(
-                        f"{param_name}:",
-                        choices=choices,
-                    ).ask()
-
-                elif isinstance(default, list):
-                    choices = suggestions + [
-                        c for c in table_cols if c not in suggestions
-                    ]
-
-                    value = questionary.checkbox(
-                        f"  {param_name}:",
-                        choices=choices,
-                    ).ask()
-
-                else:
-                    # Use most recent suggestion as default if available
-                    suggested_default = (
-                        suggestions[0]
-                        if suggestions
-                        else (
-                            str(default)
-                            if default is not inspect.Parameter.empty
-                            else ""
-                        )
+            # ── Table ──────────────────────────────────────────────────────────
+            if step == STEP_TABLE:
+                available_tables = _get_unconfigured_tables(p_db, config)
+                if not available_tables:
+                    click.echo(
+                        "\n  No unconfigured tables found. Either all tables already have "
+                        "reports defined, or no tables have been ingested yet.\n"
+                        "  Run: vp ingest   to load files first."
                     )
+                    return
 
-                    # Scalar param — free text
-                    value = questionary.text(
-                        f"{param_name}:",
-                        default=suggested_default,
+                table = questionary.select(
+                    "Which table should this report run against?",
+                    choices=available_tables,
+                ).ask()
+                if table is None:
+                    click.echo("Cancelled.")
+                    return  # first step — exit entirely
+                state["table"] = table
+                step = STEP_NAME
+
+            # ── Name ───────────────────────────────────────────────────────────
+            elif step == STEP_NAME:
+                default_name = f"{state['table']}_validation"
+                name = questionary.text(
+                    "Report name:",
+                    default=default_name,
+                ).ask()
+                if name is None:
+                    step = STEP_TABLE
+                    continue
+
+                existing_names = [r["name"] for r in config.get("reports", [])]
+                if name in existing_names:
+                    overwrite = questionary.confirm(
+                        f"Report '{name}' already exists. Edit it?"
                     ).ask()
+                    if overwrite is None:
+                        step = STEP_TABLE
+                        continue
+                    if not overwrite:
+                        click.echo("Cancelled.")
+                        return
 
-                    # Try to cast back to number if appropriate
-                    if value:
-                        try:
-                            value = int(value) if "." not in value else float(value)
-                        except ValueError:
-                            pass
+                state["name"] = name
+                state["existing_names"] = existing_names
+                step = STEP_CHECKS
 
-                filled_params[param_name] = value
+            # ── Check selection ────────────────────────────────────────────────
+            elif step == STEP_CHECKS:
+                selected = questionary.checkbox(
+                    "Select checks to run on this report:",
+                    choices=available_checks,
+                ).ask()
+                if selected is None:
+                    step = STEP_NAME
+                    continue
+                if not selected:
+                    click.echo("  Please select at least one check.")
+                    continue  # re-ask without moving step
+                state["selected_checks"] = selected
+                step = STEP_PARAMS
 
-            # Record to history
-            _record_param_history(conn, check_name, name, table, filled_params)
-            check_entries.append({"name": check_name, "params": filled_params})
-    else:
-        check_entries = [{"name": c} for c in selected_checks]
-    conn.close()
+            # ── Param filling ──────────────────────────────────────────────────
+            elif step == STEP_PARAMS:
+                check_entries, go_back = _fill_params(
+                    selected_checks=state["selected_checks"],
+                    table=state["table"],
+                    p_db=p_db,
+                    check_registry=check_registry,
+                    multi_select=multi_select,
+                    conn=conn,
+                    report_name=state["name"],
+                )
+                if go_back:
+                    step = STEP_CHECKS
+                    continue
+                state["check_entries"] = check_entries
+                step = STEP_DONE
 
-    # Build report entry
+    finally:
+        conn.close()
+
+    # Build and write report entry
     report = {
-        "name": name,
+        "name": state["name"],
         "source": {
             "type": "duckdb",
             "path": p_db,
-            "table": table,
+            "table": state["table"],
         },
         "options": {"parallel": False},
-        "checks": check_entries,
+        "checks": state["check_entries"],
     }
 
-    # Write to config
     reports = config.get("reports", [])
-    if name in existing_names:
-        reports = [r for r in reports if r["name"] != name]
+    if state["name"] in state["existing_names"]:
+        reports = [r for r in reports if r["name"] != state["name"]]
     reports.append(report)
     config["reports"] = reports
     write_config(config, rep_cfg)
 
-    click.echo(f"\n[ok] Report '{name}' added to {rep_cfg}")
+    click.echo(f"\n[ok] Report '{state['name']}' added to {rep_cfg}")
     click.echo("\nNext steps:")
     click.echo("1. Review the entry in reports_config.yaml if needed")
     click.echo("2. Run: vp validate")

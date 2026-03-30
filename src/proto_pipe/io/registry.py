@@ -11,6 +11,7 @@ from functools import partial
 from os import PathLike
 from pathlib import Path
 
+import click
 import pandas as pd
 from ruamel.yaml import YAML
 
@@ -88,28 +89,17 @@ def resolve_check(
 
 
 def resolve_check_uuid(
-    report: dict,
-    check_registry: CheckRegistry,
+        report: dict,
+        check_registry: CheckRegistry,
 ) -> list[str]:
-    """Resolve the UUIDs for checks within a report using a provided check registry.
+    """Resolve check UUIDs for a report, expanding list params into multiple registrations.
 
-    This function iterates over the checks specified in a report, attempting to
-    resolve their names or templates. If a given check does not have a name
-    registered in the provided check registry, it is registered dynamically. A
-    list of resolved check names is then returned.
-
-    :param report: Dictionary containing the structured report data including a list of checks to be resolved.
-        The checks should include their "name", optional "params", and optional "template". Comes from config.
-
-    :param check_registry: An instance of the CheckRegistry class which provides methods for
-        querying and registering checks.
-
-    :return: A list of resolved and registered check names from the provided
-        report data.
+    When a param value is a list (e.g. col: [price, cost]), one check registration
+    is created per column combination. Single-length lists are broadcast to match
+    the longest list. Scalar params stay fixed across all combinations.
     """
     resolved_check_names: list[str] = []
 
-    # Run through the checks that the config had under the report
     for check in report.get("checks", []):
         template_name = check.get("template")
         if template_name is not None:
@@ -117,13 +107,47 @@ def resolve_check_uuid(
             continue
 
         func_name = check["name"]
-        params = check.get("params", {})
-        check_name = _build_check_keys(func_name, params)
+        params = check.get("params", {}) or {}
 
-        if check_name not in check_registry.available():
-            _register_check(check_name, func_name, params, check_registry)
+        list_params = {k: v for k, v in params.items() if isinstance(v, list)}
+        scalar_params = {k: v for k, v in params.items() if not isinstance(v, list)}
 
-        resolved_check_names.append(check_name)
+        if not list_params:
+            # Single registration — original behaviour
+            check_name = _build_check_keys(func_name, params)
+            if check_name not in check_registry.available():
+                _register_check(check_name, func_name, params, check_registry)
+            resolved_check_names.append(check_name)
+            continue
+
+        # Expand list params into multiple registrations
+        lengths = {k: len(v) for k, v in list_params.items()}
+        max_len = max(lengths.values())
+
+        # Broadcast single-length lists; truncate incompatible ones
+        expanded = {}
+        for k, v in list_params.items():
+            if len(v) == 1:
+                expanded[k] = v * max_len
+            elif len(v) == max_len:
+                expanded[k] = v
+            else:
+                # Incompatible — truncate to shortest
+                min_len = min(lengths.values())
+                click.echo(
+                    f"  [warn] Check '{func_name}' has list params with unequal lengths"
+                    f" {lengths}. Using first {min_len} combination(s)."
+                )
+                expanded[k] = v[:min_len]
+                max_len = min_len
+
+        for i in range(max_len):
+            combo_params = {**scalar_params, **{k: v[i] for k, v in expanded.items()}}
+            check_name = _build_check_keys(func_name, combo_params)
+            if check_name not in check_registry.available():
+                _register_check(check_name, func_name, combo_params, check_registry)
+            resolved_check_names.append(check_name)
+
     return resolved_check_names
 
 

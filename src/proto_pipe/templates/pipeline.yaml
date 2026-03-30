@@ -61,3 +61,11 @@ paths:
   # are checked on subsequent runs. Created automatically by `vp db-init`.
   # Safe to leave as-is.
   watermark_db: "data/watermarks.db"
+
+# multi_select_params: true
+#
+# When true, vp new-report will show a multi-select checkbox for
+# column parameters on eligible checks (those that return pd.Series[bool]
+# with str-typed column params). Each selected column results in a
+# separate check execution. Set to false to always use single-select.
+multi_select_params: true
