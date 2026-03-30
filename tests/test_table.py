@@ -23,7 +23,7 @@ from proto_pipe.cli.table import (
     _get_all_tables,
     _get_reviewer,
     table_cmd,
-    _INFRASTRUCTURE_TABLES,
+    PIPELINE_TABLES,
 )
 
 

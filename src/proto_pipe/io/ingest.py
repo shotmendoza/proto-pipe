@@ -52,6 +52,33 @@ CHUNK_SIZE = 1000
 """GLOBAL: Maximum number of rows to process in a single SQL IN (...) clause"""
 
 
+def _init_check_registry_metadata(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create check_registry_metadata table if it doesn't exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS check_registry_metadata (
+            id                      VARCHAR PRIMARY KEY,
+            check_name              VARCHAR NOT NULL UNIQUE,
+            check_key               VARCHAR NOT NULL,
+            is_multiselect_eligible BOOLEAN NOT NULL,
+            column_params           VARCHAR,
+            scalar_params           VARCHAR,
+            recorded_at             TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+
+def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
+    """Write metadata for all built-in checks. Safe to call multiple times —
+    write_to_db is idempotent and only updates when the function source changes.
+    """
+    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+    from proto_pipe.checks.inspector import CheckParamInspector
+
+    for name, func in BUILT_IN_CHECKS.items():
+        inspector = CheckParamInspector(func)
+        inspector.write_to_db(conn, name)
+
+
 # ---------------------------------------------------------------------------
 # Flag identity
 # ---------------------------------------------------------------------------
@@ -351,6 +378,8 @@ def init_db(db_path: str) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(db_path) as conn:
         _init_ingest_log(conn)
+        _init_check_registry_metadata(conn)
+        _populate_builtin_metadata(conn)
 
 
 def init_source_tables(db_path: str, sources: list[dict]):

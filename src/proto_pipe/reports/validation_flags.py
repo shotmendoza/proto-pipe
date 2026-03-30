@@ -51,6 +51,7 @@ def init_validation_flags_table(conn: duckdb.DuckDBPyConnection) -> None:
             table_name   VARCHAR NOT NULL,
             pk_col       VARCHAR,
             pk_value     VARCHAR,
+            args         VARCHAR,
             reason       VARCHAR,
             flagged_at   TIMESTAMPTZ NOT NULL
         )
@@ -84,6 +85,7 @@ def write_validation_flags(
     table_name: str,
     pk_col: str | None,
     flag_rows: list[dict],
+    args: str | None = None,
 ) -> int:
     """Insert flag rows into validation_flags. Returns count inserted.
 
@@ -104,6 +106,7 @@ def write_validation_flags(
             "table_name":  table_name,
             "pk_col":      pk_col,
             "pk_value":    pk_value,
+            "args":        args,
             "reason":      (f.get("reason") or "")[:500],
             "flagged_at":  now,
         })
@@ -111,11 +114,11 @@ def write_validation_flags(
     flags_df = pd.DataFrame(records)
     conn.execute("""
         INSERT INTO validation_flags
-            (id, report_name, check_name, table_name, pk_col, pk_value, reason, flagged_at)
-        SELECT id, report_name, check_name, table_name, pk_col, pk_value, reason, flagged_at
+            (id, report_name, check_name, table_name, pk_col, pk_value, args, reason, flagged_at)
+        SELECT id, report_name, check_name, table_name, pk_col, pk_value, args, reason, flagged_at
         FROM flags_df
         ON CONFLICT (id) DO NOTHING
-    """)
+""")
     return len(records)
 
 
@@ -145,6 +148,7 @@ def summary_df(
         SELECT
             report_name,
             check_name,
+            args,
             table_name,
             count(*)                        AS flagged_count,
             count(pk_value)                 AS row_level_count,
@@ -152,7 +156,7 @@ def summary_df(
             max(flagged_at)                 AS last_flagged
         FROM validation_flags
         {where}
-        GROUP BY report_name, check_name, table_name
+        GROUP BY report_name, check_name, args, table_name
         ORDER BY report_name, flagged_count DESC
     """
     where = "WHERE report_name = ?" if report_name else ""

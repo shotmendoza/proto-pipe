@@ -6,17 +6,7 @@ import click
 import duckdb
 
 from proto_pipe.cli.helpers import config_path_or_override
-
-# TODO: there's the same exact definition in scaffold.py
-# Pipeline infrastructure tables — shown separately from user data tables
-_INFRASTRUCTURE_TABLES = {
-    "flagged_rows",
-    "validation_flags",
-    "ingest_log",
-    "report_runs",
-    "check_params_history",
-    "watermarks",
-}
+from proto_pipe.constants import PIPELINE_TABLES
 
 
 def _get_all_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
@@ -244,8 +234,8 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
         # If no table specified, show selection menu
         if not table_name:
             # Split into user tables and infrastructure tables for clarity
-            user_tables = [t for t in all_tables if t not in _INFRASTRUCTURE_TABLES]
-            infra_tables = [t for t in all_tables if t in _INFRASTRUCTURE_TABLES]
+            user_tables = [t for t in all_tables if t not in PIPELINE_TABLES]
+            infra_tables = [t for t in all_tables if t in PIPELINE_TABLES]
 
             choices = []
             if user_tables:

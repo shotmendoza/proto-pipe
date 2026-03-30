@@ -14,14 +14,7 @@ import questionary
 from proto_pipe.cli.helpers import config_path_or_override
 from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry
-
-_PIPELINE_TABLES = {
-    "flagged_rows",
-    "ingest_log",
-    "report_runs",
-    "validation_flags",
-    "check_params_history",
-}
+from proto_pipe.constants import PIPELINE_TABLES
 
 
 def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.6) -> list[str]:
@@ -216,7 +209,7 @@ def _get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str
     conn.close()
     return [
         t for t in all_tables
-        if t not in _PIPELINE_TABLES and t not in configured
+        if t not in PIPELINE_TABLES and t not in configured
     ]
 
 
@@ -636,6 +629,7 @@ def new_report(reports_config, pipeline_db):
     from proto_pipe.cli.helpers import config_path_or_override
     from proto_pipe.io.registry import load_custom_checks_module
     from proto_pipe.io.settings import load_settings
+    from proto_pipe.checks.inspector import CheckParamInspector
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -675,6 +669,11 @@ def new_report(reports_config, pipeline_db):
     step = STEP_TABLE
 
     conn = duckdb.connect(p_db)
+
+    for check_name in check_registry.available():
+        original = _get_original_func(check_name, check_registry)
+        if original is not None:
+            CheckParamInspector(original).write_to_db(conn, check_name)
 
     try:
         while step < STEP_DONE:

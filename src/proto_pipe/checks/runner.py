@@ -4,6 +4,55 @@ from proto_pipe.checks.result import CheckResult
 from proto_pipe.registry.base import CheckRegistry
 
 
+def _get_check_args(check_name: str, registry) -> str | None:
+    """Extract the column args from a registered check for display in validation_flags.
+
+    Returns a human-readable string like "price", "cost, price", or "cost, price +1"
+    representing the column params baked into this check registration.
+    Returns None if the check has no column params or isn't found.
+    """
+    import functools
+    import inspect
+    from proto_pipe.checks.inspector import CheckParamInspector
+
+    func = registry.get(check_name)
+    if func is None:
+        return None
+
+    # Get the partial that wrap_series_check wraps (via __wrapped__)
+    inner = inspect.unwrap(func)  # follows __wrapped__ → partial or original
+
+    # Get column param names from the original function
+    unwrapped = inner
+    while isinstance(unwrapped, functools.partial):
+        unwrapped = unwrapped.func
+    original = inspect.unwrap(unwrapped)
+    while isinstance(original, functools.partial):
+        original = original.func
+
+    inspector = CheckParamInspector(original)
+    col_params = inspector.column_params()
+    if not col_params:
+        return None
+
+    # Get baked-in column values from the partial's keywords
+    if not isinstance(inner, functools.partial):
+        return None
+    col_values = [
+        str(inner.keywords[p])
+        for p in col_params
+        if p in inner.keywords
+    ]
+    if not col_values:
+        return None
+
+    # Format: "price" / "cost, price" / "cost, price +1"
+    MAX_DISPLAY = 2
+    if len(col_values) <= MAX_DISPLAY:
+        return ", ".join(sorted(col_values))
+    return ", ".join(sorted(col_values)[:MAX_DISPLAY]) + f" +{len(col_values) - MAX_DISPLAY}"
+
+
 # ---------------------------------------------------------------------------
 # Check execution
 # ---------------------------------------------------------------------------
@@ -151,6 +200,7 @@ def run_checks_and_flag(
                 # passed — no flags to write
                 continue
 
+            args = _get_check_args(check_name, registry)
             write_validation_flags(
                 conn=conn,
                 report_name=report_name,
@@ -158,6 +208,7 @@ def run_checks_and_flag(
                 table_name=table_name or "",
                 pk_col=pk_col,
                 flag_rows=flag_rows,
+                args=args,
             )
     finally:
         conn.close()
