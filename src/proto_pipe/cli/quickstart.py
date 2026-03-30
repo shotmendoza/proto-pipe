@@ -82,19 +82,21 @@ def docs():
 # db-init
 # ---------------------------------------------------------------------------
 @click.command("db-init")
-@click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
-@click.option("--watermark-db",   default=None, help="Override watermark DB path.")
-def db_init(pipeline_db, watermark_db):
+@click.option("--pipeline-db",  default=None, help="Override pipeline DB path.")
+@click.option("--watermark-db", default=None, help="Override watermark DB path.")
+@click.option("--migrate", is_flag=True, default=False, help="Apply schema migrations to existing tables.")
+def db_init(pipeline_db, watermark_db, migrate):
     """Create DuckDB files and bootstrap tables from sources_config.yaml.
 
-    Safe to re-run — existing tables are never overwritten. Also creates
-    the flagged_rows and report_runs tables and registers any views defined
-    in views_config.yaml.
+    Safe to re-run — existing tables are never dropped. Pass --migrate
+    to apply any pending schema changes to existing tables.
 
     \b
     Example:
       vp db-init
+      vp db-init --migrate
     """
+
     import duckdb
 
     from proto_pipe.io.ingest import init_db
@@ -131,6 +133,13 @@ def db_init(pipeline_db, watermark_db):
 """)
     init_validation_flags_table(conn)
     init_report_runs_table(conn)
+
+    if migrate:
+        from proto_pipe.reports.validation_flags import migrate_validation_flags
+
+        migrate_validation_flags(conn)
+        click.echo("[ok] Schema migrations applied")
+
     click.echo("[ok] Infrastructure tables ready (Report Runs + Flagged Tables)")
     conn.close()
 
