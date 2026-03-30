@@ -630,6 +630,7 @@ def new_report(reports_config, pipeline_db):
     from proto_pipe.io.registry import load_custom_checks_module
     from proto_pipe.io.settings import load_settings
     from proto_pipe.checks.inspector import CheckParamInspector
+    from proto_pipe.io.ingest import _init_check_registry_metadata
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -670,6 +671,7 @@ def new_report(reports_config, pipeline_db):
 
     conn = duckdb.connect(p_db)
 
+    _init_check_registry_metadata(conn)  # ← add this line
     for check_name in check_registry.available():
         original = _get_original_func(check_name, check_registry)
         if original is not None:
