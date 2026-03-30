@@ -231,15 +231,6 @@ def export_validation_report(
     output_path: str,
     report_name: str | None = None,
 ) -> tuple[int, int]:
-    """Write a two-sheet Excel file with Detail and Summary tabs.
-
-    Sheet "Detail" — one row per flagged row; pk column named after actual
-                      pk_col value so the user sees their own terminology.
-    Sheet "Summary" — one row per (report, check) with counts.
-
-    Returns (detail_row_count, summary_row_count).
-    Raises ValueError if no flags exist for the given scope.
-    """
     from pathlib import Path
     import pandas as pd
 
@@ -250,35 +241,98 @@ def export_validation_report(
         scope = f"report '{report_name}'" if report_name else "any report"
         raise ValueError(f"No validation flags found for {scope}")
 
-    # Rename pk_col/pk_value columns to use the actual column name.
-    # If all flags share the same pk_col, rename the column in the export.
-    # If mixed (multiple sources), keep generic names.
-    pk_cols_present = det["pk_col"].dropna().unique()
-    if len(pk_cols_present) == 1:
-        pk_col_name = pk_cols_present[0]
-        det = det.drop(columns=["pk_col"]).rename(columns={"pk_value": pk_col_name})
+    # Attempt to enrich detail with source row data via join
+    pk_cols = det["pk_col"].dropna().unique()
+
+    if len(pk_cols) == 0 or det["pk_col"].isna().all():
+        print(
+            "  [warn] No primary key defined for flagged rows — "
+            "showing flag metadata only. Define a primary key in "
+            "sources_config.yaml for full row context."
+        )
+        enriched = det
     else:
-        det = det.rename(columns={"pk_value": "record_id"}).drop(columns=["pk_col"])
+        enriched_frames = []
+        for table_name in det["table_name"].unique():
+            table_flags = det[det["table_name"] == table_name].copy()
+            pk_col = table_flags["pk_col"].dropna().iloc[0] if not table_flags["pk_col"].isna().all() else None
 
-    # _flag_id must be the first column — same pattern as export_flagged — so that
-    # import_corrections can use it to clear resolved flags from validation_flags.
-    # Users should leave this column untouched when fixing values.
-    cols = ["_flag_id"] + [c for c in det.columns if c != "_flag_id"]
-    det = det[cols]
+            if pk_col is None:
+                enriched_frames.append(table_flags)
+                continue
 
-    # Excel does not support timezone-aware datetimes. Strip tz from any
-    # datetime columns in both frames before writing.
+            try:
+                # Get all non-pipeline source columns
+                source_cols = conn.execute(f"""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = ?
+                    AND column_name NOT LIKE '\_%' ESCAPE '\\'
+                    ORDER BY ordinal_position
+                """, [table_name]).df()["column_name"].tolist()
+
+                if not source_cols:
+                    enriched_frames.append(table_flags)
+                    continue
+
+                col_select = ", ".join([f's."{c}"' for c in source_cols])
+                joined = conn.execute(f"""
+                    SELECT
+                        f._flag_id,
+                        f.report_name,
+                        f.check_name,
+                        f.args,
+                        f.reason,
+                        f.flagged_at,
+                        {col_select}
+                    FROM table_flags f
+                    LEFT JOIN "{table_name}" s
+                        ON CAST(s."{pk_col}" AS VARCHAR) = f.pk_value
+                    ORDER BY f.flagged_at
+                """).df()
+
+                if joined.empty or joined[source_cols[0]].isna().all():
+                    print(
+                        f"  [warn] No source rows matched flags for '{table_name}' "
+                        f"on key '{pk_col}' — the key may be invalid or data was "
+                        f"already corrected. Showing flag metadata only."
+                    )
+                    enriched_frames.append(table_flags)
+                else:
+                    enriched_frames.append(joined)
+
+            except Exception as e:
+                print(f"  [warn] Could not join source data for '{table_name}': {e}")
+                enriched_frames.append(table_flags)
+
+        enriched = pd.concat(enriched_frames, ignore_index=True) if enriched_frames else det
+
+    # If we fell back to flag metadata only (no source join),
+    # rename pk_value to the actual column name for clarity
+    if "pk_value" in enriched.columns:
+        pk_cols_present = enriched["pk_col"].dropna().unique()
+        if len(pk_cols_present) == 1:
+            pk_col_name = pk_cols_present[0]
+            enriched = enriched.drop(columns=["pk_col"]).rename(
+                columns={"pk_value": pk_col_name}
+            )
+        else:
+            enriched = enriched.rename(columns={"pk_value": "record_id"}).drop(
+                columns=["pk_col"]
+            )
+
+    # Strip tz from datetime columns
     def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
         for col in df.select_dtypes(include=["datetimetz"]).columns:
             df[col] = df[col].dt.tz_localize(None)
         return df
 
-    det = _strip_tz(det)
+    enriched = _strip_tz(enriched)
     summ = _strip_tz(summ)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        det.to_excel(writer, sheet_name="Detail", index=False)
+        enriched.to_excel(writer, sheet_name="Detail", index=False)
         summ.to_excel(writer, sheet_name="Summary", index=False)
 
-    return len(det), len(summ)
+    return len(enriched), len(summ)

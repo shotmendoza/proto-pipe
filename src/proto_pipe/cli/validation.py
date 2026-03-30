@@ -96,13 +96,15 @@ def validate(pipeline_db, watermark_db, reports_config, table):
         if total_flags > 0:
             summ = summary_df(conn)
             click.echo(
-                f"\n  ⚠  {total_flags} validation flag(s) across {summ['report_name'].nunique()} report(s)."
+                f"\n⚠  {total_flags} validation flag(s) across "
+                f"{summ['report_name'].nunique()} report(s)."
             )
-            click.echo(
-                "  Run: vp export-validation  to export a detail + summary report."
-            )
+            click.echo("\nTo review and fix flagged rows:")
+            click.echo("vp export-validation - export detail + summary to Excel")
+            click.echo("vp table validation_flags — browse flags in the terminal")
+            click.echo("vp table <table> --edit — fix rows directly in the pipeline DB")
         else:
-            click.echo("\n  ✓  No validation flags.")
+            click.echo("\n✓  No validation flags.")
     finally:
         conn.close()
 
