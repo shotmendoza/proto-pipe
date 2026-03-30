@@ -24,9 +24,8 @@ _DEFAULTS = {
         "output_dir": "output/reports/",
         "sql_dir": "sql/",
     },
-    "checks": {
-        "multi_select_params": True,
-    }
+    "multi_select_params": True,
+
 }
 
 

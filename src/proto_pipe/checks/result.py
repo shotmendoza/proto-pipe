@@ -116,4 +116,6 @@ def wrap_series_check(func: Callable) -> Callable:
     def wrapper(context, **kwargs):
         result = func(context, **kwargs)
         return CheckResult.from_series(result, metadata={"kwargs": kwargs})
+    wrapper.__wrapped__ = func  # ← add this
     return wrapper
+

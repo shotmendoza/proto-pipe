@@ -146,9 +146,16 @@ class TestCheckParamInspectorClassification:
 
 @pytest.fixture()
 def registry():
+    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+    BUILT_IN_CHECKS["price_check"] = check_price
+    BUILT_IN_CHECKS["multi_col_check"] = check_multi_col
+    BUILT_IN_CHECKS["no_params_check"] = check_no_params
     r = CheckRegistry()
     r.register("price_check", check_price)
-    return r
+    yield r
+    BUILT_IN_CHECKS.pop("price_check", None)
+    BUILT_IN_CHECKS.pop("multi_col_check", None)
+    BUILT_IN_CHECKS.pop("no_params_check", None)
 
 
 @pytest.fixture()
@@ -229,13 +236,20 @@ class TestResolveCheckUuidExpansion:
         captured = capsys.readouterr()
         assert "warn" in captured.out.lower()
 
-    def test_no_params_check_unchanged(self, minimal_report):
+    def test_no_params_check_unchanged(self, minimal_report, registry):
         r = CheckRegistry()
         r.register("no_params_check", check_no_params)
-        report = minimal_report([{"name": "no_params_check"}])
-        from proto_pipe.io.registry import resolve_check_uuid
-        names = resolve_check_uuid(report, r)
-        assert len(names) == 1
+        from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+
+        BUILT_IN_CHECKS["no_params_check"] = check_no_params
+        try:
+            report = minimal_report([{"name": "no_params_check"}])
+            from proto_pipe.io.registry import resolve_check_uuid
+
+            names = resolve_check_uuid(report, r)
+            assert len(names) == 1
+        finally:
+            BUILT_IN_CHECKS.pop("no_params_check", None)
 
     def test_template_not_expanded(self, minimal_report):
         """Template references pass through unchanged."""
