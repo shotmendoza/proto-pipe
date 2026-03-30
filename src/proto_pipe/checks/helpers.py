@@ -33,12 +33,20 @@ def custom_check(name: str):
     Example:
 
         @custom_check("margin_check")
-        def check_margin(context, col="margin", threshold=0.2):
-            df = context["df"]
-            below = df[df[col] < threshold]
-            return {"violations": len(below), "threshold": threshold}
+        def check_margin(context, col: str) -> pd.Series:
+            return context["df"][col] > threshold
     """
     def decorator(func: Callable) -> Callable:
+        from proto_pipe.checks.inspector import CheckParamInspector
+
+        inspector = CheckParamInspector(func)
+        if not inspector.returns_boolean_series():
+            print(
+                f"[warn] Custom check '{name}' has no valid return annotation.\n"
+                f"Expected: -> pd.Series\n"
+                f"The check will not be available until this is fixed.\n"
+                f"Example: def {func.__name__}(context, col: str) -> pd.Series: ..."
+            )
         _DECORATED_CHECKS[name] = func
         return func
     return decorator

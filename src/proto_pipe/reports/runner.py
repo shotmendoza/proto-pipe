@@ -85,7 +85,7 @@ def run_report(
     # some rows were not fully validated — we want them re-checked next run.
     all_passed = all(v["status"] == "passed" for v in results.values())
     if all_passed:
-        ts_col = source_config.get("timestamp_col")
+        ts_col = source_config.get("timestamp_col") or "_ingested_at"
         if ts_col and ts_col in df.columns:
             max_ts = df[ts_col].max()
             if not isinstance(max_ts, datetime):

@@ -214,6 +214,7 @@ def reports_config() -> dict:
                     "expected_cols": [
                         "order_id", "price", "quantity",
                         "customer_id", "region", "order_date", "updated_at",
+                        "_ingested_at",  # add this
                     ]
                 },
             },

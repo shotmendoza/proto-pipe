@@ -22,6 +22,7 @@ import duckdb
 import pandas as pd
 
 from proto_pipe.checks.built_in import check_nulls, check_range
+from proto_pipe.checks.result import CheckResult
 from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
 from proto_pipe.registry.base import CheckRegistry, ReportRegistry
@@ -100,7 +101,6 @@ class TestRunReport:
         assert result["status"] == "skipped"
 
     def test_returns_error_when_source_table_missing(self, pipeline_db, check_registry, watermark_store):
-        # Table never created — load_from_duckdb will raise
         check_registry.register("null_check", check_nulls)
         config = _make_report_config(pipeline_db, "nonexistent_table", ["null_check"])
 
@@ -113,14 +113,13 @@ class TestRunReport:
         self, pipeline_db, sales_df, check_registry, watermark_store
     ):
         _seed_table(pipeline_db, "sales", sales_df)
-        check_registry.register("nonexistent_check", lambda ctx: (_ for _ in ()).throw(ValueError("boom")))
-        # Simpler: just register a name that isn't in the registry
+        # Use a check name that isn't registered — runner handles missing checks gracefully
         config = _make_report_config(pipeline_db, "sales", ["missing_check"])
 
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        assert result["results"]["missing_check"]["status"] == "failed"
+        assert result["results"]["missing_check"]["status"] == "error"
 
     def test_range_violation_is_captured_not_raised(
         self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
@@ -133,8 +132,10 @@ class TestRunReport:
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        assert result["results"]["price_range"]["status"] == "passed"
-        assert result["results"]["price_range"]["result"]["violations"] == 1
+        check_result = result["results"]["price_range"]["result"]
+        assert isinstance(check_result, CheckResult)
+        assert check_result.passed is False
+        assert check_result.mask.sum() == 1
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +173,8 @@ class TestWatermarkAdvancement:
         self, pipeline_db, sales_df, check_registry, watermark_store
     ):
         _seed_table(pipeline_db, "sales", sales_df)
-        # Register a check that raises — forces status=failed
-        def always_raises(ctx):
+
+        def always_raises(ctx) -> pd.Series:
             raise RuntimeError("hard failure")
 
         check_registry.register("hard_fail", always_raises)
@@ -181,7 +182,6 @@ class TestWatermarkAdvancement:
 
         assert watermark_store.get("sales_validation") is None
         run_report(config, check_registry, watermark_store)
-        # Watermark must not have advanced because the check failed
         assert watermark_store.get("sales_validation") is None
 
     def test_watermark_does_not_advance_when_one_of_many_checks_fails(
@@ -190,7 +190,7 @@ class TestWatermarkAdvancement:
         _seed_table(pipeline_db, "sales", sales_df)
         check_registry.register("null_check", check_nulls)
 
-        def always_raises(ctx):
+        def always_raises(ctx) -> pd.Series:
             raise RuntimeError("one bad check")
 
         check_registry.register("hard_fail", always_raises)
@@ -234,7 +234,6 @@ class TestRunReportFlagWriting:
         check_registry.register("price_range", fn)
         config = _make_report_config(pipeline_db, "sales", ["price_range"], primary_key="order_id")
 
-        # No pipeline_db arg — old behaviour
         run_report(config, check_registry, watermark_store)
 
         conn = duckdb.connect(pipeline_db)
@@ -257,7 +256,6 @@ class TestRunReportFlagWriting:
         conn = duckdb.connect(pipeline_db)
         try:
             det = detail_df(conn)
-            # pk_col stored correctly
             assert det.iloc[0]["pk_col"] == "order_id"
         finally:
             conn.close()
@@ -275,7 +273,6 @@ class TestRunReportFlagWriting:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            # All prices in sales_df are in range → violation_indices=[] → no flags
             assert count_validation_flags(conn) == 0
         finally:
             conn.close()
@@ -335,9 +332,9 @@ class TestRunAllReports:
 
         from proto_pipe import register_custom_check
 
-        def check_negative_price(ctx, col="price"):
+        def check_negative_price(ctx, col: str = "price") -> pd.Series:
             df = ctx["df"]
-            return {"mask": df[col] < 0}
+            return df[col] >= 0  # True = passes, False = fails (negative)
 
         register_custom_check("neg_price", check_negative_price, check_registry)
 
@@ -364,7 +361,7 @@ class TestRunAllReports:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            # sales_df has all positive prices → mask is all False → no flags
+            # sales_df has all positive prices → mask is all True → no flags
             assert count_validation_flags(conn) == 0
         finally:
             conn.close()

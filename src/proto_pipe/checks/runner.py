@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from proto_pipe.checks.result import CheckResult
 from proto_pipe.registry.base import CheckRegistry
 
 
@@ -16,6 +17,8 @@ def run_check_safe(
     Returns:
     {"status": "passed", "result": <dict>}
     {"status": "failed", "error": <str>}
+    {"status": "unavailable", "error": str} # result.available=False
+    {"status": "error", "error": str} # exception raised
 
     :param registry: a registry instance that will run the checks in parallel
     :param check_name: Name of the check that is being run
@@ -24,9 +27,19 @@ def run_check_safe(
     """
     try:
         result = registry.run(check_name, context)
-        return {"status": "passed", "result": result}
+        if not isinstance(result, CheckResult):
+            return {
+                "status": "error",
+                "error": f"Check '{check_name}' did not return a CheckResult — got {type(result).__name__}",
+            }
+        if not result.available:
+            return {"status": "unavailable", "error": result.error}
+        return {
+            "status": "passed" if result.passed else "failed",
+            "result": result,
+        }
     except Exception as e:
-        return {"status": "failed", "error": str(e)}
+        return {"status": "error", "error": str(e)}
 
 
 def run_checks(
@@ -64,8 +77,6 @@ def run_checks(
 # ---------------------------------------------------------------------------
 # Batch execution with validation flag writing
 # ---------------------------------------------------------------------------
-
-
 def run_checks_and_flag(
     check_names: list[str],
     registry: CheckRegistry,
@@ -104,29 +115,41 @@ def run_checks_and_flag(
     if not pipeline_db or not report_name:
         return results
 
-    from proto_pipe.reports.validation_flags import (
-        _extract_flagged_rows,
-        write_validation_flags,
-    )
+    from proto_pipe.reports.validation_flags import write_validation_flags
     import duckdb
     import pandas as pd
-    from typing import Any
 
     df: pd.DataFrame = context["df"]
     conn = duckdb.connect(pipeline_db)
     try:
         for check_name, outcome in results.items():
-            if outcome["status"] == "failed":
-                # Check raised — write one summary flag
-                flag_rows = [{"pk_value": None, "reason": outcome["error"]}]
+            status = outcome["status"]
+
+            if status in ("error", "unavailable"):
+                # Check raised or is unavailable — write one summary flag
+                flag_rows = [{"pk_value": None, "reason": outcome.get("error", "")}]
+
+            elif status == "failed":
+                # Check ran but found failures — use mask to identify rows
+                result: CheckResult = outcome["result"]
+                flag_rows = []
+                if result.mask is not None:
+                    failing = df[result.mask]
+                    cols = list(failing.columns)
+                    pk_idx = cols.index(pk_col) if pk_col and pk_col in cols else None
+                    for row in failing.itertuples(index=False, name=None):
+                        pk_value = str(row[pk_idx]) if pk_idx is not None else None
+                        flag_rows.append(
+                            {
+                                "pk_value": pk_value,
+                                "reason": result.reason or f"{check_name}: row failed",
+                            }
+                        )
+                else:
+                    flag_rows = [{"pk_value": None, "reason": result.reason}]
             else:
-                result_dict: dict[str, Any] = outcome.get("result", {})
-                flag_rows = _extract_flagged_rows(
-                    result=result_dict,
-                    df=df,
-                    pk_col=pk_col,
-                    check_name=check_name,
-                )
+                # passed — no flags to write
+                continue
 
             write_validation_flags(
                 conn=conn,

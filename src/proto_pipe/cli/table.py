@@ -7,6 +7,7 @@ import duckdb
 
 from proto_pipe.cli.helpers import config_path_or_override
 
+# TODO: there's the same exact definition in scaffold.py
 # Pipeline infrastructure tables — shown separately from user data tables
 _INFRASTRUCTURE_TABLES = {
     "flagged_rows",

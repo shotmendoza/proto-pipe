@@ -22,15 +22,6 @@ from proto_pipe.checks.helpers import custom_check, _DECORATED_CHECKS
 # ---------------------------------------------------------------------------
 
 def _write_module(path: Path, content: str) -> None:
-    """Writes the provided content to a file located at the given path.
-
-    :param path: The file system path where the content will be written.
-    :type path: Path
-    :param content: The textual content to be written to the file.
-    :type content: str
-    :return: This function does not return a value.
-    :rtype: None
-    """
     path.write_text(content)
 
 
@@ -40,21 +31,23 @@ def _write_module(path: Path, content: str) -> None:
 
 class TestCustomCheckDecorator:
     def test_decorator_populates_decorated_checks(self):
-        # Use a unique name to avoid cross-test pollution
         @custom_check("_test_decorator_check")
-        def my_fn(context):
-            return {"ok": True}
+        def my_fn(context) -> pd.Series:
+            return pd.Series([True])
 
         assert "_test_decorator_check" in _DECORATED_CHECKS
         assert _DECORATED_CHECKS["_test_decorator_check"] is my_fn
 
     def test_decorated_function_still_callable(self):
         @custom_check("_test_callable_check")
-        def my_fn(context):
-            return {"called": True}
+        def my_fn(context) -> pd.Series:
+            df = context["df"]
+            return pd.Series([True] * len(df), index=df.index)
 
-        result = my_fn({"df": pd.DataFrame()})
-        assert result["called"] is True
+        df = pd.DataFrame({"col": [1, 2]})
+        result = my_fn({"df": df})
+        assert isinstance(result, pd.Series)
+        assert result.all()
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +57,15 @@ class TestCustomCheckDecorator:
 class TestLoadCustomChecksModule:
     def test_registers_decorated_function(self, tmp_path, check_registry):
         module_path = tmp_path / "my_checks.py"
-        _write_module(module_path, """
-from proto_pipe.checks.helpers import custom_check
-
-@custom_check("margin_check")
-def check_margin(context, col="margin", threshold=0.2):
-    df = context["df"]
-    below = df[df[col] < threshold]
-    return {"violations": len(below)}
-""")
+        _write_module(module_path, (
+            "from proto_pipe.checks.helpers import custom_check\n"
+            "import pandas as pd\n"
+            "\n"
+            "@custom_check('margin_check')\n"
+            "def check_margin(context, col: str = 'margin') -> pd.Series:\n"
+            "    df = context['df']\n"
+            "    return df[col] >= 0.2\n"
+        ))
         from proto_pipe.io.registry import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
@@ -80,21 +73,24 @@ def check_margin(context, col="margin", threshold=0.2):
 
     def test_custom_check_is_runnable(self, tmp_path, check_registry):
         module_path = tmp_path / "my_checks.py"
-        _write_module(module_path, """
-from proto_pipe.checks.helpers import custom_check
-
-@custom_check("pct_check")
-def check_pct(context, col="pct"):
-    df = context["df"]
-    bad = df[df[col] > 1.0]
-    return {"violations": len(bad)}
-""")
+        _write_module(module_path, (
+            "from proto_pipe.checks.helpers import custom_check\n"
+            "import pandas as pd\n"
+            "\n"
+            "@custom_check('pct_check')\n"
+            "def check_pct(context, col: str = 'pct') -> pd.Series:\n"
+            "    df = context['df']\n"
+            "    return df[col] <= 1.0\n"
+        ))
         from proto_pipe.io.registry import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
         df = pd.DataFrame({"pct": [0.5, 1.5, 0.9]})
+        from proto_pipe.checks.result import CheckResult
         result = check_registry.run("pct_check", {"df": df})
-        assert result["violations"] == 1
+        assert isinstance(result, CheckResult)
+        assert result.passed is False
+        assert result.mask.sum() == 1  # 1 row fails (1.5 > 1.0)
 
     def test_missing_module_exits(self, tmp_path, check_registry):
         from proto_pipe.io.registry import load_custom_checks_module
@@ -114,7 +110,6 @@ def check_pct(context, col="pct"):
         module_path = tmp_path / "empty_checks.py"
         _write_module(module_path, "# no decorated functions here\nX = 1\n")
 
-        # _DECORATED_CHECKS may have entries from other tests — clear it temporarily
         original = dict(_DECORATED_CHECKS)
         _DECORATED_CHECKS.clear()
 
@@ -134,19 +129,16 @@ def check_pct(context, col="pct"):
 
 class TestCustomCheckEndToEnd:
     def test_custom_check_runs_via_config(self, tmp_path, check_registry, report_registry):
-        """
-        Full path: module loaded → check registered → config references it
-        → register_from_config resolves it → check runs successfully.
-        """
         module_path = tmp_path / "e2e_checks.py"
-        _write_module(module_path, """
-from proto_pipe.checks.helpers import custom_check
-
-@custom_check("e2e_custom_check")
-def check_e2e(context):
-    df = context["df"]
-    return {"row_count": len(df)}
-""")
+        _write_module(module_path, (
+            "from proto_pipe.checks.helpers import custom_check\n"
+            "import pandas as pd\n"
+            "\n"
+            "@custom_check('e2e_custom_check')\n"
+            "def check_e2e(context) -> pd.Series:\n"
+            "    df = context['df']\n"
+            "    return pd.Series([True] * len(df), index=df.index)\n"
+        ))
         from proto_pipe.io.registry import (
             load_custom_checks_module,
             register_from_config,
@@ -162,7 +154,6 @@ def check_e2e(context):
                         "type": "duckdb",
                         "path": str(tmp_path / "fake.db"),
                         "table": "sales",
-                        "timestamp_col": "updated_at",
                     },
                     "options": {},
                     "checks": [{"name": "e2e_custom_check"}],
@@ -172,5 +163,7 @@ def check_e2e(context):
         register_from_config(config, check_registry, report_registry)
 
         df = pd.DataFrame({"col": [1, 2, 3]})
+        from proto_pipe.checks.result import CheckResult
         result = check_registry.run("e2e_custom_check", {"df": df})
-        assert result["row_count"] == 3
+        assert isinstance(result, CheckResult)
+        assert result.passed is True

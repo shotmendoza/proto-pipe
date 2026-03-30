@@ -22,15 +22,6 @@ Flag identity:
   deduplicated across runs.
 
 Result dict conventions (checked by _extract_flagged_rows):
-
-  {"mask": pd.Series[bool], "flag_when": True}
-      Row-level. Rows where mask == flag_when are flagged.
-      flag_when defaults to True if omitted.
-
-  {"violation_indices": [0, 2, 5]}
-      Row-level, backward-compatible. Rows at those DataFrame integer
-      indices are flagged. Used by the built-in check_range today.
-
   Anything else (or if the check raises):
       Summary flag. One entry per check run, no row identifiers.
       reason = the exception message (raises) or a short dict repr (other).
@@ -38,7 +29,6 @@ Result dict conventions (checked by _extract_flagged_rows):
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
 import duckdb
 import pandas as pd
@@ -81,92 +71,6 @@ def _flag_id(report_name: str, check_name: str, pk_value: str | None) -> str:
         return str(uuid.uuid4())
     key = f"{report_name}:{check_name}:{pk_value}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
-
-
-# ---------------------------------------------------------------------------
-# Result interpretation
-# ---------------------------------------------------------------------------
-
-def _extract_flagged_rows(
-    result: dict[str, Any],
-    df: pd.DataFrame,
-    pk_col: str | None,
-    check_name: str,
-    reason_prefix: str = "",
-) -> list[dict]:
-    """Inspect a check result dict and return a list of flag dicts.
-
-    Each flag dict has keys: pk_value, reason.
-    pk_value is None when the source has no primary_key defined.
-
-    Priority:
-      1. "mask" key  → pd.Series[bool], rows where mask == flag_when are flagged
-      2. "violation_indices" key → list[int], backward-compat with check_range
-      3. Anything else → one summary flag, no pk_value
-    """
-    flags: list[dict] = []
-
-    # --- Mode 1: boolean mask ---
-    if "mask" in result:
-        mask = result["mask"]
-        if not isinstance(mask, pd.Series):
-            # Malformed — fall through to summary
-            flags.append({"pk_value": None, "reason": f"'mask' is not a pd.Series: {type(mask)}"})
-            return flags
-
-        flag_when = result.get("flag_when", True)
-        failing = df[mask == flag_when]
-
-        for _, row in failing.iterrows():
-            pk_value = str(row[pk_col]) if pk_col and pk_col in row.index else None
-            reason = reason_prefix or f"{check_name}: row failed mask check (flag_when={flag_when})"
-            flags.append({"pk_value": pk_value, "reason": reason})
-        return flags
-
-    # --- Mode 2: violation_indices (backward compat) ---
-    if "violation_indices" in result:
-        indices = result["violation_indices"]
-        if not indices:
-            return []
-
-        failing = df.loc[df.index.isin(indices)]
-        col = result.get("col", "")
-        min_val = result.get("min_val")
-        max_val = result.get("max_val")
-
-        for _, row in failing.iterrows():
-            pk_value = str(row[pk_col]) if pk_col and pk_col in row.index else None
-            if col and min_val is not None and max_val is not None:
-                actual = row.get(col, "?")
-                reason = f"{col} out of range [{min_val}, {max_val}]: {actual}"
-            else:
-                reason = reason_prefix or f"value out of range"
-            flags.append({"pk_value": pk_value, "reason": reason})
-        return flags
-
-    # --- Mode 3: summary ---
-    summary = reason_prefix or _summarise_result(result)
-    flags.append({"pk_value": None, "reason": summary})
-    return flags
-
-
-def _summarise_result(result: dict) -> str:
-    """Build a short human-readable summary from a free-form result dict."""
-    parts = []
-    # Highlight the most useful keys if present
-    if "has_nulls" in result:
-        null_counts = result.get("null_counts", {})
-        affected = {k: v for k, v in null_counts.items() if v > 0}
-        parts.append(f"null values in: {list(affected.keys())}")
-    elif "has_duplicates" in result:
-        parts.append(f"{result.get('duplicate_count', '?')} duplicate row(s)")
-    elif "missing_cols" in result:
-        parts.append(f"missing columns: {result.get('missing_cols')}")
-    else:
-        # Generic: show up to 3 key-value pairs
-        items = list(result.items())[:3]
-        parts.append(", ".join(f"{k}={v}" for k, v in items))
-    return "; ".join(parts) or str(result)
 
 
 # ---------------------------------------------------------------------------

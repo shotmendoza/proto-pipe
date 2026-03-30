@@ -137,6 +137,10 @@ class TestWatermarkFiltering:
         register_from_config(reports_config, cr, rr)
         run_all_reports(rr, cr, ws, parallel_reports=False)
 
+        # Debug
+        mark = ws.get("daily_sales_validation")
+        print(f"Watermark after first run: {mark}")
+
         # Second run — same data, watermark should skip all rows
         results = run_all_reports(rr, cr, ws, parallel_reports=False)
         sales_result = next(r for r in results if r["report"] == "daily_sales_validation")
@@ -287,10 +291,9 @@ class TestCustomCheckInPipeline:
         from proto_pipe.checks.built_in import BUILT_IN_CHECKS
 
         @custom_check("quantity_positive")
-        def check_quantity(context):
+        def check_quantity(context) -> pd.Series:
             df = context["df"]
-            bad = df[df["quantity"] <= 0]
-            return {"violations": len(bad)}
+            return df["quantity"] > 0
 
         # Register custom check into BUILT_IN_CHECKS so loader can find it
         BUILT_IN_CHECKS["quantity_positive"] = check_quantity
@@ -310,7 +313,14 @@ class TestCustomCheckInPipeline:
         results = run_all_reports(rr, cr, ws, parallel_reports=False)
 
         sales_result = next(r for r in results if r["report"] == "daily_sales_validation")
-        expected_key = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"quantity_positive:{sorted({}.items())}"))
+        # Update assertion — result is now CheckResult not dict:
+        expected_key = str(
+            uuid.uuid5(uuid.NAMESPACE_DNS, f"quantity_positive:{sorted({}.items())}")
+        )
         assert expected_key in sales_result["results"]
-        assert sales_result["results"][expected_key]["result"]["violations"] == 0
+        result = sales_result["results"][expected_key]["result"]
+        from proto_pipe.checks.result import CheckResult
+
+        assert isinstance(result, CheckResult)
+        assert result.passed is True
         assert sales_result["status"] == "completed"

@@ -2,15 +2,13 @@
 
 Covers:
 - run_check_safe: returns passed on success
-- run_check_safe: returns failed on exception, does not re-raise
-- run_check_safe: result dict preserved in outcome
+- run_check_safe: returns error on exception, does not re-raise
+- run_check_safe: result is CheckResult
 - run_checks: sequential execution returns all results
 - run_checks: parallel execution returns all results
 - run_checks: failed check does not prevent other checks from running
-- run_checks_and_flag: mask mode writes row-level flags to pipeline_db
-- run_checks_and_flag: violation_indices mode writes row-level flags
+- run_checks_and_flag: writes row-level flags to pipeline_db
 - run_checks_and_flag: raising check writes summary flag
-- run_checks_and_flag: summary mode (free-form result) writes one summary flag
 - run_checks_and_flag: multiple checks write independent flags
 - run_checks_and_flag: idempotent — re-running does not duplicate row-level flags
 - run_checks_and_flag: no pipeline_db → no flags written, returns results normally
@@ -24,6 +22,7 @@ import pandas as pd
 import pytest
 
 from proto_pipe.checks.built_in import check_nulls, check_range
+from proto_pipe.checks.result import CheckResult
 from proto_pipe.checks.runner import run_check_safe, run_checks, run_checks_and_flag
 from proto_pipe.registry.base import CheckRegistry
 from proto_pipe.reports.validation_flags import (
@@ -73,40 +72,44 @@ class TestRunCheckSafe:
     def test_returns_passed_on_success(self, registry, context):
         registry.register("null_check", check_nulls)
         outcome = run_check_safe(registry, "null_check", context)
-
         assert outcome["status"] == "passed"
         assert "result" in outcome
 
-    def test_result_dict_preserved(self, registry, context):
+    def test_result_is_check_result(self, registry, context):
         registry.register("null_check", check_nulls)
         outcome = run_check_safe(registry, "null_check", context)
+        assert isinstance(outcome["result"], CheckResult)
 
-        assert "has_nulls" in outcome["result"]
-
-    def test_returns_failed_on_exception(self, registry, context):
-        def always_raises(ctx):
+    def test_returns_error_on_exception(self, registry, context):
+        def always_raises(ctx) -> pd.Series:
             raise ValueError("something went wrong")
 
         registry.register("bad_check", always_raises)
         outcome = run_check_safe(registry, "bad_check", context)
-
-        assert outcome["status"] == "failed"
+        assert outcome["status"] == "error"
         assert "something went wrong" in outcome["error"]
 
     def test_does_not_re_raise_exception(self, registry, context):
-        def always_raises(ctx):
+        def always_raises(ctx) -> pd.Series:
             raise RuntimeError("boom")
 
         registry.register("boom_check", always_raises)
-        # Should not raise
         outcome = run_check_safe(registry, "boom_check", context)
-        assert outcome["status"] == "failed"
+        assert outcome["status"] == "error"
 
-    def test_unregistered_check_returns_failed(self, registry, context):
+    def test_unregistered_check_returns_error(self, registry, context):
         outcome = run_check_safe(registry, "nonexistent_check", context)
-
-        assert outcome["status"] == "failed"
+        assert outcome["status"] == "error"
         assert "nonexistent_check" in outcome["error"]
+
+    def test_returns_error_on_exception_with_correct_message(self, registry, context):
+        def always_raises(ctx) -> pd.Series:
+            raise ValueError("fail")
+
+        registry.register("bad_check", always_raises)
+        outcome = run_check_safe(registry, "bad_check", context)
+        assert outcome["status"] == "error"
+        assert "fail" in outcome["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +146,7 @@ class TestRunChecks:
         assert {k: v["status"] for k, v in seq.items()} == {k: v["status"] for k, v in par.items()}
 
     def test_one_failed_check_does_not_prevent_others(self, registry, context):
-        def always_raises(ctx):
+        def always_raises(ctx) -> pd.Series:
             raise ValueError("fail")
 
         registry.register("bad_check", always_raises)
@@ -151,7 +154,7 @@ class TestRunChecks:
 
         results = run_checks(["bad_check", "null_check"], registry, context)
 
-        assert results["bad_check"]["status"] == "failed"
+        assert results["bad_check"]["status"] == "error"
         assert results["null_check"]["status"] == "passed"
 
     def test_empty_check_list_returns_empty_dict(self, registry, context):
@@ -164,10 +167,32 @@ class TestRunChecks:
 # ---------------------------------------------------------------------------
 
 class TestRunChecksAndFlag:
+    def test_range_violation_writes_row_level_flag(self, registry, pipeline_db, sample_df):
+        registry.register("price_range", partial(check_range, col="price", min_val=0, max_val=500))
+
+        run_checks_and_flag(
+            check_names=["price_range"],
+            registry=registry,
+            context={"df": sample_df},
+            pipeline_db=pipeline_db,
+            report_name="sales_report",
+            table_name="sales",
+            pk_col="order_id",
+        )
+
+        conn = duckdb.connect(pipeline_db)
+        try:
+            det = detail_df(conn, "sales_report")
+            assert len(det) == 1
+            assert det.iloc[0]["pk_value"] == "ORD-002"
+            assert det.iloc[0]["reason"] is not None
+        finally:
+            conn.close()
+
     def test_mask_mode_writes_row_level_flag(self, registry, pipeline_db, sample_df):
-        def check_negative_price(ctx, col="price"):
+        def check_negative_price(ctx, col: str = "price") -> pd.Series:
             df = ctx["df"]
-            return {"mask": df[col] < 0, "flag_when": True}
+            return df[col] >= 0  # True = passes, False = fails (negative)
 
         registry.register("neg_price", check_negative_price)
 
@@ -186,34 +211,11 @@ class TestRunChecksAndFlag:
             det = detail_df(conn, "sales_report")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] == "ORD-002"
-            assert "neg_price" in det.iloc[0]["reason"]
-        finally:
-            conn.close()
-
-    def test_violation_indices_mode_writes_row_level_flag(self, registry, pipeline_db, sample_df):
-        registry.register("price_range", partial(check_range, col="price", min_val=0, max_val=500))
-
-        run_checks_and_flag(
-            check_names=["price_range"],
-            registry=registry,
-            context={"df": sample_df},
-            pipeline_db=pipeline_db,
-            report_name="sales_report",
-            table_name="sales",
-            pk_col="order_id",
-        )
-
-        conn = duckdb.connect(pipeline_db)
-        try:
-            det = detail_df(conn, "sales_report")
-            assert len(det) == 1
-            assert det.iloc[0]["pk_value"] == "ORD-002"
-            assert "-5.0" in det.iloc[0]["reason"]
         finally:
             conn.close()
 
     def test_raising_check_writes_summary_flag(self, registry, pipeline_db, sample_df):
-        def always_raises(ctx):
+        def always_raises(ctx) -> pd.Series:
             raise ValueError("completely broken")
 
         registry.register("broken_check", always_raises)
@@ -237,11 +239,12 @@ class TestRunChecksAndFlag:
         finally:
             conn.close()
 
-    def test_summary_mode_free_form_writes_one_flag(self, registry, pipeline_db, sample_df):
-        registry.register("null_check", check_nulls)
+    def test_failing_check_writes_flag(self, registry, pipeline_db, sample_df):
+        """A check that finds failures writes flags."""
+        registry.register("price_range", partial(check_range, col="price", min_val=0, max_val=500))
 
         run_checks_and_flag(
-            check_names=["null_check"],
+            check_names=["price_range"],
             registry=registry,
             context={"df": sample_df},
             pipeline_db=pipeline_db,
@@ -252,22 +255,20 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            # null_check returns a free-form dict → one summary flag
             assert count_validation_flags(conn, "sales_report") == 1
-            assert detail_df(conn).iloc[0]["pk_value"] is None
         finally:
             conn.close()
 
     def test_multiple_checks_write_independent_flags(self, registry, pipeline_db, sample_df):
-        def check_negative(ctx, col="price"):
+        def check_negative(ctx, col: str = "price") -> pd.Series:
             df = ctx["df"]
-            return {"mask": df[col] < 0}
+            return df[col] >= 0
 
         registry.register("neg_price", check_negative)
-        registry.register("null_check", check_nulls)
+        registry.register("price_range", partial(check_range, col="price", min_val=0, max_val=500))
 
         run_checks_and_flag(
-            check_names=["neg_price", "null_check"],
+            check_names=["neg_price", "price_range"],
             registry=registry,
             context={"df": sample_df},
             pipeline_db=pipeline_db,
@@ -278,7 +279,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            # neg_price: 1 row-level flag; null_check: 1 summary flag
+            # Both checks flag ORD-002 with different check names → 2 flags
             assert count_validation_flags(conn, "sales_report") == 2
         finally:
             conn.close()
@@ -298,7 +299,6 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            # uuid5 dedup: same (report, check, pk_value) → same id → only 1 flag
             assert count_validation_flags(conn, "r") == 1
         finally:
             conn.close()
@@ -315,12 +315,11 @@ class TestRunChecksAndFlag:
         )
 
         assert results["null_check"]["status"] == "passed"
-        # No DB → nothing to assert on flags; test confirms no exception raised
 
     def test_no_pk_col_flags_written_with_none_pk_value(self, registry, pipeline_db, sample_df):
-        def check_negative(ctx, col="price"):
+        def check_negative(ctx, col: str = "price") -> pd.Series:
             df = ctx["df"]
-            return {"mask": df[col] < 0}
+            return df[col] >= 0
 
         registry.register("neg_price", check_negative)
 
@@ -331,7 +330,7 @@ class TestRunChecksAndFlag:
             pipeline_db=pipeline_db,
             report_name="r",
             table_name="sales",
-            pk_col=None,  # no primary key defined
+            pk_col=None,
         )
 
         conn = duckdb.connect(pipeline_db)
@@ -339,6 +338,25 @@ class TestRunChecksAndFlag:
             det = detail_df(conn, "r")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] is None
+        finally:
+            conn.close()
+
+    def test_clean_data_writes_no_flags(self, registry, pipeline_db, sample_df):
+        registry.register("null_check", check_nulls)
+
+        run_checks_and_flag(
+            check_names=["null_check"],
+            registry=registry,
+            context={"df": sample_df},
+            pipeline_db=pipeline_db,
+            report_name="sales_report",
+            table_name="sales",
+            pk_col="order_id",
+        )
+
+        conn = duckdb.connect(pipeline_db)
+        try:
+            assert count_validation_flags(conn, "sales_report") == 0
         finally:
             conn.close()
 
@@ -356,4 +374,4 @@ class TestRunChecksAndFlag:
         )
 
         assert "null_check" in results
-        assert results["null_check"]["status"] in ("passed", "failed")
+        assert results["null_check"]["status"] in ("passed", "failed", "error", "unavailable")

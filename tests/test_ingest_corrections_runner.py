@@ -1,21 +1,21 @@
 """
 Tests covering all behaviour with the final flag identity design:
 
-  id = md5(str(pk_value))  — deterministic, computable in DuckDB SQL,
+  id = md5(str(pk_value)) — deterministic, computable in DuckDB SQL,
                              no extra columns in source tables or flagged_rows.
 
   ingest.py:
-    - TestFlagIdForHelper           — md5 derivation, determinism
+    - TestFlagIdForHelper — md5 derivation, determinism
     - TestDirectoryValidation
     - TestNullPrimaryKeyWarning
     - TestChunking
     - TestMultipleExistingRows
     - TestOnDuplicateModes
     - TestCheckNullOverwritesIdempotent
-    - TestWriteFlagIdempotent       — ON CONFLICT DO NOTHING
+    - TestWriteFlagIdempotent — ON CONFLICT DO NOTHING
 
   corrections.py:
-    - TestExportFlaggedJoin         — join on md5(pk_col), drift-free
+    - TestExportFlaggedJoin — join on md5(pk_col), drift-free
     - TestImportCorrectionsXlsx
     - TestImportCorrectionsBatched
     - TestImportCorrectionsNotFound
@@ -179,8 +179,8 @@ class TestDirectoryValidation:
             ingest_directory(str(tmp_path / "nonexistent"), [], db)
 
     def test_file_not_dir_raises(self, tmp_path):
-        db      = _make_db(tmp_path)
-        not_dir = tmp_path / "afile.txt"
+        db = _make_db(tmp_path)
+        not_dir = tmp_path / "file.txt"
         not_dir.write_text("hello")
         conn = duckdb.connect(db)
         _init_ingest_log(conn)
@@ -660,14 +660,20 @@ class TestWatermarkOnlyAdvancesOnFullPass:
             ])
             result = run_report(report_config, check_registry, watermark_store)
         watermark_store.set.assert_not_called()
-        assert result["results"]["failing_check"]["status"] == "failed"
+        assert result["results"]["failing_check"]["status"] == "error"
 
     def test_watermark_advances_when_all_pass(self):
         from proto_pipe.reports.runner import run_report
+        from proto_pipe.checks.result import CheckResult
+        import pandas as pd
         watermark_store = MagicMock()
         watermark_store.get.return_value = None
         check_registry = MagicMock()
-        check_registry.run.return_value = {"status": "ok"}
+        check_registry.run.return_value = CheckResult(
+            passed=True,
+            mask=pd.Series([], dtype=bool),
+            reason="",
+        )
         report_config = {
             "name": "test_report",
             "source": {"path": ":memory:", "table": "sales", "timestamp_col": "updated_at"},

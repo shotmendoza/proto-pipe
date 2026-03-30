@@ -15,7 +15,13 @@ from proto_pipe.cli.helpers import config_path_or_override
 from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry
 
-_PIPELINE_TABLES = {"flagged_rows", "ingest_log", "report_runs", "validation_flags"}
+_PIPELINE_TABLES = {
+    "flagged_rows",
+    "ingest_log",
+    "report_runs",
+    "validation_flags",
+    "check_params_history",
+}
 
 
 def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.6) -> list[str]:

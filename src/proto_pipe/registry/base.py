@@ -1,6 +1,8 @@
 from functools import partial
 from typing import Callable
 
+from proto_pipe.checks.result import CheckResult, wrap_series_check
+
 
 # ---------------------------------------------------------------
 # Check Registry
@@ -35,12 +37,30 @@ class CheckRegistry:
         return self._checks.get(name)
 
     def register(self, name: str, func: Callable) -> None:
-        """registers a function into the registry
+        """Register a function into the registry.
+
+        If the function returns pd.Series[bool], it is automatically wrapped
+        to return CheckResult. If it has no return annotation or an invalid one,
+        registration is rejected with a clear error.
 
         :param name: name of the function, used as a reference
         :param func: function to be registered.
+        :raises ValueError: if the function lacks a valid return annotation
         """
-        self._checks[name] = func
+        from proto_pipe.checks.inspector import CheckParamInspector
+
+        # Get the underlying function if wrapped by partial
+        inspector = CheckParamInspector(func)
+
+        if inspector.returns_boolean_series():
+            self._checks[name] = wrap_series_check(func)
+        else:
+            raise ValueError(
+                f"[error] Check '{name}' was not registered.\n"
+                f"Reason: missing return annotation.\n"
+                f"Fix: add '-> pd.Series' to your function signature.\n"
+                f"Example: def {inspector.func.__name__}(context, col: str) -> pd.Series: ..."
+            )
 
     def register_with_params(
             self,
@@ -55,7 +75,7 @@ class CheckRegistry:
         :param name: name of the function, used as a reference
         :param func: function to be registered.
         """
-        self._checks[name] = partial(func, **params)
+        self.register(name, partial(func, **params))
 
     def run(
             self,
