@@ -151,28 +151,44 @@ def resolve_check_uuid(
     return resolved_check_names
 
 
-def _register_check(
-        name: str,
-        func_name: str,
-        params: dict,
-        check_registry: CheckRegistry
-) -> None:
-    """Registers a check function to the provided check registry. This function looks up a built-in check function
-    by name and then registers it in the given CheckRegistry object.
+def _register_check(name, func_name, params, check_registry):
+    import inspect
+    import functools
 
-    If additional parameters are provided, a partially applied version of the built-in check function is registered.
-
-    :param name: The name to associate with the registered check in the registry.
-    :param func_name: The name of the built-in check function to retrieve from the BUILT_IN_CHECKS dictionary.
-    :param params: A dictionary of parameters to partially apply to the built-in check function, if necessary.
-    :param check_registry: The CheckRegistry object where the resolved check function will be registered.
-    :raises ValueError: If the given func_name is not found in the BUILT_IN_CHECKS dictionary.
-    """
     func = BUILT_IN_CHECKS.get(func_name)
     if func is None:
         raise ValueError(f"No built-in check named '{func_name}'")
-    if params:
-        check_registry.register(name, partial(func, **params))
+
+    # Get the original function's signature to find defaults
+    unwrapped = func
+    while isinstance(unwrapped, functools.partial):
+        unwrapped = unwrapped.func
+    sig = inspect.signature(inspect.unwrap(unwrapped))
+
+    filled = {}
+    for k, v in (params or {}).items():
+        if v is not None:
+            filled[k] = v
+            continue
+
+        param = sig.parameters.get(k)
+        if param and param.default is not inspect.Parameter.empty:
+            # None given but function has a default — use it and warn
+            filled[k] = param.default
+            click.echo(
+                f"  [warn] '{func_name}' param '{k}' is None in config"
+                f" — using default value: {param.default!r}"
+            )
+        else:
+            # None given and no default — skip and warn
+            click.echo(
+                f"  [warn] '{func_name}' param '{k}' is None in config"
+                f" and has no default — param skipped, check may fail at runtime."
+                f" Edit reports_config.yaml to set a value."
+            )
+
+    if filled:
+        check_registry.register(name, partial(func, **filled))
     else:
         check_registry.register(name, func)
 

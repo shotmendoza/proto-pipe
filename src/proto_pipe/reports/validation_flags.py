@@ -182,6 +182,7 @@ def detail_df(
             id AS _flag_id,
             report_name,
             check_name,
+            args,
             table_name,
             pk_col,
             pk_value,
