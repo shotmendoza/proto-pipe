@@ -201,6 +201,7 @@ def run_checks_and_flag(
                 continue
 
             args = _get_check_args(check_name, registry)
+            results[check_name]["args"] = args
             write_validation_flags(
                 conn=conn,
                 report_name=report_name,

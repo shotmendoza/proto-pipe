@@ -68,17 +68,28 @@ def validate(pipeline_db, watermark_db, reports_config, table):
         pipeline_db=p_db
     )
 
+    if table:
+        results = [
+            r for r in results if r["report"] in {rpt["name"] for rpt in reports}
+        ]
+
     for r in results:
         status = r["status"]
-        click.echo(f"\n  {r['report']} [{status}]")
+        click.echo(f"\n {r['report']} [{status}]")
         if status == "completed":
             for check_name, outcome in r["results"].items():
                 mark = "✓" if outcome["status"] == "passed" else "✗"
-                click.echo(f"{mark} {check_name}")
+                args = outcome.get("args")
+                label = f"{check_name} ({args})" if args else check_name
+                click.echo(f"{mark} {label}")
                 if outcome["status"] == "failed":
-                    click.echo(f"{outcome['error']}")
+                    result = outcome["result"]
+                    if result.reason:
+                        click.echo(f"{result.reason}")
+                elif outcome["status"] in ("error", "unavailable"):
+                    click.echo(f"{outcome.get('error', '')}")
 
-        # Summarise validation flags written during this run
+        # Summarize validation flags written during this run
     conn = duckdb.connect(p_db)
     try:
         total_flags = count_validation_flags(conn)
