@@ -423,15 +423,32 @@ class TestWriteIntegrityFlags:
 
 class TestIngestDirectoryScenarioA:
 
-    def _source_with_types(self, column_types: dict) -> list[dict]:
+    def _sources(self) -> list[dict]:
+        """Source definition without column_types — registry is the source of truth now."""
         return [{
             "name": "sales",
             "patterns": ["sales_*.csv"],
             "target_table": "sales",
             "primary_key": "order_id",
             "on_duplicate": "flag",
-            "column_types": column_types,
         }]
+
+    def _seed_registry(self, pipeline_db: str, column_types: dict) -> None:
+        """Write column types to column_type_registry so ingest_directory can read them."""
+        conn = duckdb.connect(pipeline_db)
+        _init_ingest_log(conn)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS column_type_registry (
+                column_name   VARCHAR NOT NULL,
+                source_name   VARCHAR NOT NULL,
+                declared_type VARCHAR NOT NULL,
+                recorded_at   TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (column_name, source_name)
+            )
+        """)
+        from proto_pipe.io.ingest import write_registry_types
+        write_registry_types(conn, "sales", column_types)
+        conn.close()
 
     def test_creates_table_when_types_match(self, tmp_path, sales_df, pipeline_db):
         sales_df.to_csv(tmp_path / "sales_2026-01.csv", index=False)
@@ -444,7 +461,8 @@ class TestIngestDirectoryScenarioA:
             "order_date":  "VARCHAR",
             "updated_at":  "VARCHAR",
         }
-        sources = self._source_with_types(column_types)
+        self._seed_registry(pipeline_db, column_types)
+        sources = self._sources()
         summary = ingest_directory(str(tmp_path), sources, pipeline_db)
         assert summary["sales_2026-01.csv"]["status"] == "ok"
         conn = duckdb.connect(pipeline_db)
@@ -455,43 +473,24 @@ class TestIngestDirectoryScenarioA:
     def test_fails_file_when_type_mismatch(self, tmp_path, sales_df, pipeline_db):
         # Build the DataFrame with the bad value already present as a string
         # so pandas creates the price column as object dtype from the start.
-        # df.loc assignment onto a float64 column raises in pandas 2.x — write
-        # the mixed data directly instead, which matches what load_file sees
-        # when reading a CSV that has a non-numeric value in a numeric column.
         rows = [
-            {
-                "order_id": "ORD-001",
-                "customer_id": "CUST-A",
-                "price": 99.99,
-                "quantity": 2,
-                "region": "EMEA",
-                "order_date": "2026-01-15",
-                "updated_at": "2026-01-15T10:00:00+00:00",
-            },
-            {
-                "order_id": "ORD-002",
-                "customer_id": "CUST-B",
-                "price": "not-a-number",
-                "quantity": 1,
-                "region": "APAC",
-                "order_date": "2026-02-10",
-                "updated_at": "2026-02-10T09:00:00+00:00",
-            },
-            {
-                "order_id": "ORD-003",
-                "customer_id": "CUST-C",
-                "price": 15.50,
-                "quantity": 5,
-                "region": "EMEA",
-                "order_date": "2026-03-01",
-                "updated_at": "2026-03-01T08:30:00+00:00",
-            },
+            {"order_id": "ORD-001", "customer_id": "CUST-A", "price": 99.99,
+             "quantity": 2, "region": "EMEA", "order_date": "2026-01-15",
+             "updated_at": "2026-01-15T10:00:00+00:00"},
+            {"order_id": "ORD-002", "customer_id": "CUST-B", "price": "not-a-number",
+             "quantity": 1, "region": "APAC", "order_date": "2026-02-10",
+             "updated_at": "2026-02-10T09:00:00+00:00"},
+            {"order_id": "ORD-003", "customer_id": "CUST-C", "price": 15.50,
+             "quantity": 5, "region": "EMEA", "order_date": "2026-03-01",
+             "updated_at": "2026-03-01T08:30:00+00:00"},
         ]
         df = pd.DataFrame(rows)
         df.to_csv(tmp_path / "sales_2026-01.csv", index=False)
 
-        column_types = {"price": "DOUBLE", "order_id": "VARCHAR"}
-        sources = self._source_with_types(column_types)
+        # Seed registry so ingest_directory has a declared type to check against
+        self._seed_registry(pipeline_db, {"price": "DOUBLE", "order_id": "VARCHAR"})
+
+        sources = self._sources()
         summary = ingest_directory(str(tmp_path), sources, pipeline_db)
 
         assert summary["sales_2026-01.csv"]["status"] == "failed"
@@ -503,13 +502,22 @@ class TestIngestDirectoryScenarioA:
         assert exists == 0
         conn.close()
 
-    def test_no_column_types_falls_back_to_inference(self, tmp_path, sales_df, pipeline_db):
+    def test_no_registry_entries_falls_back_to_inference(self, tmp_path, sales_df, pipeline_db):
         sales_df.to_csv(tmp_path / "sales_2026-01.csv", index=False)
-        sources = [{
-            "name": "sales",
-            "patterns": ["sales_*.csv"],
-            "target_table": "sales",
-        }]
+        # No registry seeded — should fall back to inference and succeed
+        conn = duckdb.connect(pipeline_db)
+        _init_ingest_log(conn)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS column_type_registry (
+                column_name   VARCHAR NOT NULL,
+                source_name   VARCHAR NOT NULL,
+                declared_type VARCHAR NOT NULL,
+                recorded_at   TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (column_name, source_name)
+            )
+        """)
+        conn.close()
+        sources = self._sources()
         summary = ingest_directory(str(tmp_path), sources, pipeline_db)
         assert summary["sales_2026-01.csv"]["status"] == "ok"
 

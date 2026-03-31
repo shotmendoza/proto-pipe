@@ -19,6 +19,45 @@ from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry
 
 
+def _get_column_registry_hints(
+    pipeline_db: str,
+    columns: list[str],
+) -> dict[str, dict[str, str]]:
+    """Return {column_name: {source_name: declared_type}} from column_type_registry.
+
+    Used by new_source to show which sources have already declared a type for
+    each column, and to detect conflicts when multiple sources disagree.
+
+    Falls back to {} if the registry table doesn't exist yet (before vp db-init)
+    or if the DB file doesn't exist.
+
+    :param pipeline_db: Path to the pipeline DuckDB file.
+    :param columns:     Column names to look up.
+    :return: Nested dict mapping column → source → type.
+    """
+    try:
+        with duckdb.connect(pipeline_db) as conn:
+            if not columns:
+                return {}
+            placeholders = ", ".join(["?"] * len(columns))
+            rows = conn.execute(
+                f"""
+                SELECT column_name, source_name, declared_type
+                FROM column_type_registry
+                WHERE column_name IN ({placeholders})
+                ORDER BY column_name, recorded_at DESC
+            """,
+                columns,
+            ).fetchall()
+    except Exception:
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for col, source, dtype in rows:
+        result.setdefault(col, {})[source] = dtype
+    return result
+
+
 def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
     """Remove files already successfully logged in ingest_log.
 
@@ -330,7 +369,7 @@ def new_source(sources_config, incoming_dir):
     """
     from fnmatch import fnmatch
     from proto_pipe.cli.helpers import config_path_or_override
-    from proto_pipe.io.ingest import load_file
+    from proto_pipe.io.ingest import load_file, write_registry_types
     from proto_pipe.io.registry import load_config, write_config
     from proto_pipe.io.settings import load_settings
 
@@ -340,12 +379,13 @@ def new_source(sources_config, incoming_dir):
     config = load_config(src_cfg)
     existing_names = [s["name"] for s in config.get("sources", [])]
     settings = load_settings()
+    pipeline_db = settings["paths"]["pipeline_db"]
 
     click.echo("\n── New Source ──────────────────────────────")
 
     # Scan incoming dir — hide files already successfully ingested
     files = _scan_incoming(inc_dir)
-    files = _filter_uningested(files, settings["paths"]["pipeline_db"])
+    files = _filter_uningested(files, pipeline_db)
 
     sample = None
     if files:
@@ -484,18 +524,45 @@ def new_source(sources_config, incoming_dir):
             ).ask()
             timestamp_col = ts_input.strip() if ts_input else None
 
-        # Column type confirmation — shown as a summary, user confirms or picks overrides
-    column_types: dict[str, str] = {}
+    # Column type confirmation
+    confirmed_types: dict[str, str] = {}
     if sample is not None and file_cols:
         _DUCKDB_TYPES = ["VARCHAR", "DOUBLE", "BIGINT", "BOOLEAN", "TIMESTAMPTZ"]
 
-        # Build inferred types for all columns
+        # Infer types from the sample DataFrame
         inferred_types = {col: _infer_duckdb_type(sample[col]) for col in file_cols}
 
-        # Show summary — one line per column, no prompts yet
+        # Read registry hints — {col: {source_name: declared_type}}
+        registry_hints = _get_column_registry_hints(pipeline_db, file_cols)
+
+        # Build working types — registry wins when all sources agree on one type
+        working_types: dict[str, str] = {}
+        for col in file_cols:
+            hints = registry_hints.get(col, {})
+            unique_types = set(hints.values())
+            if len(unique_types) == 1:
+                working_types[col] = next(iter(unique_types))
+            else:
+                working_types[col] = inferred_types[col]
+
+        # Show summary with registry notes
         click.echo("\n  Inferred column types:")
-        for col, dtype in inferred_types.items():
-            click.echo(f"    {col:<30} {dtype}")
+        for col in file_cols:
+            hints = registry_hints.get(col, {})
+            unique_types = set(hints.values())
+            dtype = working_types[col]
+
+            if len(unique_types) == 0:
+                note = ""
+            elif len(unique_types) == 1:
+                source_names = ", ".join(f"'{s}'" for s in hints.keys())
+                note = f"  (registered in {source_names})"
+            else:
+                # Conflict — show what each source declared
+                conflict_parts = ", ".join(f"{t} in '{s}'" for s, t in hints.items())
+                note = f"  ⚠ conflict: {conflict_parts}"
+
+            click.echo(f"    {col:<30} {dtype}{note}")
 
         looks_right = questionary.confirm(
             "\n  Do these look right?",
@@ -506,18 +573,35 @@ def new_source(sources_config, incoming_dir):
             return
 
         if not looks_right:
-            # Multi-select: which columns need a different type?
+            # Checkbox shows type inline so it stays visible while selecting
             to_fix = questionary.checkbox(
                 "Select the columns to change:",
-                choices=file_cols,
+                choices=[
+                    questionary.Choice(
+                        f"{col:<30} {working_types[col]}",
+                        value=col,
+                    )
+                    for col in file_cols
+                ],
             ).ask()
             if to_fix is None:
                 click.echo("Cancelled.")
                 return
 
-            # For each selected column, pick the correct type
             for col in to_fix:
-                current = inferred_types[col]
+                current = working_types[col]
+                hints = registry_hints.get(col, {})
+                unique_types = set(hints.values())
+
+                # Surface conflict note before the select prompt
+                if len(unique_types) > 1:
+                    conflict_parts = ", ".join(
+                        f"{t} in '{s}'" for s, t in hints.items()
+                    )
+                    click.echo(
+                        f"  ⚠ '{col}' has conflicting registry types: {conflict_parts}"
+                    )
+
                 chosen = questionary.select(
                     f"  '{col}' (currently {current}):",
                     choices=[
@@ -532,11 +616,19 @@ def new_source(sources_config, incoming_dir):
                 if chosen is None:
                     click.echo("Cancelled.")
                     return
-                inferred_types[col] = chosen
+                working_types[col] = chosen
 
-        column_types = inferred_types
+        confirmed_types = working_types
 
-    # Build source entry
+        # Write confirmed types to registry — non-fatal if registry not ready yet
+        try:
+            with duckdb.connect(pipeline_db) as conn:
+                write_registry_types(conn, name, confirmed_types)
+        except Exception:
+            pass
+
+    # Build source entry — column_types no longer written to config,
+    # registry is now the source of truth
     source = {
         "name": name,
         "patterns": patterns,
@@ -547,8 +639,6 @@ def new_source(sources_config, incoming_dir):
     if primary_key:
         source["primary_key"] = primary_key
         source["on_duplicate"] = on_duplicate
-    if column_types:
-        source["column_types"] = column_types
 
     # Write to config
     sources = config.get("sources", [])
@@ -560,8 +650,8 @@ def new_source(sources_config, incoming_dir):
 
     click.echo(f"\n[ok] Source '{name}' added to {src_cfg}")
     click.echo("\nNext steps:")
-    click.echo("1. Review the entry in sources_config.yaml if needed")
-    click.echo("2. Run: vp ingest")
+    click.echo("  1. Review the entry in sources_config.yaml if needed")
+    click.echo("  2. Run: vp ingest")
 
 
 def _is_list_annotation(ann) -> bool:
