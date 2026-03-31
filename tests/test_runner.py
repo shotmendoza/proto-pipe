@@ -113,13 +113,17 @@ class TestRunReport:
         self, pipeline_db, sales_df, check_registry, watermark_store
     ):
         _seed_table(pipeline_db, "sales", sales_df)
-        # Use a check name that isn't registered — runner handles missing checks gracefully
-        config = _make_report_config(pipeline_db, "sales", ["missing_check"])
+
+        def always_fails(ctx: dict) -> pd.Series:
+            raise RuntimeError("deliberate runtime failure")
+
+        check_registry.register("failing_check", always_fails)
+        config = _make_report_config(pipeline_db, "sales", ["failing_check"])
 
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        assert result["results"]["missing_check"]["status"] == "error"
+        assert result["results"]["failing_check"]["status"] == "error"
 
     def test_range_violation_is_captured_not_raised(
         self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store

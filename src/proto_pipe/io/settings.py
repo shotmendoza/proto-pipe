@@ -25,7 +25,7 @@ _DEFAULTS = {
         "sql_dir": "sql/",
     },
     "multi_select_params": True,
-
+    "macros_dir": "macros",
 }
 
 
@@ -48,6 +48,8 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     # Merge with defaults so missing keys don't cause KeyErrors
     merged = _DEFAULTS.copy()
     merged["paths"].update(loaded.get("paths", {}))
+    if "macros_dir" in loaded:
+        merged["macros_dir"] = loaded["macros_dir"]
     return merged
 
 

@@ -589,9 +589,9 @@ class TestImportCorrectionsXlsx:
 
 class TestImportCorrectionsBatched:
     def test_large_corrections_all_applied(self, tmp_path):
-        n    = 500
+        n = 500
         conn = duckdb.connect(":memory:")
-        df   = pd.DataFrame([{"order_id": f"ORD-{i}", "price": float(i)} for i in range(n)])
+        df = pd.DataFrame([{"order_id": f"ORD-{i}", "price": float(i)} for i in range(n)])
         conn.execute("CREATE TABLE sales AS SELECT * FROM df")
         _init_flagged_rows(conn)
         corr = tmp_path / "corrections.csv"
@@ -642,24 +642,37 @@ class TestImportCorrectionsNotFound:
 # ---------------------------------------------------------------------------
 
 class TestWatermarkOnlyAdvancesOnFullPass:
-    def test_watermark_held_when_check_fails(self):
+
+    def test_watermark_held_when_check_fails(self, tmp_path):
         from proto_pipe.reports.runner import run_report
-        watermark_store = MagicMock()
-        watermark_store.get.return_value = None
-        check_registry = MagicMock()
-        check_registry.run.side_effect = ValueError("check failed")
+        from proto_pipe.registry.base import CheckRegistry
+        from proto_pipe.pipelines.watermark import WatermarkStore
+
+        watermark_store = WatermarkStore(str(tmp_path / "watermarks.db"))
+        check_registry = CheckRegistry()
+
+        def always_fails(ctx: dict) -> pd.Series:
+            raise RuntimeError("check failed at runtime")
+
+        check_registry.register("failing_check", always_fails)
+
         report_config = {
             "name": "test_report",
-            "source": {"path": ":memory:", "table": "sales", "timestamp_col": "updated_at"},
+            "source": {
+                "path": ":memory:",
+                "table": "sales",
+                "timestamp_col": "updated_at",
+            },
             "options": {"parallel": False},
             "resolved_checks": ["failing_check"],
         }
         with patch("proto_pipe.reports.runner.load_from_duckdb") as mock_load:
-            mock_load.return_value = pd.DataFrame([
-                {"order_id": "ORD-1", "updated_at": "2026-01-01"}
-            ])
+            mock_load.return_value = pd.DataFrame(
+                [{"order_id": "ORD-1", "updated_at": "2026-01-01"}]
+            )
             result = run_report(report_config, check_registry, watermark_store)
-        watermark_store.set.assert_not_called()
+
+        assert watermark_store.get("test_report") is None
         assert result["results"]["failing_check"]["status"] == "error"
 
     def test_watermark_advances_when_all_pass(self):

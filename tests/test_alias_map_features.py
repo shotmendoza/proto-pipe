@@ -1,0 +1,859 @@
+"""
+Tests for:
+- alias_map expansion (test_alias_map_*)
+- transform checks kind='transform' (test_transform_*)
+- reset_report (test_reset_*)
+- load_macros / vp new-macro (test_macro_*)
+"""
+from pathlib import Path
+
+import duckdb
+import pandas as pd
+import pytest
+
+from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+from proto_pipe.checks.helpers import _DECORATED_CHECKS, custom_check, register_custom_check
+from proto_pipe.checks.inspector import CheckContract
+from proto_pipe.io.ingest import (
+    _init_ingest_log,
+    _table_exists,
+    init_db,
+    ingest_directory,
+    load_macros,
+    reset_report,
+)
+from proto_pipe.io.registry import (
+    _build_alias_param_map,
+    _expand_check_with_alias_map,
+    register_from_config,
+)
+from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.reports.runner import _apply_transforms
+
+
+# ===========================================================================
+# Fixtures
+# ===========================================================================
+
+@pytest.fixture(autouse=True)
+def restore_built_in_checks():
+    """Restore BUILT_IN_CHECKS to its original state after each test.
+
+    Tests that call register_custom_check mutate the global BUILT_IN_CHECKS.
+    Without this fixture, a check registered in one test (e.g. an unavailable
+    lambda) would be picked up by _fresh_registry() in later tests and cause
+    spurious failures.
+    """
+    original = dict(BUILT_IN_CHECKS)
+    yield
+    BUILT_IN_CHECKS.clear()
+    BUILT_IN_CHECKS.update(original)
+
+
+def _fresh_registry() -> CheckRegistry:
+    reg = CheckRegistry()
+    for name, func in BUILT_IN_CHECKS.items():
+        reg.register(name, func)
+    return reg
+
+
+def _setup_table(db_path: str, table_name: str, df: pd.DataFrame) -> None:
+    conn = duckdb.connect(db_path)
+    conn.execute(f'CREATE TABLE "{table_name}" AS SELECT * FROM df')
+    conn.close()
+
+
+def _read_table(db_path: str, table_name: str) -> pd.DataFrame:
+    conn = duckdb.connect(db_path)
+    df = conn.execute(f'SELECT * FROM "{table_name}"').df()
+    conn.close()
+    return df
+
+
+def _setup_db_with_table(db_path: str, table_name: str, df: pd.DataFrame) -> None:
+    init_db(db_path)
+    conn = duckdb.connect(db_path)
+    _init_ingest_log(conn)
+    conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" AS SELECT * FROM df')
+    conn.execute("""
+        INSERT INTO ingest_log (id, filename, table_name, status, rows, ingested_at)
+        VALUES (gen_random_uuid()::VARCHAR, 'sales_2026.csv', ?, 'ok', 3, NOW())
+    """, [table_name])
+    conn.close()
+
+
+# ===========================================================================
+# RegistryEntry dataclass
+# ===========================================================================
+
+def test_registry_entry_defaults():
+    def dummy(ctx): pass
+    entry = CheckContract(func=dummy)
+    assert entry.kind == "check"
+    assert entry.func is dummy
+
+
+def test_registry_entry_transform_kind():
+    def dummy(ctx): pass
+    entry = CheckContract(func=dummy, kind="transform")
+    assert entry.kind == "transform"
+
+
+# ===========================================================================
+# CheckRegistry with kind support
+# ===========================================================================
+
+def test_registry_stores_registry_entry():
+    reg = CheckRegistry()
+
+    def my_check(ctx: dict) -> pd.Series:
+        return pd.Series([True])
+
+    reg.register("my_check", my_check)
+    assert isinstance(reg._checks["my_check"], CheckContract)
+
+
+def test_registry_get_returns_callable():
+    reg = CheckRegistry()
+
+    def my_check(ctx: dict) -> pd.Series:
+        return pd.Series([True])
+
+    reg.register("my_check", my_check)
+    func = reg.get("my_check")
+    assert callable(func)
+
+
+def test_registry_get_missing_returns_none():
+    reg = CheckRegistry()
+    assert reg.get("nonexistent") is None
+
+
+def test_registry_get_kind_check():
+    reg = CheckRegistry()
+
+    def my_check(ctx: dict) -> pd.Series:
+        return pd.Series([True])
+
+    reg.register("my_check", my_check, kind="check")
+    assert reg.get_kind("my_check") == "check"
+
+
+def test_registry_get_kind_transform():
+    reg = CheckRegistry()
+
+    def my_transform(ctx: dict) -> pd.Series:
+        return ctx["df"]["val"]
+
+    reg.register("my_transform", my_transform, kind="transform")
+    assert reg.get_kind("my_transform") == "transform"
+
+
+def test_registry_get_kind_missing_raises():
+    reg = CheckRegistry()
+    with pytest.raises(ValueError, match="No check registered"):
+        reg.get_kind("nonexistent")
+
+
+def test_registry_checks_only():
+    reg = CheckRegistry()
+
+    def c(ctx: dict) -> pd.Series: return pd.Series([True])
+    def t(ctx): return ctx["df"]
+
+    reg.register("check_a", c, kind="check")
+    reg.register("transform_a", t, kind="transform")
+    reg.register("check_b", c, kind="check")
+
+    assert set(reg.checks_only()) == {"check_a", "check_b"}
+    assert reg.transforms_only() == ["transform_a"]
+
+
+def test_registry_run_unpacks_entry():
+    reg = CheckRegistry()
+
+    def my_check(ctx: dict) -> pd.Series:
+        return pd.Series([True, False])
+
+    reg.register("my_check", my_check)
+    # run should return a CheckResult (wrapped), not raise
+    result = reg.run("my_check", {"df": pd.DataFrame({"a": [1, 2]})})
+    assert result is not None
+
+
+def test_invalid_kind_skips_registration(capsys):
+    """Invalid kind should warn and skip registration, not raise."""
+    from proto_pipe.checks.inspector import validate_check
+
+    def my_check(ctx: dict) -> pd.Series:
+        return pd.Series([True])
+
+    contract = validate_check("my_check", my_check, kind="invalid")
+    assert contract is None
+    assert "warn" in capsys.readouterr().out
+
+
+# ===========================================================================
+# @custom_check decorator stores (func, kind) tuple
+# ===========================================================================
+
+def test_custom_check_decorator_stores_tuple():
+    @custom_check("_test_check_tuple")
+    def my_check(ctx: dict) -> pd.Series:
+        return pd.Series([True])
+
+    assert "_test_check_tuple" in _DECORATED_CHECKS
+    func, kind = _DECORATED_CHECKS["_test_check_tuple"]
+    assert callable(func)
+    assert kind == "check"
+
+
+def test_custom_check_decorator_transform_kind():
+    @custom_check("_test_transform_tuple", kind="transform")
+    def my_transform(ctx: dict) -> pd.Series:
+        return ctx["df"]["val"]
+
+    func, kind = _DECORATED_CHECKS["_test_transform_tuple"]
+    assert kind == "transform"
+
+
+def test_custom_check_invalid_kind_raises():
+    with pytest.raises(ValueError, match="kind must be"):
+        @custom_check("_bad_kind", kind="invalid")
+        def noop(ctx): pass
+
+
+# ===========================================================================
+# register_custom_check validates return type
+# ===========================================================================
+
+def test_register_custom_check_bad_annotation_skips_registration(capsys):
+    """kind='check' without pd.Series return annotation should warn and skip registration."""
+    reg = CheckRegistry()
+
+    def bad_check(ctx: dict):  # no return annotation
+        return ctx["df"]
+
+    register_custom_check("_bad_check", bad_check, reg, kind="check")
+    captured = capsys.readouterr()
+    assert "warn" in captured.out
+    assert "_bad_check" not in reg.available()
+
+
+def test_register_custom_check_transform_bool_annotation_warns(capsys):
+    """kind='transform' with pd.Series[bool] return annotation should warn but still register."""
+    reg = _fresh_registry()
+
+    def looks_like_check(ctx: dict) -> pd.Series:
+        return pd.Series([True])
+
+    register_custom_check("_looks_like_check", looks_like_check, reg, kind="transform")
+    captured = capsys.readouterr()
+    assert "warn" in captured.out
+    assert "_looks_like_check" in reg.available()
+
+
+# ===========================================================================
+# Alias map — _build_alias_param_map
+# ===========================================================================
+
+def test_build_alias_param_map_single_entry():
+    result = _build_alias_param_map([{"param": "col", "column": "Coverage A"}])
+    assert result == {"col": ["Coverage A"]}
+
+
+def test_build_alias_param_map_multi_entry_same_param():
+    alias_map = [
+        {"param": "col", "column": "Coverage A"},
+        {"param": "col", "column": "Coverage B"},
+    ]
+    result = _build_alias_param_map(alias_map)
+    assert result == {"col": ["Coverage A", "Coverage B"]}
+
+
+def test_build_alias_param_map_multiple_params():
+    alias_map = [
+        {"param": "col", "column": "Coverage A"},
+        {"param": "bound_premium", "column": "Foo Bound Premium"},
+    ]
+    result = _build_alias_param_map(alias_map)
+    assert result["col"] == ["Coverage A"]
+    assert result["bound_premium"] == ["Foo Bound Premium"]
+
+
+def test_build_alias_param_map_empty():
+    assert _build_alias_param_map([]) == {}
+
+
+# ===========================================================================
+# Alias map — _expand_check_with_alias_map
+# ===========================================================================
+
+def test_expand_no_alias_map_registers_single():
+    reg = _fresh_registry()
+    names = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"col": "price", "min_val": 0, "max_val": 500},
+        alias_param_map={},
+        check_registry=reg,
+    )
+    assert len(names) == 1
+
+
+def test_expand_single_column_alias_registers_one():
+    reg = _fresh_registry()
+    names = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"min_val": 0, "max_val": 500},
+        alias_param_map={"col": ["Coverage A"]},
+        check_registry=reg,
+    )
+    assert len(names) == 1
+    df = pd.DataFrame({"Coverage A": [100.0, 200.0]})
+    result = reg.run(names[0], {"df": df})
+    assert result is not None
+
+
+def test_expand_multi_column_alias_registers_n():
+    reg = _fresh_registry()
+    names = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"min_val": 0, "max_val": 500},
+        alias_param_map={"col": ["Coverage A", "Coverage B", "Coverage C"]},
+        check_registry=reg,
+    )
+    assert len(names) == 3
+    assert len(set(names)) == 3  # all distinct
+
+
+def test_expand_scalar_params_broadcast():
+    """min_val and max_val should be baked into every expanded check."""
+    reg = _fresh_registry()
+    names = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"min_val": 10, "max_val": 100},
+        alias_param_map={"col": ["Col A", "Col B"]},
+        check_registry=reg,
+    )
+    assert len(names) == 2
+    df_pass = pd.DataFrame({"Col A": [50.0]})
+    df_fail = pd.DataFrame({"Col A": [5.0]})
+    from proto_pipe.checks.result import CheckResult
+    result_pass = reg.run(names[0], {"df": df_pass})
+    result_fail = reg.run(names[0], {"df": df_fail})
+    assert result_pass.passed is True
+    assert result_fail.passed is False
+
+
+def test_expand_idempotent():
+    reg = _fresh_registry()
+    names1 = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"min_val": 0, "max_val": 500},
+        alias_param_map={"col": ["Coverage A"]},
+        check_registry=reg,
+    )
+    names2 = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"min_val": 0, "max_val": 500},
+        alias_param_map={"col": ["Coverage A"]},
+        check_registry=reg,
+    )
+    assert names1 == names2
+
+
+def test_expand_unknown_param_in_alias_map_ignored():
+    reg = _fresh_registry()
+    names = _expand_check_with_alias_map(
+        func_name="range_check",
+        params={"col": "price", "min_val": 0, "max_val": 500},
+        alias_param_map={"unknown_param": ["X", "Y"]},
+        check_registry=reg,
+    )
+    assert len(names) == 1
+
+
+def test_expand_unequal_multi_column_lengths_raises():
+    reg = _fresh_registry()
+
+    def two_col_check(context: dict, col_a: str, col_b: str) -> pd.Series:
+        df = context["df"]
+        return df[col_a] == df[col_b]
+
+    BUILT_IN_CHECKS["_two_col_check"] = two_col_check
+    reg.register("_two_col_check", two_col_check)
+
+    with pytest.raises(ValueError, match="unequal lengths"):
+        _expand_check_with_alias_map(
+            func_name="_two_col_check",
+            params={},
+            alias_param_map={
+                "col_a": ["A1", "A2", "A3"],
+                "col_b": ["B1", "B2"],
+            },
+            check_registry=reg,
+        )
+
+
+def test_expand_single_entry_broadcasts_silently():
+    reg = _fresh_registry()
+
+    def two_col_check(context: dict, col_a: str, col_b: str) -> pd.Series:
+        df = context["df"]
+        return df[col_a] == df[col_b]
+
+    BUILT_IN_CHECKS["_two_col_broadcast"] = two_col_check
+    reg.register("_two_col_broadcast", two_col_check)
+
+    names = _expand_check_with_alias_map(
+        func_name="_two_col_broadcast",
+        params={},
+        alias_param_map={
+            "col_a": ["A1", "A2", "A3"],
+            "col_b": ["B1"],            # single entry broadcasts
+        },
+        check_registry=reg,
+    )
+    assert len(names) == 3
+
+
+def test_register_from_config_alias_map_expands_resolved_checks():
+    config = {
+        "templates": {},
+        "reports": [
+            {
+                "name": "coverage_report",
+                "source": {"type": "duckdb", "path": "", "table": "sales"},
+                "alias_map": [
+                    {"param": "col", "column": "Coverage A"},
+                    {"param": "col", "column": "Coverage B"},
+                ],
+                "options": {"parallel": False},
+                "checks": [
+                    {"name": "range_check", "params": {"min_val": 0, "max_val": 1000}},
+                ],
+            }
+        ],
+    }
+    reg = _fresh_registry()
+    rep_reg = ReportRegistry()
+    register_from_config(config, reg, rep_reg)
+
+    report = rep_reg.get("coverage_report")
+    assert len(report["resolved_checks"]) == 2
+    assert len(set(report["resolved_checks"])) == 2
+
+
+def test_register_from_config_no_alias_map_single_check():
+    config = {
+        "templates": {},
+        "reports": [
+            {
+                "name": "sales_report",
+                "source": {"type": "duckdb", "path": "", "table": "sales"},
+                "options": {"parallel": False},
+                "checks": [
+                    {"name": "range_check", "params": {"col": "price", "min_val": 0, "max_val": 500}},
+                ],
+            }
+        ],
+    }
+    reg = _fresh_registry()
+    rep_reg = ReportRegistry()
+    register_from_config(config, reg, rep_reg)
+
+    report = rep_reg.get("sales_report")
+    assert len(report["resolved_checks"]) == 1
+
+
+def test_register_from_config_alias_map_stored_in_report():
+    alias_map = [
+        {"param": "col", "column": "Coverage A"},
+        {"param": "col", "column": "Coverage B"},
+    ]
+    config = {
+        "templates": {},
+        "reports": [
+            {
+                "name": "test_report",
+                "source": {"type": "duckdb", "path": "", "table": "t"},
+                "alias_map": alias_map,
+                "options": {"parallel": False},
+                "checks": [
+                    {"name": "range_check", "params": {"min_val": 0, "max_val": 100}},
+                ],
+            }
+        ],
+    }
+    reg = _fresh_registry()
+    rep_reg = ReportRegistry()
+    register_from_config(config, reg, rep_reg)
+
+    report = rep_reg.get("test_report")
+    assert report["alias_map"] == alias_map
+
+
+# ===========================================================================
+# Transform checks — _apply_transforms
+# ===========================================================================
+
+def test_apply_transforms_series_updates_column(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    df = pd.DataFrame({"id": [1, 2, 3], "status": ["Issuance", "Renewal", "Issuance"]})
+    _setup_table(db_path, "sales", df)
+
+    reg = CheckRegistry()
+
+    def normalize(context: dict) -> pd.Series:
+        s = context["df"]["status"].replace({"Issuance": "Reinstatement"})
+        s.name = "status"
+        return s
+
+    reg.register("normalize", normalize, kind="transform")
+    _apply_transforms(["normalize"], reg, df, "sales", db_path)
+
+    result = _read_table(db_path, "sales")
+    assert list(result["status"]) == ["Reinstatement", "Renewal", "Reinstatement"]
+
+
+def test_apply_transforms_dataframe_replaces_table(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
+    _setup_table(db_path, "sales", df)
+
+    reg = CheckRegistry()
+
+    def double_val(context: dict) -> pd.DataFrame:
+        d = context["df"].copy()
+        d["val"] = d["val"] * 2
+        return d
+
+    reg.register("double_val", double_val, kind="transform")
+    _apply_transforms(["double_val"], reg, df, "sales", db_path)
+
+    result = _read_table(db_path, "sales")
+    assert list(result["val"]) == [20, 40]
+
+
+def test_apply_transforms_failed_transform_leaves_table_unchanged(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
+    _setup_table(db_path, "sales", df)
+
+    reg = CheckRegistry()
+
+    def bad_transform(context: dict) -> pd.Series:
+        raise RuntimeError("deliberate failure")
+
+    reg.register("bad_transform", bad_transform, kind="transform")
+    _apply_transforms(["bad_transform"], reg, df, "sales", db_path)
+
+    result = _read_table(db_path, "sales")
+    assert list(result["val"]) == [10, 20]
+
+
+def test_apply_transforms_successful_before_failed_still_applies(tmp_path):
+    """Successful transforms before a failing one should still be applied."""
+    db_path = str(tmp_path / "test.db")
+    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
+    _setup_table(db_path, "sales", df)
+
+    reg = CheckRegistry()
+
+    def good(context: dict) -> pd.Series:
+        s = context["df"]["val"] * 2
+        s.name = "val"
+        return s
+
+    def bad(context: dict) -> pd.Series:
+        raise RuntimeError("deliberate failure")
+
+    reg.register("good", good, kind="transform")
+    reg.register("bad", bad, kind="transform")
+
+    _apply_transforms(["good", "bad"], reg, df, "sales", db_path)
+
+    result = _read_table(db_path, "sales")
+    assert list(result["val"]) == [20, 40]
+
+
+def test_apply_transforms_series_unknown_column_skipped(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
+    _setup_table(db_path, "sales", df)
+
+    reg = CheckRegistry()
+
+    def bad_col(context: dict) -> pd.Series:
+        return pd.Series([99, 99], name="nonexistent_col")
+
+    reg.register("bad_col", bad_col, kind="transform")
+    _apply_transforms(["bad_col"], reg, df, "sales", db_path)
+
+    result = _read_table(db_path, "sales")
+    assert list(result["val"]) == [10, 20]
+
+
+def test_apply_transforms_order_preserved(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    df = pd.DataFrame({"id": [1], "val": [1]})
+    _setup_table(db_path, "t", df)
+
+    reg = CheckRegistry()
+    call_order = []
+
+    for name in ["t1", "t2", "t3"]:
+        def make_t(n):
+            def t(context: dict) -> pd.DataFrame:
+                call_order.append(n)
+                return context["df"]
+            return t
+        reg.register(name, make_t(name), kind="transform")
+
+    _apply_transforms(["t1", "t2", "t3"], reg, df, "t", db_path)
+    assert call_order == ["t1", "t2", "t3"]
+
+
+def test_run_report_transforms_run_after_checks(tmp_path):
+    """Checks must complete before transforms are applied."""
+    from proto_pipe.reports.runner import run_report
+    from proto_pipe.pipelines.watermark import WatermarkStore
+
+    db_path = str(tmp_path / "pipeline.db")
+    wm_path = str(tmp_path / "watermarks.db")
+
+    init_db(db_path)
+    conn = duckdb.connect(db_path)
+    for ddl in [
+        """CREATE TABLE IF NOT EXISTS flagged_rows (
+            id VARCHAR PRIMARY KEY, table_name VARCHAR, check_name VARCHAR,
+            reason VARCHAR, flagged_at TIMESTAMPTZ)""",
+        """CREATE TABLE IF NOT EXISTS validation_flags (
+            id VARCHAR PRIMARY KEY, report_name VARCHAR, table_name VARCHAR,
+            check_name VARCHAR, pk_value VARCHAR, reason VARCHAR,
+            args VARCHAR, flagged_at TIMESTAMPTZ)""",
+    ]:
+        conn.execute(ddl)
+    df = pd.DataFrame({
+        "id": ["R1", "R2"],
+        "status": ["Issuance", "Renewal"],
+        "_ingested_at": pd.Timestamp("2026-01-01", tz="UTC"),
+    })
+    conn.execute("CREATE TABLE sales AS SELECT * FROM df")
+    conn.close()
+
+    reg = CheckRegistry()
+    call_order = []
+
+    def my_check(context: dict) -> pd.Series:
+        call_order.append("check")
+        return pd.Series([True, True])
+
+    def my_transform(context: dict) -> pd.Series:
+        call_order.append("transform")
+        s = context["df"]["status"].replace({"Issuance": "Reinstatement"})
+        s.name = "status"
+        return s
+
+    reg.register("my_check", my_check, kind="check")
+    reg.register("my_transform", my_transform, kind="transform")
+
+    wm = WatermarkStore(wm_path)
+    report_config = {
+        "name": "test_report",
+        "source": {
+            "type": "duckdb", "path": db_path,
+            "table": "sales", "timestamp_col": "_ingested_at",
+        },
+        "options": {"parallel": False},
+        "resolved_checks": ["my_check", "my_transform"],
+    }
+
+    run_report(report_config, reg, wm, pipeline_db=db_path)
+    assert call_order == ["check", "transform"]
+
+
+# ===========================================================================
+# reset_report
+# ===========================================================================
+
+def test_reset_report_drops_table(tmp_path):
+    db_path = str(tmp_path / "pipeline.db")
+    df = pd.DataFrame({"id": [1, 2, 3], "val": ["a", "b", "c"]})
+    _setup_db_with_table(db_path, "sales", df)
+
+    reset_report("sales", db_path)
+
+    conn = duckdb.connect(db_path)
+    assert not _table_exists(conn, "sales")
+    conn.close()
+
+
+def test_reset_report_clears_ingest_log(tmp_path):
+    db_path = str(tmp_path / "pipeline.db")
+    df = pd.DataFrame({"id": [1], "val": ["x"]})
+    _setup_db_with_table(db_path, "sales", df)
+
+    reset_report("sales", db_path)
+
+    conn = duckdb.connect(db_path)
+    count = conn.execute(
+        "SELECT count(*) FROM ingest_log WHERE table_name = 'sales'"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_reset_report_nonexistent_table_is_graceful(tmp_path):
+    db_path = str(tmp_path / "pipeline.db")
+    init_db(db_path)
+    reset_report("nonexistent_table", db_path)  # should not raise
+
+
+def test_reset_report_does_not_affect_other_tables(tmp_path):
+    db_path = str(tmp_path / "pipeline.db")
+    init_db(db_path)
+    conn = duckdb.connect(db_path)
+    _init_ingest_log(conn)
+    conn.execute("""
+        INSERT INTO ingest_log (id, filename, table_name, status, rows, ingested_at)
+        VALUES
+            (gen_random_uuid()::VARCHAR, 'sales.csv', 'sales', 'ok', 3, NOW()),
+            (gen_random_uuid()::VARCHAR, 'inventory.csv', 'inventory', 'ok', 5, NOW())
+    """)
+    conn.close()
+
+    reset_report("sales", db_path)
+
+    conn = duckdb.connect(db_path)
+    inventory_count = conn.execute(
+        "SELECT count(*) FROM ingest_log WHERE table_name = 'inventory'"
+    ).fetchone()[0]
+    conn.close()
+    assert inventory_count == 1
+
+
+def test_reset_report_allows_reingest(tmp_path):
+    db_path = str(tmp_path / "pipeline.db")
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+
+    df = pd.DataFrame({"id": ["A", "B"], "val": [1, 2]})
+    (incoming / "sales_2026.csv").write_text(df.to_csv(index=False))
+
+    sources = [{"name": "sales", "patterns": ["sales_*.csv"], "target_table": "sales"}]
+
+    init_db(db_path)
+    ingest_directory(str(incoming), sources, db_path)
+
+    reset_report("sales", db_path)
+
+    conn = duckdb.connect(db_path)
+    assert not _table_exists(conn, "sales")
+    conn.close()
+
+    ingest_directory(str(incoming), sources, db_path)
+
+    conn = duckdb.connect(db_path)
+    assert _table_exists(conn, "sales")
+    rows = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+    conn.close()
+    assert rows == 2
+
+
+# ===========================================================================
+# load_macros
+# ===========================================================================
+
+def test_load_macros_registers_macro(tmp_path):
+    macros_dir = tmp_path / "macros"
+    macros_dir.mkdir()
+    (macros_dir / "normalize.sql").write_text("""
+        CREATE OR REPLACE MACRO normalize_status(val) AS
+            CASE WHEN val = 'Issuance' THEN 'Reinstatement' ELSE val END;
+    """)
+    conn = duckdb.connect()
+    load_macros(conn, str(macros_dir))
+
+    assert conn.execute("SELECT normalize_status('Issuance')").fetchone()[0] == "Reinstatement"
+    assert conn.execute("SELECT normalize_status('Renewal')").fetchone()[0] == "Renewal"
+    conn.close()
+
+
+def test_load_macros_missing_dir_warns_not_crashes(tmp_path, capsys):
+    conn = duckdb.connect()
+    load_macros(conn, str(tmp_path / "nonexistent"))
+    assert "warn" in capsys.readouterr().out
+    conn.close()
+
+
+def test_load_macros_empty_dir_is_noop(tmp_path):
+    macros_dir = tmp_path / "macros"
+    macros_dir.mkdir()
+    conn = duckdb.connect()
+    load_macros(conn, str(macros_dir))  # should not raise
+    conn.close()
+
+
+def test_load_macros_broken_file_skipped_others_load(tmp_path, capsys):
+    macros_dir = tmp_path / "macros"
+    macros_dir.mkdir()
+    (macros_dir / "bad.sql").write_text("THIS IS NOT VALID SQL ;;;")
+    (macros_dir / "good.sql").write_text("CREATE OR REPLACE MACRO double_val(x) AS x * 2;")
+
+    conn = duckdb.connect()
+    load_macros(conn, str(macros_dir))
+
+    assert conn.execute("SELECT double_val(5)").fetchone()[0] == 10
+    assert "macro-fail" in capsys.readouterr().out
+    conn.close()
+
+
+def test_load_macros_idempotent(tmp_path):
+    macros_dir = tmp_path / "macros"
+    macros_dir.mkdir()
+    (macros_dir / "add_one.sql").write_text("CREATE OR REPLACE MACRO add_one(x) AS x + 1;")
+
+    conn = duckdb.connect()
+    load_macros(conn, str(macros_dir))
+    load_macros(conn, str(macros_dir))
+
+    assert conn.execute("SELECT add_one(10)").fetchone()[0] == 11
+    conn.close()
+
+
+# ===========================================================================
+# vp new-macro CLI
+# ===========================================================================
+
+def test_new_macro_creates_sql_file(tmp_path):
+    from click.testing import CliRunner
+    from proto_pipe.cli.scaffold import new_macro
+
+    macros_dir = tmp_path / "macros"
+    runner = CliRunner()
+    result = runner.invoke(new_macro, ["normalize_tx", "--macros-dir", str(macros_dir)])
+
+    assert result.exit_code == 0
+    macro_file = macros_dir / "normalize_tx.sql"
+    assert macro_file.exists()
+    content = macro_file.read_text()
+    assert "CREATE OR REPLACE MACRO" in content
+    assert "normalize_tx" in content
+
+
+def test_new_macro_skips_existing_file(tmp_path):
+    from click.testing import CliRunner
+    from proto_pipe.cli.scaffold import new_macro
+
+    macros_dir = tmp_path / "macros"
+    macros_dir.mkdir()
+    existing = macros_dir / "my_macro.sql"
+    existing.write_text("-- existing content")
+
+    runner = CliRunner()
+    result = runner.invoke(new_macro, ["my_macro", "--macros-dir", str(macros_dir)])
+
+    assert result.exit_code == 0
+    assert "skip" in result.output
+    assert existing.read_text() == "-- existing content"

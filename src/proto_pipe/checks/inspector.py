@@ -1,14 +1,103 @@
 """CheckParamInspector — inspects a check function's signature and stores metadata."""
 from __future__ import annotations
 
-import functools
 import hashlib
 import inspect
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
 import duckdb
+
+
+@dataclass
+class CheckContract:
+    """A vetted check or transform function, ready for the CheckRegistry.
+
+    Created exclusively by validate_check() after passing all validation.
+    CheckRegistry stores and communicates through CheckContract objects —
+    anything in the registry has been signed off by CheckParamInspector.
+
+    Attributes:
+        func: The callable. For kind='check', already wrapped with
+              wrap_series_check so it returns CheckResult.
+        kind: 'check' or 'transform'.
+    """
+
+    func: Callable
+    kind: str = "check"
+
+
+def validate_check(
+    name: str,
+    func: Callable,
+    kind: str,
+) -> "CheckContract | None":
+    """Validate a function against the check contract and return a CheckContract.
+
+    This is the single validation gate for all checks and transforms. Uses
+    CheckParamInspector to inspect the function. Returns None (and prints a
+    user-facing warning) if any requirement is not met — invalid functions
+    are never registered.
+
+    Requirements:
+      - kind must be 'check' or 'transform'
+      - function must have a return annotation
+      - kind='check' must return pd.Series[bool]
+      - kind='transform' returning pd.Series[bool] is allowed but warned
+
+    For kind='check', the returned contract's func is already wrapped with
+    wrap_series_check so it produces a CheckResult at runtime.
+
+    :param name: The check name, used in warning messages.
+    :param func: The function to validate.
+    :param kind: The intended kind — 'check' or 'transform'.
+    :return: A CheckContract if valid, None if validation failed.
+    """
+    from proto_pipe.checks.result import wrap_series_check
+
+    if kind not in ("check", "transform"):
+        print(
+            f"[warn] '{name}': kind must be 'check' or 'transform', "
+            f"got '{kind}' — skipping registration."
+        )
+        return None
+
+    inspector = CheckParamInspector(func)
+
+    if inspector._sig.return_annotation is inspect.Parameter.empty:
+        if kind == "check":
+            print(
+                f"[warn] '{name}': no return annotation found — skipping registration. "
+                f"Add '-> pd.Series' to your check function signature."
+            )
+            return None
+        else:
+            print(
+                f"[warn] '{name}': no return annotation found — registering as transform anyway. "
+                f"Consider adding '-> pd.Series' or '-> pd.DataFrame' for clarity."
+            )
+
+    returns_bool = inspector.returns_boolean_series()
+
+    if kind == "check" and not returns_bool:
+        print(
+            f"[warn] '{name}' is kind='check' but its return annotation is not "
+            f"pd.Series[bool] — skipping registration. "
+            f"Fix the annotation or use kind='transform'."
+        )
+        return None
+
+    if kind == "transform" and returns_bool:
+        print(
+            f"[warn] '{name}' is kind='transform' but its return annotation is "
+            f"pd.Series[bool] — this looks like a check. "
+            f"Registering as transform anyway. Did you mean kind='check'?"
+        )
+
+    wrapped_func = wrap_series_check(func) if kind == "check" else func
+    return CheckContract(func=wrapped_func, kind=kind)
 
 
 class CheckParamInspector:
@@ -35,7 +124,6 @@ class CheckParamInspector:
         # Pass 3: unwrap any partial __wrapped__ pointed to
         while isinstance(unwrapped, functools.partial):
             unwrapped = unwrapped.func
-
 
         self.func = unwrapped
         self._sig = inspect.signature(self.func)

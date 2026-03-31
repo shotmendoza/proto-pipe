@@ -69,3 +69,5 @@ paths:
 # with str-typed column params). Each selected column results in a
 # separate check execution. Set to false to always use single-select.
 multi_select_params: true
+
+macros_dir: "macros"

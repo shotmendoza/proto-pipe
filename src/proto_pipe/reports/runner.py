@@ -14,13 +14,85 @@ from proto_pipe.reports.query import _log_run, init_report_runs_table
 
 
 # ---------------------------------------------------------------------------
+# Transform application
+# ---------------------------------------------------------------------------
+def _apply_transforms(
+    transform_names: list[str],
+    check_registry: CheckRegistry,
+    df: pd.DataFrame,
+    table_name: str,
+    pipeline_db: str,
+) -> None:
+    """Apply transforms in order, then write the result back to DuckDB in one pass.
+
+    Each transform receives {"df": working_df} and must return either:
+      - pd.DataFrame — replaces the working DataFrame entirely
+      - pd.Series    — replaces a single column (series.name must match a column)
+
+    On exception, that transform is skipped and the working DataFrame is left
+    unchanged for subsequent transforms. A single DuckDB write happens after
+    all transforms complete.
+
+    :param transform_names: Ordered list of transform names from the registry.
+    :param check_registry:  Registry holding the transform callables.
+    :param df:              The current report DataFrame.
+    :param table_name:      DuckDB table to write the final result back to.
+    :param pipeline_db:     Path to the pipeline DuckDB file.
+    """
+    working_df = df.copy()
+    failed: list[str] = []
+
+    for name in transform_names:
+        try:
+            result = check_registry.run(name, {"df": working_df})
+            if isinstance(result, pd.DataFrame):
+                working_df = result
+            elif isinstance(result, pd.Series):
+                col_name = result.name
+                if col_name and col_name in working_df.columns:
+                    working_df = working_df.copy()
+                    working_df[col_name] = result.values
+                else:
+                    print(
+                        f"  [transform-warn] '{name}' returned a Series with "
+                        f"name={col_name!r} — not found in table columns, skipped"
+                    )
+            else:
+                print(
+                    f"  [transform-warn] '{name}' returned {type(result).__name__} "
+                    f"(expected DataFrame or Series) — skipped"
+                )
+        except Exception as e:
+            print(f"  [transform-fail] '{name}': {e} — skipped, table unchanged")
+            failed.append(name)
+
+    # Single write back — one DuckDB round-trip regardless of how many transforms ran.
+    conn = duckdb.connect(pipeline_db)
+    try:
+        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        conn.execute(f'CREATE TABLE "{table_name}" AS SELECT * FROM working_df')
+    finally:
+        conn.close()
+
+    if failed:
+        print(
+            f"  [transform] {len(transform_names) - len(failed)}/{len(transform_names)} "
+            f"transform(s) applied to '{table_name}'. Failed: {', '.join(failed)}"
+        )
+    else:
+        print(
+            f"  [transform] {len(transform_names)} transform(s) applied to '{table_name}'"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Report execution
 # ---------------------------------------------------------------------------
 def run_report(
-        report_config: dict,
-        check_registry: CheckRegistry,
-        watermark_store: WatermarkStore,
-        pipeline_db: str | None = None,
+    report_config: dict,
+    check_registry: CheckRegistry,
+    watermark_store: WatermarkStore,
+    pipeline_db: str | None = None,
 ) -> dict:
     """Executes a full report process, involving data loading, checks resolution,
     execution of checks, and watermark management for persisted state tracking.
@@ -65,7 +137,13 @@ def run_report(
         return {"report": report_name, "status": "skipped"}
 
     context = {"df": df}
-    check_names = report_config["resolved_checks"]
+
+    # Split resolved names by kind — checks run first, then transforms.
+    all_names = report_config["resolved_checks"]
+    check_names = [n for n in all_names if check_registry.get_kind(n) == "check"]
+    transform_names = [
+        n for n in all_names if check_registry.get_kind(n) == "transform"
+    ]
 
     if pipeline_db:
         results = run_checks_and_flag(
@@ -79,7 +157,13 @@ def run_report(
             pk_col=pk_col,
         )
     else:
-        results = run_checks(check_names, check_registry, context, parallel=parallel_checks)
+        results = run_checks(
+            check_names, check_registry, context, parallel=parallel_checks
+        )
+
+    # Apply transforms after checks so validation runs against unmodified data.
+    if transform_names and pipeline_db:
+        _apply_transforms(transform_names, check_registry, df, table_name, pipeline_db)
 
     # Advance watermark only when every check passed. A failed check means
     # some rows were not fully validated — we want them re-checked next run.

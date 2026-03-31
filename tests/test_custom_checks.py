@@ -36,7 +36,9 @@ class TestCustomCheckDecorator:
             return pd.Series([True])
 
         assert "_test_decorator_check" in _DECORATED_CHECKS
-        assert _DECORATED_CHECKS["_test_decorator_check"] is my_fn
+        func, kind = _DECORATED_CHECKS["_test_decorator_check"]
+        assert func is my_fn
+        assert kind == "check"
 
     def test_decorated_function_still_callable(self):
         @custom_check("_test_callable_check")

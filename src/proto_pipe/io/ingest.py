@@ -930,3 +930,65 @@ def check_null_overwrites(
                 _write_flag(conn, table, changed, pk_value=str(key_val))
                 flagged += 1
     return flagged
+
+
+def reset_report(table_name: str, db_path: str) -> None:
+    """Drop a report table and clear its ingest_log entries so files are re-ingested.
+
+    This is the implementation backing `vp table-reset`. After calling this,
+    the next `vp ingest` run will recreate the table from source files as if
+    it had never been ingested, including re-applying any transforms.
+
+    :param table_name: The DuckDB table name to reset (from sources_config target_table).
+    :param db_path:    Path to the pipeline DuckDB file.
+    """
+    conn = duckdb.connect(db_path)
+    try:
+        if _table_exists(conn, table_name):
+            conn.execute(f'DROP TABLE "{table_name}"')
+            print(f"  [reset] Dropped table '{table_name}'")
+        else:
+            print(f"  [reset] Table '{table_name}' does not exist — nothing to drop")
+
+        # Clear ingest_log so source files are picked up again on next ingest
+        deleted = conn.execute(
+            "DELETE FROM ingest_log WHERE table_name = ? RETURNING filename",
+            [table_name],
+        ).fetchall()
+        if deleted:
+            filenames = [row[0] for row in deleted]
+            print(f"  [reset] Cleared {len(filenames)} ingest_log entry/entries: {', '.join(filenames)}")
+    finally:
+        conn.close()
+
+
+def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
+    """Register all SQL macros found in macros_dir with the DuckDB connection.
+
+    Scans all *.sql files in macros_dir and executes them. Files should contain
+    CREATE OR REPLACE MACRO statements so re-running is idempotent.
+
+    Missing macros_dir produces a warning, not an error — the pipeline continues
+    without macros. Individual file errors are also warned and skipped so one
+    broken macro file doesn't block the whole pipeline.
+
+    :param conn:       An open DuckDB connection to register macros against.
+    :param macros_dir: Path to the directory containing .sql macro files.
+    """
+    p = Path(macros_dir)
+    if not p.exists():
+        print(f"  [warn] macros_dir '{macros_dir}' not found — skipping macro loading")
+        return
+
+    sql_files = sorted(p.glob("*.sql"))
+    if not sql_files:
+        return
+
+    for sql_file in sql_files:
+        try:
+            sql = sql_file.read_text().strip()
+            if sql:
+                conn.execute(sql)
+                print(f"  [macro] Loaded '{sql_file.name}'")
+        except Exception as e:
+            print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")

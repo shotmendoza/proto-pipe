@@ -1,7 +1,7 @@
 from functools import partial
 from typing import Callable
 
-from proto_pipe.checks.result import CheckResult, wrap_series_check
+from proto_pipe.checks.inspector import CheckContract, validate_check
 
 
 # ---------------------------------------------------------------
@@ -30,73 +30,99 @@ class CheckRegistry:
     """
     def __init__(self):
         """The checks / functions that have been registered. Key-Value pair of function name, function"""
-        self._checks: dict[str, Callable] = {}
+        self._checks: dict[str, CheckContract] = {}
+        """Maps name -> CheckContract. Only vetted functions enter the registry"""
 
     def get(self, name: str) -> Callable | None:
         """Return the registered function for a check name, or None if not found."""
-        return self._checks.get(name)
+        entry = self._checks.get(name)
+        return entry.func if entry else None
 
-    def register(self, name: str, func: Callable) -> None:
+    def get_kind(self, name: str) -> str:
+        """Return the kind ('check' or 'transform') for a registered name.
+
+        :raises ValueError: if name is not registered
+        """
+        if name not in self._checks:
+            raise ValueError(f"No check registered under '{name}'")
+        return self._checks[name].kind
+
+    def register(
+            self,
+            name: str,
+            func: Callable,
+            kind: str = "check"
+    ) -> None:
         """Register a function into the registry.
 
         If the function returns pd.Series[bool], it is automatically wrapped
         to return CheckResult. If it has no return annotation or an invalid one,
         registration is rejected with a clear error.
 
+        :param kind: "check" (default) or "transform".
         :param name: name of the function, used as a reference
         :param func: function to be registered.
         :raises ValueError: if the function lacks a valid return annotation
         """
-        from proto_pipe.checks.inspector import CheckParamInspector
-
-        # Get the underlying function if wrapped by partial
-        inspector = CheckParamInspector(func)
-
-        if inspector.returns_boolean_series():
-            self._checks[name] = wrap_series_check(func)
-        else:
-            raise ValueError(
-                f"[error] Check '{name}' was not registered.\n"
-                f"Reason: missing return annotation.\n"
-                f"Fix: add '-> pd.Series' to your function signature.\n"
-                f"Example: def {inspector.func.__name__}(context, col: str) -> pd.Series: ..."
-            )
+        contract = validate_check(name, func, kind)
+        if contract is not None:
+            self._checks[name] = contract
 
     def register_with_params(
             self,
             name: str,
             func: Callable,
+            kind: str = "check",
             **params
     ) -> None:
-        """Bake params into the function at registration time using partial.
-
-        This will allow parameters to be saved, and executed when the function is called and ready.
-
-        :param name: name of the function, used as a reference
-        :param func: function to be registered.
         """
-        self.register(name, partial(func, **params))
+        Registers a function with additional parameters. The registration associates the function
+        with a name and a kind, and partializes the function with the provided parameters.
+
+        :param name: The name to associate with the function upon registration.
+        :type name: str
+        :param func: The function to be registered. It is the callable that will be
+            associated with the given name and kind.
+        :type func: Callable
+        :param kind: Specifies the kind of function being registered. Defaults to "check".
+            This parameter categorizes the type of function.
+        :type kind: str
+        :param params: Arbitrary keyword arguments to be passed to the function as additional
+            parameters during its partialization.
+        :type params: dict
+        :return: This function does not return a value.
+        :rtype: None
+        """
+        self.register(name, partial(func, **params), kind=kind)
 
     def run(
             self,
             name: str,
             context: dict
-    ):
-        """function for running specific checks in the registry
+    ) -> Callable:
+        """Run a specific check or transform in the registry.
 
         :param name: name of the function, used as a reference
         :param context: the parameters to pass to the function
         """
         if name not in self._checks:
             raise ValueError(f"No check registered under '{name}'")
-        return self._checks[name](context)
+        return self._checks[name].func(context)
 
     def available(self) -> list[str]:
-        """returns a list of available checks, that were registered
+        """Return a list of all registered names (checks and transforms).
 
-        :return: available checks
+        :return: available check/transform names
         """
         return list(self._checks.keys())
+
+    def checks_only(self) -> list[str]:
+        """Return names of registered entries with kind='check'."""
+        return [n for n, cr in self._checks.items() if cr.kind == "check"]
+
+    def transforms_only(self) -> list[str]:
+        """Return names of registered entries with kind='transform'."""
+        return [n for n, cr in self._checks.items() if cr.kind == "transform"]
 
 
 class ReportRegistry:

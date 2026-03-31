@@ -97,6 +97,11 @@ vp config set incoming_dir /Volumes/SharedDrive/data/incoming/
 Or edit `pipeline.yaml` directly. All other defaults are fine to leave as-is
 for a first setup.
 
+The `macros_dir` key controls where SQL macro files live. Macros are
+registered at startup and available in any deliverable or view SQL query.
+The default is `macros/` in your project root — create it when you're ready
+to add macros using `vp new-macro <name>`.
+
 ---
 
 ## 5. Define your sources
@@ -211,6 +216,9 @@ reports:
       - template: price_range_check
 ```
 
+Use `vp new-report` to add reports interactively — the wizard handles column
+selection, alias_map setup, and param filling without editing YAML directly.
+
 See `docs/adding_reports.md` for the full key reference and all available
 built-in checks. See `docs/adding_checks.md` to write your own.
 
@@ -236,8 +244,8 @@ Running validation across 1 report(s)...
   Run: vp export-validation  to export a detail + summary report.
 ```
 
-A `✓` means the check returned without raising. A `✗` means it raised an
-exception — the error message tells you why.
+A `✓` means the check passed. A `✗` means it raised an error — the message
+tells you why.
 
 Any rows that fail a check are written to the `validation_flags` table.
 Validation flags are **warnings only** — they do not block a deliverable from
@@ -340,24 +348,29 @@ vp export-validation          # export Detail + Summary sheets
 
 ## Quick reference
 
-| Task | Command |
-|---|---|
-| First-time setup | `vp init` then `vp db-init` |
-| Load new source files | `vp ingest` |
-| Check why a file failed to load | `vp ingest-log --status failed` |
-| Run checks | `vp validate` |
-| Produce a deliverable | `vp pull-report <n>` |
-| Run everything | `vp run-all --deliverable <n>` |
-| Check current paths | `vp config show` |
-| Update a path | `vp config set <key> <value>` |
-| List available checks | `vp checks` |
-| Review ingest conflicts | `vp flagged-summary` |
-| View ingest conflict rows | `vp flagged-list --table <n>` |
-| Export ingest conflicts for correction | `vp export-flagged --table <n>` |
-| Apply corrections | `vp import-corrections <file> --table <n>` |
-| Clear ingest conflicts | `vp flagged-clear --table <n>` |
-| Scan for duplicate conflicts | `vp check-null-overwrites --table <n>` |
-| Export validation flags for review | `vp export-validation` |
-| Refresh views manually | `vp refresh-views` |
-| Review ingest conflict workflow | See `docs/reviewing_flagged_rows.md` |
-| Write a custom check | See `docs/adding_checks.md` |
+| Task                                   | Command                                    |
+|----------------------------------------|--------------------------------------------|
+| First-time setup                       | `vp init` then `vp db-init`                |
+| Load new source files                  | `vp ingest`                                |
+| Check why a file failed to load        | `vp ingest-log --status failed`            |
+| Run checks                             | `vp validate`                              |
+| Produce a deliverable                  | `vp pull-report <n>`                       |
+| Run everything                         | `vp run-all --deliverable <n>`             |
+| Check current paths                    | `vp config show`                           |
+| Update a path                          | `vp config set <key> <value>`              |
+| List available checks                  | `vp checks`                                |
+| Scaffold a new source                  | `vp new-source`                            |
+| Scaffold a new report                  | `vp new-report`                            |
+| Scaffold a new deliverable             | `vp new-deliverable`                       |
+| Scaffold a SQL query file              | `vp new-sql <n>`                           |
+| Scaffold a macro                       | `vp new-macro <n>`                         |
+| Reset a report table                   | `vp table-reset --report <n>`              |
+| Review ingest conflicts                | `vp flagged-summary`                       |
+| View ingest conflict rows              | `vp flagged-list --table <n>`              |
+| Export ingest conflicts for correction | `vp export-flagged --table <n>`            |
+| Apply corrections                      | `vp import-corrections <file> --table <n>` |
+| Clear ingest conflicts                 | `vp flagged-clear --table <n>`             |
+| Export validation flags for review     | `vp export-validation`                     |
+| Refresh views manually                 | `vp refresh-views`                         |
+| Review ingest conflict workflow        | See `docs/reviewing_flagged_rows.md`       |
+| Write a custom check                   | See `docs/adding_checks.md`                |

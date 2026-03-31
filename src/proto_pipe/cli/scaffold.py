@@ -120,35 +120,60 @@ def _sort_views(views: list[dict]) -> list[dict]:
     return [view_map[n] for n in sorted_names if n in view_map]
 
 
+def _format_join_clause(
+        base_alias: str,
+        table: str,
+        alias: str,
+        base_pk: str | None,
+        pk: str | None,
+) -> str:
+    """Build the LEFT JOIN clause for a table."""
+    if base_pk and pk:
+        join_condition = f"{base_alias}.{base_pk} = {alias}.{pk}"
+        if base_pk != pk:
+            return (
+                f"LEFT JOIN {table} {alias}\n"
+                f"    ON {join_condition}  -- update join keys if needed"
+            )
+        return (
+            f"LEFT JOIN {table} {alias}\n"
+            f"    ON {join_condition}"
+        )
+
+    return (
+        f"LEFT JOIN {table} {alias}\n"
+        f"    ON {base_alias}.<key> = {alias}.<key>  -- define join key"
+    )
+
+
 def _build_sql_scaffold(
-    deliverable_name: str,
-    selected_reports: list[str],
-    reports_config: dict,
-    sources_config: dict,
+        deliverable_name: str,
+        selected_reports: list[str],
+        reports_config: dict,
+        sources_config: dict,
 ) -> str:
     """Build a SQL scaffold with JOIN stubs based on selected reports."""
-
-    # Build a map of report name -> table name
-    report_to_table = {
-        r["name"]: r["source"]["table"] for r in reports_config.get("reports", [])
+    report_name_to_table = {
+        report["name"]: report["source"]["table"]
+        for report in reports_config.get("reports", [])
+    }
+    table_to_primary_key = {
+        source["target_table"]: source.get("primary_key")
+        for source in sources_config.get("sources", [])
     }
 
-    # Build a map of table name -> primary key from sources config
-    table_to_pk = {
-        s["target_table"]: s.get("primary_key")
-        for s in sources_config.get("sources", [])
-    }
-
-    tables = [
-        report_to_table.get(r) for r in selected_reports if report_to_table.get(r)
+    selected_tables = [
+        report_name_to_table[report_name]
+        for report_name in selected_reports
+        if report_name in report_name_to_table
     ]
 
-    if not tables:
+    if not selected_tables:
         return f"-- {deliverable_name}.sql\nSELECT *\nFROM <table>;\n"
 
-    base_table = tables[0]
+    base_table = selected_tables[0]
     base_alias = "a"
-    base_pk = table_to_pk.get(base_table)
+    base_pk = table_to_primary_key.get(base_table)
 
     lines = [
         f"-- {deliverable_name}.sql",
@@ -158,43 +183,33 @@ def _build_sql_scaffold(
         f"-- (e.g. _ingested_at) and should be excluded from your SELECT.",
         f"--",
         f"-- Note: if joining on multiple columns, update the JOIN conditions below.",
-        f"",
-        f"SELECT",
+        "",
+        "SELECT",
         f"    {base_alias}.*",
     ]
 
-    join_lines = []
-    for i, table in enumerate(tables[1:], start=2):
-        alias = chr(ord("a") + i - 1)
-        pk = table_to_pk.get(table)
+    join_clauses: list[str] = []
+    for index, table in enumerate(selected_tables[1:], start=2):
+        alias = chr(ord("a") + index - 1)
+        pk = table_to_primary_key.get(table)
+
         lines.append(
             f"    -- , {alias}.<column>  -- add columns from {table} as needed"
         )
-
-        if base_pk and pk:
-            # Try matching primary keys
-            if base_pk == pk:
-                join_lines.append(
-                    f"LEFT JOIN {table} {alias}\n"
-                    f"    ON {base_alias}.{base_pk} = {alias}.{pk}"
-                )
-            else:
-                join_lines.append(
-                    f"LEFT JOIN {table} {alias}\n"
-                    f"    ON {base_alias}.{base_pk} = {alias}.{pk}"
-                    f"  -- update join keys if needed"
-                )
-        else:
-            join_lines.append(
-                f"LEFT JOIN {table} {alias}\n"
-                f"    ON {base_alias}.<key> = {alias}.<key>  -- define join key"
+        join_clauses.append(
+            _format_join_clause(
+                base_alias=base_alias,
+                table=table,
+                alias=alias,
+                base_pk=base_pk,
+                pk=pk,
             )
+        )
 
     lines.append(f"FROM {base_table} {base_alias}")
-    lines.extend(join_lines)
+    lines.extend(join_clauses)
     lines.append(f"WHERE {base_alias}._ingested_at >= '<from_date>'")
     lines.append(f"ORDER BY {base_alias}._ingested_at DESC;")
-
     return "\n".join(lines)
 
 
@@ -370,6 +385,7 @@ def new_source(sources_config, incoming_dir):
 
     # on_duplicate — only ask if primary key is defined
     on_duplicate = None
+    timestamp_col = None
     if primary_key:
         on_duplicate = questionary.select(
             "Duplicate row handling — what should happen when a new file contains"
@@ -481,15 +497,29 @@ def _fill_params(
     multi_select: bool,
     conn: "duckdb.DuckDBPyConnection",
     report_name: str,
-) -> tuple[list[dict], bool]:
-    """Fill params for each selected check.
+    existing_alias_map: list[dict] | None = None,
+) -> tuple[list[dict], list[dict], bool]:
+    """Fill params for each selected check, building alias_map entries for column params.
 
-    Returns (check_entries, go_back).
-    go_back=True means the user pressed ESC — caller should return to check selection.
+    Column params are resolved through alias_map — they are NOT written into the
+    check's params dict. Scalar params are written into the check's params dict.
+
+    Returns (check_entries, alias_map_entries, go_back).
+      check_entries — list of {name, params} dicts. Column params omitted.
+      alias_map_entries — accumulated list of {param, column} dicts.
+      go_back — True if the user pressed ESC.
     """
     from proto_pipe.checks.inspector import CheckParamInspector
 
     table_cols = sorted(_get_table_columns(p_db, table))
+    existing_alias_map = existing_alias_map or []
+
+    # Build {param: [col, ...]} from existing alias_map for suggestions and dedup.
+    alias_param_to_cols: dict[str, list[str]] = {}
+    for entry in existing_alias_map:
+        alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
+
+    accumulated_alias: list[dict] = list(existing_alias_map)
 
     checks_with_params = {
         c: _get_check_params(c, check_registry)
@@ -498,13 +528,11 @@ def _fill_params(
     }
 
     if not checks_with_params:
-        return [{"name": c} for c in selected_checks], False
+        return [{"name": c} for c in selected_checks], accumulated_alias, False
 
-    fill = questionary.confirm(
-        "Some checks have parameters. Fill them in now?"
-    ).ask()
+    fill = questionary.confirm("Some checks have parameters. Fill them in now?").ask()
     if fill is None:
-        return [], True  # ESC → go back
+        return [], [], True  # ESC -> go back
 
     check_entries = []
 
@@ -526,16 +554,28 @@ def _fill_params(
         col_params = inspector.column_params()
         sig = inspect.signature(inspector.func)
 
-        filled_params = {}
-        list_selections = {}  # param_name → list of selections (for length validation)
+        filled_params: dict = {}  # scalar params only
 
         for param_name, default in params.items():
-            suggestions = _get_param_suggestions(conn, check_name, param_name, table_cols)
-            choices = suggestions + [c for c in table_cols if c not in suggestions]
-
-            ann = sig.parameters[param_name].annotation if param_name in sig.parameters else inspect.Parameter.empty
+            ann = (
+                sig.parameters[param_name].annotation
+                if param_name in sig.parameters
+                else inspect.Parameter.empty
+            )
 
             if param_name in col_params:
+                # Suggest from alias_map if populated, else fall back to history/table cols
+                alias_cols = alias_param_to_cols.get(param_name, [])
+                if alias_cols:
+                    choices = alias_cols + [
+                        c for c in table_cols if c not in alias_cols
+                    ]
+                else:
+                    history = _get_param_suggestions(
+                        conn, check_name, param_name, table_cols
+                    )
+                    choices = history + [c for c in table_cols if c not in history]
+
                 if eligible:
                     click.echo(
                         f"  ℹ  Selecting multiple columns will run '{check_name}'"
@@ -546,69 +586,79 @@ def _fill_params(
                         choices=sorted(choices),
                     ).ask()
                     if value is None:
-                        return [], True  # ESC → go back
-                    value = sorted(value)  # alphabetical order
-                    if value:
-                        list_selections[param_name] = value
+                        return [], [], True  # ESC -> go back
+                    value = sorted(value)
+                    for col in value:
+                        if not any(
+                            e["param"] == param_name and e["column"] == col
+                            for e in accumulated_alias
+                        ):
+                            accumulated_alias.append(
+                                {"param": param_name, "column": col}
+                            )
                 else:
                     value = questionary.select(
                         f"{param_name}:",
                         choices=choices,
                     ).ask()
                     if value is None:
-                        return [], True  # ESC → go back
+                        return [], [], True  # ESC -> go back
+                    if not any(
+                        e["param"] == param_name and e["column"] == value
+                        for e in accumulated_alias
+                    ):
+                        accumulated_alias.append({"param": param_name, "column": value})
+
+                # Refresh lookup for subsequent checks in this session
+                alias_param_to_cols[param_name] = [
+                    e["column"] for e in accumulated_alias if e["param"] == param_name
+                ]
+                # Column params are NOT added to filled_params — they live in alias_map
 
             elif _is_list_annotation(ann) or isinstance(default, list):
+                suggestions = _get_param_suggestions(
+                    conn, check_name, param_name, table_cols
+                )
+                choices = suggestions + [c for c in table_cols if c not in suggestions]
                 value = questionary.checkbox(
                     f"{param_name}:",
                     choices=sorted(choices),
                 ).ask()
                 if value is None:
-                    return [], True  # ESC → go back
-                value = sorted(value)
+                    return [], [], True  # ESC -> go back
+                filled_params[param_name] = sorted(value)
 
             else:
+                suggestions = _get_param_suggestions(
+                    conn, check_name, param_name, table_cols
+                )
                 suggested_default = (
-                    suggestions[0] if suggestions
-                    else (str(default) if default is not inspect.Parameter.empty else "")
+                    suggestions[0]
+                    if suggestions
+                    else (
+                        str(default) if default is not inspect.Parameter.empty else ""
+                    )
                 )
                 value = questionary.text(
                     f"{param_name}:",
                     default=suggested_default,
                 ).ask()
                 if value is None:
-                    return [], True  # ESC → go back
+                    return [], [], True  # ESC -> go back
                 if value:
                     try:
                         value = int(value) if "." not in value else float(value)
                     except ValueError:
                         pass
-
-            filled_params[param_name] = value
-
-        # Validate list param lengths — warn and broadcast if needed
-        if len(list_selections) > 1:
-            lengths = {k: len(v) for k, v in list_selections.items()}
-            max_len = max(lengths.values())
-            for k, v in list_selections.items():
-                if len(v) == 1:
-                    # Broadcast single-length silently
-                    filled_params[k] = v * max_len
-                elif len(v) != max_len:
-                    click.echo(
-                        f"\n  [warn] Multi-select params have unequal lengths: "
-                        + ", ".join(f"'{k}': {l}" for k, l in lengths.items())
-                        + f". Using first {min(lengths.values())} combination(s)."
-                    )
-                    min_len = min(lengths.values())
-                    for kk in list_selections:
-                        filled_params[kk] = filled_params[kk][:min_len]
-                    break
+                filled_params[param_name] = value
 
         _record_param_history(conn, check_name, report_name, table, filled_params)
-        check_entries.append({"name": check_name, "params": filled_params})
+        entry = {"name": check_name}
+        if filled_params:
+            entry["params"] = filled_params
+        check_entries.append(entry)
 
-    return check_entries, False
+    return check_entries, accumulated_alias, False
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +700,7 @@ def new_report(reports_config, pipeline_db):
 
     available_checks = check_registry.available()
     if not available_checks:
-        click.echo("\n  [warn] No checks available. Add built-in or custom checks first.")
+        click.echo("\n[warn] No checks available. Add built-in or custom checks first.")
         return
 
     click.echo("\n── New Report ──────────────────────────────")
@@ -745,7 +795,7 @@ def new_report(reports_config, pipeline_db):
 
             # ── Param filling ──────────────────────────────────────────────────
             elif step == STEP_PARAMS:
-                check_entries, go_back = _fill_params(
+                check_entries, alias_map_entries, go_back = _fill_params(
                     selected_checks=state["selected_checks"],
                     table=state["table"],
                     p_db=p_db,
@@ -753,11 +803,13 @@ def new_report(reports_config, pipeline_db):
                     multi_select=multi_select,
                     conn=conn,
                     report_name=state["name"],
+                    existing_alias_map=state.get("alias_map", []),
                 )
                 if go_back:
                     step = STEP_CHECKS
                     continue
                 state["check_entries"] = check_entries
+                state["alias_map"] = alias_map_entries
                 step = STEP_DONE
 
     finally:
@@ -772,8 +824,10 @@ def new_report(reports_config, pipeline_db):
             "table": state["table"],
         },
         "options": {"parallel": False},
-        "checks": state["check_entries"],
     }
+    if state.get("alias_map"):
+        report["alias_map"] = state["alias_map"]
+    report["checks"] = state["check_entries"]
 
     reports = config.get("reports", [])
     if state["name"] in state["existing_names"]:
@@ -1024,8 +1078,334 @@ ORDER BY <date_col> DESC;
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+@click.command("table-reset")
+@click.option("--report", "report_name", default=None, help="Report name to reset.")
+@click.option("--reports-config", default=None, help="Override reports config path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def table_reset(report_name, reports_config, pipeline_db):
+    """Drop a report table and clear its ingest history so it re-ingests cleanly.
+
+    This is a destructive operation. The table is dropped from DuckDB and all
+    ingest_log entries for it are removed. The next `vp ingest` run recreates
+    the table from source files from scratch, including re-applying transforms.
+
+    \b
+    Example:
+      vp table-reset --report us_carrier
+    """
+    from proto_pipe.io.ingest import reset_report
+
+    rep_cfg = config_path_or_override("reports_config", reports_config)
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+
+    config = load_config(rep_cfg)
+    available_reports = [r["name"] for r in config.get("reports", [])]
+
+    if not available_reports:
+        click.echo("  No reports configured. Run: vp new-report")
+        return
+
+    if not report_name:
+        report_name = questionary.select(
+            "Which report do you want to reset?",
+            choices=available_reports,
+        ).ask()
+        if not report_name:
+            click.echo("Cancelled.")
+            return
+
+    if report_name not in available_reports:
+        click.echo(f"  [error] Report '{report_name}' not found in {rep_cfg}")
+        return
+
+    report_cfg = next(r for r in config["reports"] if r["name"] == report_name)
+    table_name = report_cfg["source"]["table"]
+
+    click.echo(f"\n  Report:  {report_name}")
+    click.echo(f"  Table:   {table_name}")
+    click.echo(f"  DB:      {p_db}")
+    click.echo()
+
+    confirmed = questionary.confirm(
+        f"Drop '{table_name}' and clear its ingest history? This cannot be undone.",
+        default=False,
+    ).ask()
+    if not confirmed:
+        click.echo("Cancelled.")
+        return
+
+    reset_report(table_name, p_db)
+    click.echo(f"\n[ok] '{table_name}' reset. Run: vp ingest")
+
+
+@click.command("new-macro")
+@click.argument("name")
+@click.option("--macros-dir", default=None, help="Override macros directory.")
+def new_macro(name: str, macros_dir: str | None):
+    """Scaffold a new SQL macro file in the macros directory.
+
+    Creates a templated .sql file with a CREATE OR REPLACE MACRO stub.
+    Registers macros_dir in pipeline.yaml if not already set.
+
+    \b
+    Example:
+      vp new-macro normalize_transaction_type
+    """
+    from proto_pipe.io.settings import load_settings, DEFAULT_SETTINGS_PATH
+
+    settings = load_settings()
+    macro_dir_path = macros_dir or settings.get("macros_dir", "macros")
+
+    dest_dir = Path(macro_dir_path)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = dest_dir / f"{name}.sql"
+    if dest.exists():
+        click.echo(f"  [skip] {dest} already exists — delete it first to regenerate")
+        return
+
+    template = f"""\
+-- {name}.sql
+-- Macro: describe what this macro does
+--
+-- Macros are registered at pipeline startup and available in all
+-- view and deliverable SQL queries.
+--
+-- Use CREATE OR REPLACE so re-running vp db-init is idempotent.
+
+CREATE OR REPLACE MACRO {name}(val) AS
+    CASE
+        WHEN val = 'old_value' THEN 'new_value'
+        ELSE val
+    END;
+"""
+    dest.write_text(template)
+    click.echo(f"[ok] {dest}")
+
+    # Add macros_dir to pipeline.yaml if not already present
+    pipeline_yaml = DEFAULT_SETTINGS_PATH
+    if pipeline_yaml.exists():
+        doc = load_config(pipeline_yaml)
+        if "macros_dir" not in doc:
+            doc["macros_dir"] = macro_dir_path
+            write_config(doc, pipeline_yaml)
+            click.echo(f"[ok] Added macros_dir = '{macro_dir_path}' to pipeline.yaml")
+
+    click.echo(f"\nNext steps:")
+    click.echo(f"1. Edit {dest} with your macro logic")
+    click.echo(f"2. Run: vp db-init   (re-registers all macros)")
+
+
+def _scan_macros(macros_dir: str) -> list[str]:
+    """Scan macros_dir and return a list of macro signatures found in .sql files.
+
+    Extracts names and param lists from CREATE MACRO statements so the scaffold
+    can show the user what's available to call inline.
+    """
+    import re
+
+    p = Path(macros_dir)
+    if not p.exists():
+        return []
+
+    signatures = []
+    for sql_file in sorted(p.glob("*.sql")):
+        try:
+            text = sql_file.read_text()
+            # Match: CREATE [OR REPLACE] MACRO name(params) AS
+            matches = re.findall(
+                r"CREATE\s+(?:OR\s+REPLACE\s+)?MACRO\s+(\w+\([^)]*\))",
+                text,
+                re.IGNORECASE,
+            )
+            signatures.extend(matches)
+        except Exception:
+            pass
+    return signatures
+
+
+def _build_rich_sql_scaffold(
+        deliverable_name: str,
+        selected_reports: list[str],
+        reports_config: dict,
+        sources_config: dict,
+        macros_dir: str | None = None,
+) -> str:
+    """Build an annotated SQL scaffold with join stubs, macro references,
+    and transform notes.
+
+    Extends _build_sql_scaffold with:
+    - Header notes about transforms already applied to the tables
+    - List of available macros the user can call inline
+    - Inline column comments for joined tables
+    """
+    report_to_table = {
+        report["name"]: report["source"]["table"]
+        for report in reports_config.get("reports", [])
+    }
+    table_to_pk = {
+        source["target_table"]: source.get("primary_key")
+        for source in sources_config.get("sources", [])
+    }
+
+    selected_tables = [
+        report_to_table.get(report_name)
+        for report_name in selected_reports
+        if report_to_table.get(report_name)
+    ]
+
+    if not selected_tables:
+        return f"-- {deliverable_name}.sql\nSELECT *\nFROM <table>;\n"
+
+    macro_signatures = _scan_macros(macros_dir) if macros_dir else []
+    base_table = selected_tables[0]
+    base_alias = "a"
+    base_pk = table_to_pk.get(base_table)
+
+    lines = [
+        f"-- {deliverable_name}.sql",
+        f"-- Deliverable query for: {deliverable_name}",
+        f"--",
+        f"-- The tables below have transforms applied before this query runs.",
+        f"-- Any @custom_check(kind='transform') functions registered for",
+        f"-- these reports are already reflected in the data.",
+        f"--",
+        f"-- Columns prefixed with _ are internal pipeline columns",
+        f"-- (e.g. _ingested_at) — exclude from your SELECT.",
+        f"--",
+        f"-- If joining on multiple columns, update the JOIN conditions below.",
+        "",
+        "SELECT",
+        f"    {base_alias}.*",
+    ]
+
+    if macro_signatures:
+        lines.append("    -- Example macro usage (uncomment and adapt):")
+        for signature in macro_signatures:
+            macro_name = signature.split("(")[0]
+            lines.append(f"    -- , {macro_name}({base_alias}.<col>) AS <col>")
+    else:
+        lines.append(
+            f"    -- , macro_name({base_alias}.<col>) AS <col>"
+            f"  -- call a registered macro inline"
+        )
+
+    lines.append(f"FROM {base_table} {base_alias}")
+
+    for index, table in enumerate(selected_tables[1:], start=2):
+        alias = chr(ord("a") + index - 1)
+        pk = table_to_pk.get(table)
+
+        lines.append(f"    -- , {alias}.<column>  -- add columns from {table} as needed")
+        lines.append(
+            _format_join_clause(
+                base_alias=base_alias,
+                table=table,
+                alias=alias,
+                base_pk=base_pk,
+                pk=pk,
+            )
+        )
+
+    lines.append(f"WHERE {base_alias}._ingested_at >= '<from_date>'")
+    lines.append(f"ORDER BY {base_alias}._ingested_at DESC;")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# vp new-sql
+# ---------------------------------------------------------------------------
+@click.command("new-sql")
+@click.argument("name", required=False)
+@click.option("--reports-config", default=None, help="Override reports config path.")
+@click.option("--sources-config", default=None, help="Override sources config path.")
+@click.option("--sql-dir", default=None, help="Override SQL output directory.")
+def new_sql(name, reports_config, sources_config, sql_dir):
+    """Scaffold an annotated SQL file for a deliverable query.
+
+    Creates a .sql file with join stubs, macro references, and inline comments
+    so you can write your carrier queries faster. Does not modify any config
+    file — wire it up in deliverables_config.yaml when ready.
+
+    \\b
+    Example:
+      vp new-sql carrier_a_sales
+      vp new-sql # interactive — prompts for name and tables
+    """
+    from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.settings import load_settings
+
+    rep_cfg = config_path_or_override("reports_config", reports_config)
+    src_cfg = config_path_or_override("sources_config", sources_config)
+    settings = load_settings()
+
+    sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
+    macros_dir = settings.get("macros_dir", "macros")
+
+    rep_config = load_config(rep_cfg)
+    src_config = load_config(src_cfg)
+
+    available_reports = [r["name"] for r in rep_config.get("reports", [])]
+
+    if not available_reports:
+        click.echo("  No reports configured yet. Run: vp new-report")
+        return
+
+    click.echo("\n── New SQL File ────────────────────────────")
+
+    # Name
+    if not name:
+        name = questionary.text("SQL file name (e.g. carrier_a_sales):").ask()
+        if not name:
+            click.echo("Cancelled.")
+            return
+
+    dest = Path(sql_directory) / f"{name}.sql"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists():
+        overwrite = questionary.confirm(f"{dest} already exists. Overwrite?").ask()
+        if not overwrite:
+            click.echo("Cancelled.")
+            return
+
+    # Select reports / tables
+    selected = questionary.checkbox(
+        "Which reports should this query pull from?",
+        choices=available_reports,
+    ).ask()
+    if not selected:
+        click.echo("Cancelled.")
+        return
+
+    scaffold = _build_rich_sql_scaffold(
+        deliverable_name=name,
+        selected_reports=selected,
+        reports_config=rep_config,
+        sources_config=src_config,
+        macros_dir=macros_dir,
+    )
+
+    dest.write_text(scaffold)
+    click.echo(f"\n[ok] {dest}")
+
+    # Show which macros were found
+    macros = _scan_macros(macros_dir)
+    if macros:
+        click.echo(f"\nMacros available in this query:")
+        for sig in macros:
+            click.echo(f"  {sig}")
+
+    click.echo(f"\nNext steps:")
+    click.echo(f"1. Edit {dest} with your query logic")
+    click.echo(f"2. Reference it in deliverables_config.yaml:\n" f'sql_file: "{dest}"')
+
+
 def scaffold_commands(cli):
     cli.add_command(new_source)
     cli.add_command(new_report)
     cli.add_command(new_deliverable)
     cli.add_command(new_view)
+    cli.add_command(table_reset)
+    cli.add_command(new_macro)
+    cli.add_command(new_sql)

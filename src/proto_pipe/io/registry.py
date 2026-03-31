@@ -10,6 +10,7 @@ import uuid
 from functools import partial
 from os import PathLike
 from pathlib import Path
+from typing import Literal
 
 import click
 import pandas as pd
@@ -88,16 +89,105 @@ def resolve_check(
     return resolved
 
 
+def _build_alias_param_map(alias_map: list[dict]) -> dict[str, list[str]]:
+    """Build {param_name: [col1, col2, ...]} from alias_map list.
+
+    :param alias_map: list of {param, column} dicts from report config
+    :return: dict mapping param name to list of columns
+    """
+    result: dict[str, list[str]] = {}
+    for entry in alias_map:
+        result.setdefault(entry["param"], []).append(entry["column"])
+    return result
+
+
+def _expand_check_with_alias_map(
+    func_name: str,
+    params: dict,
+    alias_param_map: dict[str, list[str]],
+    check_registry: CheckRegistry,
+) -> list[str]:
+    """Expand a check into N registered check names using alias_map column params.
+
+    For each column param that appears in alias_param_map:
+    - If one column: register one check with that column baked in.
+    - If N columns:  register N checks, one per column. Scalar params broadcast.
+
+    Returns list of registered check names (length 1 for single-column or no
+    alias params, length N for multi-column params).
+
+    :param func_name: name of the function in BUILT_IN_CHECKS
+    :param params: scalar params from the check config (column params excluded)
+    :param alias_param_map: {param: [col1, col2, ...]} built from report alias_map
+    :param check_registry: registry to register expanded checks into
+    :return: list of registered check names
+    """
+
+    from proto_pipe.checks.inspector import CheckParamInspector
+
+    func = BUILT_IN_CHECKS.get(func_name)
+    if func is None:
+        raise ValueError(f"No built-in check named '{func_name}'")
+
+    inspector = CheckParamInspector(func)
+    col_params = inspector.column_params()
+
+    # Which of this check's column params are covered by alias_map?
+    alias_col_params = {
+        p: alias_param_map[p] for p in col_params if p in alias_param_map
+    }
+
+    if not alias_col_params:
+        # No alias expansion — register normally with whatever params are given
+        check_name = _build_check_keys(func_name, params)
+        if check_name not in check_registry.available():
+            _register_check(check_name, func_name, params, check_registry)
+        return [check_name]
+
+    # Validate that all column params with multiple entries have the same length.
+    # Single-entry params (len == 1) are exempt — they broadcast silently.
+    lengths = {p: len(cols) for p, cols in alias_col_params.items()}
+    multi_lengths = {p: l for p, l in lengths.items() if l > 1}
+    unique_lengths = set(multi_lengths.values())
+    if len(unique_lengths) > 1:
+        detail = ", ".join(f"'{p}': {l}" for p, l in multi_lengths.items())
+        raise ValueError(
+            f"alias_map column params for '{func_name}' have unequal lengths: {detail}. "
+            f"All multi-column params must have the same number of entries, "
+            f"or exactly one entry (which broadcasts across all runs)."
+        )
+
+    max_len = max(lengths.values())
+    names = []
+    for i in range(max_len):
+        run_params = dict(params)  # start with scalar params
+        for p, cols in alias_col_params.items():
+            # len==1 params broadcast; all others are guaranteed equal length above
+            run_params[p] = cols[i] if i < len(cols) else cols[0]
+        check_name = _build_check_keys(func_name, run_params)
+        if check_name not in check_registry.available():
+            _register_check(check_name, func_name, run_params, check_registry)
+        names.append(check_name)
+    return names
+
+
 def resolve_check_uuid(
         report: dict,
         check_registry: CheckRegistry,
+        alias_param_map: dict[str, list[str]] | None = None,
 ) -> list[str]:
-    """Resolve check UUIDs for a report, expanding list params into multiple registrations.
+    """Resolve check UUIDs for a report, expanding alias_map column params.
 
-    When a param value is a list (e.g. col: [price, cost]), one check registration
-    is created per column combination. Single-length lists are broadcast to match
-    the longest list. Scalar params stay fixed across all combinations.
+    For checks whose column params appear in alias_param_map, registers N
+    expanded versions (one per column) and returns all their names.
+
+    :param report: Report config dict with a "checks" list.
+    :param check_registry: Registry to register resolved checks into.
+    :param alias_param_map: {param: [col1, col2]} built from report alias_map.
+                            Pass None or {} if report has no alias_map.
+    :return: List of resolved check names.
     """
+    alias_param_map = alias_param_map or {}
     resolved_check_names: list[str] = []
 
     for check in report.get("checks", []):
@@ -109,88 +199,70 @@ def resolve_check_uuid(
         func_name = check["name"]
         params = check.get("params", {}) or {}
 
-        list_params = {k: v for k, v in params.items() if isinstance(v, list)}
-        scalar_params = {k: v for k, v in params.items() if not isinstance(v, list)}
-
-        if not list_params:
-            # Single registration — original behaviour
+        if alias_param_map:
+            expanded = _expand_check_with_alias_map(
+                func_name, params, alias_param_map, check_registry
+            )
+            resolved_check_names.extend(expanded)
+        else:
             check_name = _build_check_keys(func_name, params)
             if check_name not in check_registry.available():
                 _register_check(check_name, func_name, params, check_registry)
-            resolved_check_names.append(check_name)
-            continue
-
-        # Expand list params into multiple registrations
-        lengths = {k: len(v) for k, v in list_params.items()}
-        max_len = max(lengths.values())
-
-        # Broadcast single-length lists; truncate incompatible ones
-        expanded = {}
-        for k, v in list_params.items():
-            if len(v) == 1:
-                expanded[k] = v * max_len
-            elif len(v) == max_len:
-                expanded[k] = v
-            else:
-                # Incompatible — truncate to shortest
-                min_len = min(lengths.values())
-                click.echo(
-                    f"  [warn] Check '{func_name}' has list params with unequal lengths"
-                    f" {lengths}. Using first {min_len} combination(s)."
-                )
-                expanded[k] = v[:min_len]
-                max_len = min_len
-
-        for i in range(max_len):
-            combo_params = {**scalar_params, **{k: v[i] for k, v in expanded.items()}}
-            check_name = _build_check_keys(func_name, combo_params)
-            if check_name not in check_registry.available():
-                _register_check(check_name, func_name, combo_params, check_registry)
             resolved_check_names.append(check_name)
 
     return resolved_check_names
 
 
-def _register_check(name, func_name, params, check_registry):
-    import inspect
-    import functools
+def _register_check(
+        name: str,
+        func_name: str,
+        params: dict,
+        check_registry: CheckRegistry,
+        kind: Literal["check", "transform"] = "check",
+) -> None:
+    """Register a check function into the check registry.
+
+    Looks up func_name in BUILT_IN_CHECKS and registers it, optionally
+    baking in params via partial.
+
+    :param name:           Unique key for the registry.
+    :param func_name:      Name of the function in BUILT_IN_CHECKS.
+    :param params:         Params to bake in via partial, if any.
+    :param check_registry: The registry to register into.
+    :param kind:           "check" or "transform".
+    :raises ValueError: If func_name is not in BUILT_IN_CHECKS.
+    """
+    import inspect as _inspect
 
     func = BUILT_IN_CHECKS.get(func_name)
     if func is None:
         raise ValueError(f"No built-in check named '{func_name}'")
 
-    # Get the original function's signature to find defaults
-    unwrapped = func
-    while isinstance(unwrapped, functools.partial):
-        unwrapped = unwrapped.func
-    sig = inspect.signature(inspect.unwrap(unwrapped))
-
-    filled = {}
-    for k, v in (params or {}).items():
-        if v is not None:
-            filled[k] = v
-            continue
-
-        param = sig.parameters.get(k)
-        if param and param.default is not inspect.Parameter.empty:
-            # None given but function has a default — use it and warn
-            filled[k] = param.default
-            click.echo(
-                f"  [warn] '{func_name}' param '{k}' is None in config"
-                f" — using default value: {param.default!r}"
-            )
-        else:
-            # None given and no default — skip and warn
-            click.echo(
-                f"  [warn] '{func_name}' param '{k}' is None in config"
-                f" and has no default — param skipped, check may fail at runtime."
-                f" Edit reports_config.yaml to set a value."
-            )
+    filled: dict = {}
+    if params:
+        sig = _inspect.signature(func)
+        for k, v in params.items():
+            if v is None:
+                param = sig.parameters.get(k)
+                if param and param.default is not _inspect.Parameter.empty:
+                    filled[k] = param.default
+                    print(
+                        f"[warn] '{func_name}' param '{k}' is None in config"
+                        f" — using default value: {param.default!r}"
+                    )
+                else:
+                    print(
+                        f"[warn] '{func_name}' param '{k}' is None in config"
+                        f" and has no default — param skipped, check may fail"
+                        f" at runtime. Edit reports_config.yaml to set a value."
+                    )
+            else:
+                filled[k] = v
 
     if filled:
-        check_registry.register(name, partial(func, **filled))
+        check_registry.register(name, partial(func, **filled), kind=kind)
     else:
-        check_registry.register(name, func)
+        check_registry.register(name, func, kind=kind)
 
 
 def register_from_config(
@@ -225,15 +297,18 @@ def register_from_config(
 
     # Register reports and any inline checks they define
     for report in config.get("reports", []):
-        resolved_check_names = resolve_check_uuid(report, check_registry)
+        alias_map = report.get("alias_map", [])
+        alias_param_map = _build_alias_param_map(alias_map) if alias_map else {}
 
         # Store the report with its resolved check name list
+        resolved_check_names = resolve_check_uuid(report, check_registry, alias_param_map)
+
         report_registry.register(
             report["name"],
             {
                 **report,
                 "resolved_checks": resolved_check_names,
-            }
+            },
         )
 
 
@@ -267,7 +342,7 @@ def load_custom_checks_module(
     if not path.exists():
         print(
             f"\n[error] custom_checks_module: '{module_path}' not found.\n"
-            f"        Check the path in pipeline.yaml and try again."
+            f"Check the path in pipeline.yaml and try again."
         )
         sys.exit(1)
 
@@ -279,19 +354,19 @@ def load_custom_checks_module(
     except Exception as e:
         print(
             f"\n[error] Failed to import custom_checks_module '{module_path}':\n"
-            f"        {e}"
+            f"{e}"
         )
         sys.exit(1)
 
     if not _DECORATED_CHECKS:
         print(
-            f"  [warn] Loaded '{module_path}' but found no @custom_check decorated functions."
+            f"[warn] Loaded '{module_path}' but found no @custom_check decorated functions."
         )
         return
 
-    for name, func in _DECORATED_CHECKS.items():
-        register_custom_check(name, func, check_registry)
-        print(f"  [custom_check] Registered '{name}' from '{module_path}'")
+    for name, (func, kind) in _DECORATED_CHECKS.items():
+        register_custom_check(name, func, check_registry, kind=kind)
+        print(f"[custom_check] Registered '{name}' (kind={kind}) from '{module_path}'")
 
 
 # ---------------------------------------------------------------------------

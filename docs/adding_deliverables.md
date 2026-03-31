@@ -6,10 +6,10 @@ They live entirely in `config/deliverables_config.yaml`.
 
 Each report inside a deliverable has two query paths:
 
-| Path | When to use |
-|---|---|
+| Path       | When to use                                                      |
+|------------|------------------------------------------------------------------|
 | `sql_file` | Joins across tables, carrier-specific columns, custom date logic |
-| `filters` | Simple single-table queries with date and field filters |
+| `filters`  | Simple single-table queries with date and field filters          |
 
 ---
 
@@ -82,9 +82,64 @@ is present it takes precedence and `filters` is ignored entirely.
 
 ---
 
-## SQL files
+## Scaffolding a SQL file
 
-SQL files contain a single `SELECT` statement executed directly against
+Use `vp new-sql` to scaffold an annotated SQL file for any combination of
+reports without creating a new deliverable entry. This is the fastest way
+to start writing a carrier-specific query.
+
+```bash
+vp new-sql carrier_a_sales
+```
+
+The wizard asks which reports to include, then generates a `.sql` file with:
+
+- Notes about which transforms are already applied to each table
+- A list of available macros you can call inline
+- A `LEFT JOIN` stub pre-filled with primary keys where they can be resolved
+- Inline comments on how to add columns from joined tables
+- A `WHERE _ingested_at >= '<from_date>'` filter to edit as needed
+
+Example output for a two-table query with a macro registered:
+
+```sql
+-- carrier_a_sales.sql
+-- Deliverable query for: carrier_a_sales
+--
+-- The tables below have transforms applied before this query runs.
+-- Any @custom_check(kind='transform') functions registered for
+-- these reports are already reflected in the data.
+--
+-- Available macros (call inline in your SELECT):
+--   normalize_transaction_type(val)
+--
+-- Columns prefixed with _ are internal pipeline columns
+-- (e.g. _ingested_at) — exclude from your SELECT.
+
+SELECT
+    a.*
+    -- Example macro usage (uncomment and adapt):
+    -- , normalize_transaction_type(a.<col>) AS <col>
+    -- , b.<column>  -- add columns from inventory as needed
+FROM sales a
+LEFT JOIN inventory b
+    ON a.order_id = b.order_id
+WHERE a._ingested_at >= '<from_date>'
+ORDER BY a._ingested_at DESC;
+```
+
+Once you've edited the file, wire it up in `deliverables_config.yaml`:
+
+```yaml
+reports:
+  - name: "carrier_a_sales"
+    sheet: "Sales"
+    sql_file: "sql/carrier_a_sales.sql"
+```
+
+---
+
+
 the DuckDB connection. They can join any tables that exist in `pipeline.db`,
 use any DuckDB SQL features, and handle date logic natively.
 
@@ -119,11 +174,66 @@ what data the deliverable will produce.
 
 ---
 
+## SQL macros
+
+Macros are named SQL expressions registered at pipeline startup and available
+in any SQL file — views, deliverables, or anywhere in DuckDB.
+
+Use macros for transformations that are shared across multiple carriers,
+such as normalising transaction types, standardising region codes, or
+applying business logic that would otherwise be duplicated across SQL files.
+
+**Scaffold a new macro:**
+
+```bash
+vp new-macro normalize_transaction_type
+```
+
+This creates a template file in your `macros/` directory and registers the
+directory in `pipeline.yaml`:
+
+```sql
+-- macros/normalize_transaction_type.sql
+CREATE OR REPLACE MACRO normalize_transaction_type(val) AS
+    CASE
+        WHEN val = 'Issuance' THEN 'Reinstatement'
+        ELSE val
+    END;
+```
+
+Edit the file with your logic. Macros are loaded at startup, so after
+editing run `vp db-init` to re-register them.
+
+**Use the macro in any SQL file:**
+
+```sql
+-- config/sql/carrier_a_sales.sql
+SELECT
+    order_id,
+    normalize_transaction_type(transaction_type) AS transaction_type,
+    price
+FROM sales
+WHERE order_date <= current_date
+```
+
+The same macro works in carrier B, C, or any view — write it once, use it
+everywhere.
+
+**Rules:**
+- Use `CREATE OR REPLACE MACRO` so re-running `vp db-init` is idempotent.
+- Macros are loaded in filename order. If one macro references another,
+  name the dependency so it sorts first.
+- The `macros_dir` path in `pipeline.yaml` defaults to `macros/`.
+
+---
+
 ## Shared views
 
 If multiple deliverables need the same transformation logic — standardising
 region codes, zeroing out negatives, joining a lookup table — define it once
-as a view in `config/views_config.yaml` and reference it by name in any SQL file.
+as a view in `config/views_config.yaml` and reference it by name in any SQL
+file. Views produce intermediate tables; macros produce reusable expressions.
+Use views for table-level transformations and macros for column-level ones.
 
 ```yaml
 # config/views_config.yaml
@@ -136,11 +246,6 @@ views:
 -- config/sql/views/clean_sales.sql
 SELECT
     order_id,
-    CASE
-        WHEN region = 'Europe' THEN 'EMEA'
-        WHEN region = 'Asia'   THEN 'APAC'
-        ELSE region
-    END AS region,
     GREATEST(price, 0) AS price,
     order_date
 FROM sales
@@ -150,31 +255,20 @@ Any deliverable SQL file can then reference the view like a table:
 
 ```sql
 -- config/sql/carrier_a_sales.sql
-SELECT order_id, price, region
-FROM clean_sales                   -- transformation already applied
-WHERE region = 'EMEA'
-```
-
-Views can also join other views:
-
-```sql
--- config/sql/carrier_a_sales.sql
-SELECT cs.order_id, cs.price, cb.commission_rate
-FROM clean_sales cs
-JOIN carrier_base cb ON cs.order_id = cb.order_id
-WHERE cs.region = 'EMEA'
+SELECT order_id, price
+FROM clean_sales
+WHERE order_date >= date_trunc('month', current_date)
 ```
 
 **Creation order matters** — if a view references another view, list the
 dependency first in `views_config.yaml`.
 
 Views are created by `vp db-init` and refreshed by `vp refresh-views`.
-They are also refreshed automatically during `vp run-all` before deliverables
-are produced, so changes to a view SQL file are always picked up.
+They are also refreshed automatically during `vp run-all`.
 
 ```bash
-vp refresh-views                              # manually refresh after editing a view SQL file
-vp run-all --deliverable carrier_a_pack       # auto-refreshes views before writing output
+vp refresh-views
+vp run-all --deliverable carrier_a_pack
 ```
 
 ---
@@ -199,16 +293,7 @@ still work and pass through unchanged.
 | `today-Nd` | N days ago (e.g. `today-30d`) |
 | `today+Nd` | N days from now (e.g. `today+7d`) |
 
-Omitting `from:` or `to:` means no lower or upper bound — all rows on
-that end are included. Omitting both returns all rows.
-
-```yaml
-date_filters:
-  - col: "order_date"
-    to: "end_of_last_month"     # inception to end of last month
-  - col: "updated_at"
-    to: "end_of_last_month"     # same token, second date column
-```
+Omitting `from:` or `to:` means no lower or upper bound.
 
 ---
 
@@ -247,35 +332,11 @@ Produces: `sales_report_2026-03-26.csv`.
 
 ---
 
-## CLI date overrides
-
-CLI date flags only apply to filter-based reports. They are ignored for
-any report that has a `sql_file` — date logic for those lives in the SQL.
-
-```bash
-# Override date range for filter-based reports
-vp pull-report my_export \
-  --date-col order_date \
-  --date-from 2026-01-01 \
-  --date-to   2026-03-31
-```
-
----
-
-## Running a deliverable
-
-```bash
-vp pull-report my_export
-vp run-all --deliverable my_export
-```
-
----
-
 ## Carrier-specific pattern
 
 Each carrier gets its own deliverable pointing to its own SQL file.
-Shared reports (e.g. inventory) can still use filters and be included
-in multiple deliverables without duplication.
+Shared reports can still be included in multiple deliverables without
+duplication.
 
 ```yaml
 deliverables:
@@ -288,7 +349,7 @@ deliverables:
         sql_file: "config/sql/carrier_a_sales.sql"   # carrier-specific join + columns
       - name: "inventory_validation"
         sheet: "Inventory"
-        filters:                                      # shared report, filter path
+        filters:
           date_filters:
             - col: "updated_at"
               to: "end_of_last_month"
@@ -326,9 +387,6 @@ Columns: `deliverable_name`, `report_name`, `filename`, `output_dir`,
 ## Notes
 
 - `name` must be unique across all deliverables.
-- Each report `name` must match a name in `reports_config.yaml` when
-  using the filter path. For `sql_file` reports this lookup is skipped —
-  the name is only used for sheet naming and logging.
 - Output files are never auto-deleted. Re-running on the same date
   overwrites the file.
 - `output_dir` on the deliverable overrides `pipeline.yaml`. If neither

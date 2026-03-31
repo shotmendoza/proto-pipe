@@ -78,9 +78,17 @@ vp update-table sales data/incoming/sales_2026-03.csv
 
 ## 3. Adding a new source, report, or deliverable
 
-All three are config-only — no code changes, no reinstall.
+All three are config-only — no code changes, no reinstall. Use the
+interactive wizards to avoid editing YAML directly:
 
-**New source** (`config/sources_config.yaml`):
+```bash
+vp new-source        # define a new data source
+vp new-report        # define a new report with checks and alias_map
+vp new-deliverable   # define a new output file
+```
+
+Or edit configs manually. **New source** (`config/sources_config.yaml`):
+
 ```yaml
 sources:
   - name: "orders"
@@ -89,9 +97,11 @@ sources:
     timestamp_col: "updated_at"
     primary_key: "order_id"
 ```
+
 Then `vp ingest` — the table is created automatically on first load.
 
 **New report** (`config/reports_config.yaml`):
+
 ```yaml
 reports:
   - name: "orders_validation"
@@ -105,9 +115,11 @@ reports:
       - name: range_check
         params: {col: "total", min_val: 0, max_val: 100000}
 ```
+
 Then `vp validate` — picks it up automatically.
 
 **New deliverable** (`config/deliverables_config.yaml`):
+
 ```yaml
 deliverables:
   - name: "orders_pack"
@@ -121,35 +133,34 @@ deliverables:
             - col: "updated_at"
               to: "end_of_last_month"
 ```
+
 Then `vp pull-report orders_pack`.
 
 ---
 
 ## 4. Writing a custom check
 
-Checks are functions that receive a DataFrame and return a dict. Use the
-`@custom_check` decorator and point the pipeline at your module in `pipeline.yaml`.
+Checks return `pd.Series[bool]` — `True` where a row passes, `False` where
+it fails. Use the `@custom_check` decorator and point the pipeline at your
+module in `pipeline.yaml`.
 
 ```python
 # my_checks.py
 
-from validation_pipeline import custom_check
+import pandas as pd
+from proto_pipe.checks.helpers import custom_check
+
 
 @custom_check("no_negatives")
-def check_no_negatives(context, col="price"):
+def check_no_negatives(context: dict, col: str = "price") -> pd.Series:
     df = context["df"]
-    # Return a boolean mask — True where the row fails.
-    # Each failing row gets its own entry in validation_flags.
-    return {"mask": df[col] < 0}
+    return df[col] >= 0   # True = passes, False = flagged
+
 
 @custom_check("margin_check")
-def check_margin(context, col="margin", threshold=0.2):
+def check_margin(context: dict, col: str = "margin", threshold: float = 0.2) -> pd.Series:
     df = context["df"]
-    below = df[df[col] < threshold]
-    if not below.empty:
-        # Raising marks the check as failed and writes a summary flag.
-        raise ValueError(f"{len(below)} rows below margin threshold {threshold}")
-    return {"violations": 0}
+    return df[col] >= threshold
 ```
 
 Register the module in `pipeline.yaml`:
@@ -167,20 +178,23 @@ checks:
       col: "price"
   - name: margin_check
     params:
-      col: "margin"
       threshold: 0.15
+      # col resolved from alias_map if defined on the report
 ```
 
-**Return shapes and what they produce:**
+**Transforms** — use `kind="transform"` to modify column values rather than
+flag rows. Transforms run after all checks and write back to the report table.
 
-| Return | Flags written |
-|---|---|
-| `{"mask": pd.Series}` | One flag per row where mask is `True` |
-| `{"mask": pd.Series, "flag_when": False}` | One flag per row where mask is `False` |
-| Raises an exception | One summary flag with the error message |
-| Any other dict | One summary flag with an aggregate description |
+```python
+@custom_check("normalize_transaction_type", kind="transform")
+def transform_tx_type(context: dict, col: str = "transaction_type") -> pd.Series:
+    result = context["df"][col].replace({"Issuance": "Reinstatement"})
+    result.name = col
+    return result
+```
 
-See `docs/adding_checks.md` for the full reference.
+See `docs/adding_checks.md` for the full reference including alias_map and
+SQL macros.
 
 ---
 
@@ -204,8 +218,6 @@ WHERE s.order_date <= (date_trunc('month', current_date) - INTERVAL '1 day')
   AND c.region = 'EMEA'
 ```
 
-All DuckDB SQL is valid here. Date logic lives in the SQL — no config tokens needed.
-
 **Step 2 — Reference the file in `deliverables_config.yaml`:**
 
 ```yaml
@@ -219,74 +231,72 @@ deliverables:
         sql_file: "config/sql/carrier_a_sales.sql"
 ```
 
-When `sql_file` is set, the filter system is bypassed entirely — the SQL
-runs as-is against the DuckDB connection.
+**Shared views** — define table-level transformations once in
+`views_config.yaml` and reference them by name in any SQL file.
 
-**Shared views** — if multiple SQL files need the same transformation,
-define it once in `views_config.yaml` and reference it by name:
+**SQL macros** — define reusable column-level expressions with `vp new-macro`
+and call them in any SQL file:
 
-```yaml
-# config/views_config.yaml
-views:
-  - name: "clean_sales"
-    sql_file: "config/sql/views/clean_sales.sql"
+```bash
+vp new-macro normalize_transaction_type
+# edit macros/normalize_transaction_type.sql
 ```
 
 ```sql
--- config/sql/carrier_a_sales.sql
-SELECT order_id, price, region
-FROM clean_sales          -- transformation already applied
-WHERE region = 'EMEA'
+SELECT normalize_transaction_type(transaction_type) AS transaction_type
+FROM sales
 ```
 
-After editing a view SQL file, refresh it:
-
-```bash
-vp refresh-views
-```
+After adding or editing a macro, run `vp db-init` to re-register it.
 
 See `docs/adding_deliverables.md` for useful DuckDB date expressions and the
 full key reference.
 
 ---
 
+## Quick reference
 
 **Setup & config**
 
-| Task | Command |
-|---|---|
-| Check path settings | `vp config show` |
-| Update a path | `vp config set <key> <value>` |
-| List available checks | `vp checks` |
+| Task                       | Command                       |
+|----------------------------|-------------------------------|
+| Check path settings        | `vp config show`              |
+| Update a path              | `vp config set <key> <value>` |
+| List available checks      | `vp checks`                   |
+| Scaffold a new source      | `vp new-source`               |
+| Scaffold a new report      | `vp new-report`               |
+| Scaffold a new deliverable | `vp new-deliverable`          |
+| Scaffold a SQL query file  | `vp new-sql <n>`              |
+| Scaffold a macro           | `vp new-macro <n>`            |
+| Reset a report table       | `vp table-reset --report <n>` |
 
 **Ingest**
 
-| Task | Command |
-|---|---|
-| Load source files | `vp ingest` |
-| Load a specific file | `vp update-table <table> <file>` |
-| Check failed ingests | `vp ingest-log --status failed` |
-| See ingest conflicts | `vp flagged-summary` |
-| View conflict rows | `vp flagged-list --table <n>` |
-| Export conflicts for correction | `vp export-flagged --table <n>` |
-| Apply corrections | `vp import-corrections <file> --table <n>` |
-| Clear conflicts without correcting | `vp flagged-clear --table <n>` |
-| Scan for conflicts manually | `vp check-null-overwrites --table <n>` |
+| Task                               | Command                                    |
+|------------------------------------|--------------------------------------------|
+| Load source files                  | `vp ingest`                                |
+| Load a specific file               | `vp update-table <table> <file>`           |
+| Check failed ingests               | `vp ingest-log --status failed`            |
+| See ingest conflicts               | `vp flagged-summary`                       |
+| View conflict rows                 | `vp flagged-list --table <n>`              |
+| Export conflicts for correction    | `vp export-flagged --table <n>`            |
+| Apply corrections                  | `vp import-corrections <file> --table <n>` |
+| Clear conflicts without correcting | `vp flagged-clear --table <n>`             |
 
 **Validation**
 
-| Task | Command |
-|---|---|
-| Run checks | `vp validate` |
-| Export validation flags | `vp export-validation` |
+| Task                        | Command                             |
+|-----------------------------|-------------------------------------|
+| Run checks                  | `vp validate`                       |
+| Export validation flags     | `vp export-validation`              |
 | Export flags for one report | `vp export-validation --report <n>` |
-| Apply corrections | `vp import-corrections <file> --table <n>` |
 
 **Deliverables**
 
-| Task | Command |
-|---|---|
-| Produce a deliverable | `vp pull-report <n>` |
-| Refresh views manually | `vp refresh-views` |
-| Run everything | `vp run-all --deliverable <n>` |
+| Task                                | Command                                         |
+|-------------------------------------|-------------------------------------------------|
+| Produce a deliverable               | `vp pull-report <n>`                            |
+| Refresh views manually              | `vp refresh-views`                              |
+| Re-register macros                  | `vp db-init`                                    |
+| Run everything                      | `vp run-all --deliverable <n>`                  |
 | Run everything, skip conflict block | `vp run-all --deliverable <n> --ignore-flagged` |

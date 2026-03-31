@@ -1,49 +1,49 @@
-templates:
-  standard_null_check:
-    name: null_check
-
-  price_range_check:
-    name: range_check
-    params:
-      col: "price"
-      min_val: 0
-      max_val: 500
-
-  standard_schema:
-    name: schema_check
-    params:
-      expected_cols:
-        - order_id
-        - price
-        - quantity
-        - customer_id
-
-reports:
-  - name: "daily_sales_validation"
-    source:
-      type: duckdb
-      path: "data/sales.db"
-      table: "sales"
-      timestamp_col: "updated_at"
-    options:
-      parallel: true
-    checks:
-      - template: standard_null_check
-      - template: price_range_check
-      - template: standard_schema
-
-  - name: "inventory_validation"
-    source:
-      type: duckdb
-      path: "data/inventory.db"
-      table: "inventory"
-      timestamp_col: "updated_at"
-    options:
-      parallel: false
-    checks:
-      - template: standard_null_check
-      - name: range_check
-        params:
-          col: "stock_level"
-          min_val: 0
-          max_val: 10000
+#templates:
+#  standard_null_check:
+#    name: null_check
+#
+#  price_range_check:
+#    name: range_check
+#    params:
+#      col: "price"
+#      min_val: 0
+#      max_val: 500
+#
+#  standard_schema:
+#    name: schema_check
+#    params:
+#      expected_cols:
+#        - order_id
+#        - price
+#        - quantity
+#        - customer_id
+#
+#reports:
+#  - name: "daily_sales_validation"
+#    source:
+#      type: duckdb
+#      path: "data/sales.db"
+#      table: "sales"
+#      timestamp_col: "updated_at"
+#    options:
+#      parallel: true
+#    checks:
+#      - template: standard_null_check
+#      - template: price_range_check
+#      - template: standard_schema
+#
+#  - name: "inventory_validation"
+#    source:
+#      type: duckdb
+#      path: "data/inventory.db"
+#      table: "inventory"
+#      timestamp_col: "updated_at"
+#    options:
+#      parallel: false
+#    checks:
+#      - template: standard_null_check
+#      - name: range_check
+#        params:
+#          col: "stock_level"
+#          min_val: 0
+#          max_val: 10000
