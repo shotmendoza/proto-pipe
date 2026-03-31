@@ -63,7 +63,7 @@ def init(output: str, force: bool):
     click.echo("\nNext steps:")
     click.echo("1. Edit `pipeline.yaml` to confirm your paths")
     click.echo("2. Run: `vp db-init`")
-    click.echo("Additionally, you can ru n`vp docs` to read through the docs.")
+    click.echo("Additionally, you can run `vp docs` to read through the docs.")
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def db_init(pipeline_db, watermark_db, migrate):
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     w_db = config_path_or_override("watermark_db", watermark_db)
 
-    click.echo(f"\nInitialising pipeline DB: {p_db}")
+    click.echo(f"\nInitializing pipeline DB: {p_db}")
     init_db(p_db)
 
     # [Create Infrastructure Tables] Create the report run and flagged tables
@@ -144,7 +144,7 @@ def db_init(pipeline_db, watermark_db, migrate):
     conn.close()
 
     # [Create Watermark Table] Create the watermark table for most recents
-    click.echo(f"\nInitialising watermark DB: {w_db}")
+    click.echo(f"\nInitializing watermark DB: {w_db}")
     Path(w_db).parent.mkdir(parents=True, exist_ok=True)
     WatermarkStore(w_db)
     click.echo("[ok] Watermark table ready")

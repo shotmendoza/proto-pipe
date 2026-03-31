@@ -253,4 +253,5 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
 # ---------------------------------------------------------------------------
 def data_commands(cli):
     cli.add_command(ingest)
+    cli.add_command(ingest_log)
     cli.add_command(update_table)

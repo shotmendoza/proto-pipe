@@ -10,3 +10,10 @@ PIPELINE_TABLES: frozenset[str] = frozenset({
     "check_params_history",
     "check_registry_metadata",
 })
+
+NUMERIC_DUCKDB_TYPES = frozenset({
+    "DOUBLE", "FLOAT", "REAL",
+    "BIGINT", "INTEGER", "INT", "SMALLINT", "TINYINT", "HUGEINT",
+    "DECIMAL", "NUMERIC",
+})
+"""DuckDB numeric column types that may conflict with mixed-type incoming data."""

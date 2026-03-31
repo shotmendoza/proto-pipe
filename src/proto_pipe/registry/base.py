@@ -29,9 +29,12 @@ class CheckRegistry:
 
     """
     def __init__(self):
-        """The checks / functions that have been registered. Key-Value pair of function name, function"""
         self._checks: dict[str, CheckContract] = {}
         """Maps name -> CheckContract. Only vetted functions enter the registry"""
+
+        self._bad_checks: dict[str, str] = {}
+        """Maps name -> Failure Reason. Checks that failed validate_check land here. 
+        Populated whenever registration is attempted and fails. Queryable via failed()."""
 
     def get(self, name: str) -> Callable | None:
         """Return the registered function for a check name, or None if not found."""
@@ -47,6 +50,13 @@ class CheckRegistry:
             raise ValueError(f"No check registered under '{name}'")
         return self._checks[name].kind
 
+    def failed(self) -> dict[str, str]:
+        """Return {name: failure_reason} for all checks that failed registration.
+
+        Use vp check-func for a structured view of these failures with fix suggestions.
+        """
+        return dict(self._bad_checks)
+
     def register(
             self,
             name: str,
@@ -55,18 +65,19 @@ class CheckRegistry:
     ) -> None:
         """Register a function into the registry.
 
-        If the function returns pd.Series[bool], it is automatically wrapped
-        to return CheckResult. If it has no return annotation or an invalid one,
-        registration is rejected with a clear error.
+        Routes the CheckAudit returned by validate_check: passed audits go to
+        _checks, failed audits go to _bad_checks. Either way the outcome is
+        stored — run vp check-func to see the full picture.
 
-        :param kind: "check" (default) or "transform".
-        :param name: name of the function, used as a reference
+        :param name: name of the function, used as a reference.
         :param func: function to be registered.
-        :raises ValueError: if the function lacks a valid return annotation
+        :param kind: 'check' (default) or 'transform'.
         """
-        contract = validate_check(name, func, kind)
-        if contract is not None:
-            self._checks[name] = contract
+        audit = validate_check(name, func, kind)
+        if audit.passed:
+            self._checks[name] = audit.contract
+            return
+        self._bad_checks[name] = audit.failure_reason
 
     def register_with_params(
             self,

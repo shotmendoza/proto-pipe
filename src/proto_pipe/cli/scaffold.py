@@ -5,16 +5,65 @@ import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from graphlib import TopologicalSorter, CycleError
+from importlib.util import spec_from_file_location, module_from_spec
 from pathlib import Path
+from typing import Iterable
 
 import click
 import duckdb
 import questionary
 
 from proto_pipe.cli.helpers import config_path_or_override
+from proto_pipe.constants import PIPELINE_TABLES
 from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry
-from proto_pipe.constants import PIPELINE_TABLES
+
+
+def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
+    """Remove files already successfully logged in ingest_log.
+
+    Files with status='ok' are hidden from new-source — they're already
+    accounted for and don't need a source configured.
+    Files with status='failed' or no record remain visible so the user
+    can see and resolve unprocessed files.
+
+    Falls back to returning all files if the DB doesn't exist yet
+    (e.g. before vp db-init has been run).
+
+    :param files:        List of filenames from _scan_incoming.
+    :param pipeline_db:  Path to the pipeline DuckDB file.
+    :return: Filtered list with successfully ingested files removed.
+    """
+    try:
+        with duckdb.connect(pipeline_db) as conn:
+            ingested = (
+                conn.execute("SELECT filename FROM ingest_log WHERE status = 'ok'")
+                .df()["filename"]
+                .tolist()
+            )
+    except Exception:
+        return files
+    ingested_set = set(ingested)
+    return [f for f in files if f not in ingested_set]
+
+
+def _infer_duckdb_type(series) -> str:
+    """Return the DuckDB type string inferred from a pandas Series dtype."""
+    import pandas as pd
+    if pd.api.types.is_integer_dtype(series):
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(series):
+        return "DOUBLE"
+    if pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMPTZ"
+    return "VARCHAR"
+
+
+def _sorted_choices(items: list[str]) -> Iterable[str]:
+    """Return items sorted case-insensitively for consistent prompt display."""
+    return sorted(items, key=str.casefold)
 
 
 def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.6) -> list[str]:
@@ -280,18 +329,25 @@ def new_source(sources_config, incoming_dir):
       vp new-source
     """
     from fnmatch import fnmatch
+    from proto_pipe.cli.helpers import config_path_or_override
     from proto_pipe.io.ingest import load_file
+    from proto_pipe.io.registry import load_config, write_config
+    from proto_pipe.io.settings import load_settings
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
 
     config = load_config(src_cfg)
     existing_names = [s["name"] for s in config.get("sources", [])]
+    settings = load_settings()
 
     click.echo("\n── New Source ──────────────────────────────")
 
-    # Scan incoming dir
+    # Scan incoming dir — hide files already successfully ingested
     files = _scan_incoming(inc_dir)
+    files = _filter_uningested(files, settings["pipeline_db"])
+
+    sample = None
     if files:
         selected_file = questionary.select(
             "Which file are you configuring a source for?",
@@ -354,7 +410,7 @@ def new_source(sources_config, incoming_dir):
     ).ask()
     table = table.strip() if table else name
 
-    # Primary key — show columns from selected file if available
+    # Load sample file for column inspection
     file_cols = []
     if selected_file:
         try:
@@ -363,6 +419,7 @@ def new_source(sources_config, incoming_dir):
         except Exception:
             pass
 
+    # Primary key
     if file_cols:
         pk_choice = questionary.select(
             "Primary key column — the column that uniquely identifies each row."
@@ -383,7 +440,7 @@ def new_source(sources_config, incoming_dir):
             " and duplicates won't be detected."
         )
 
-    # on_duplicate — only ask if primary key is defined
+    # on_duplicate and timestamp — only when primary key defined
     on_duplicate = None
     timestamp_col = None
     if primary_key:
@@ -410,7 +467,6 @@ def new_source(sources_config, incoming_dir):
             ],
         ).ask()
 
-        # Timestamp column
         if file_cols:
             ts_choice = questionary.select(
                 "Timestamp column — the column that tracks when each row was created or"
@@ -428,6 +484,58 @@ def new_source(sources_config, incoming_dir):
             ).ask()
             timestamp_col = ts_input.strip() if ts_input else None
 
+        # Column type confirmation — shown as a summary, user confirms or picks overrides
+    column_types: dict[str, str] = {}
+    if sample is not None and file_cols:
+        _DUCKDB_TYPES = ["VARCHAR", "DOUBLE", "BIGINT", "BOOLEAN", "TIMESTAMPTZ"]
+
+        # Build inferred types for all columns
+        inferred_types = {col: _infer_duckdb_type(sample[col]) for col in file_cols}
+
+        # Show summary — one line per column, no prompts yet
+        click.echo("\n  Inferred column types:")
+        for col, dtype in inferred_types.items():
+            click.echo(f"    {col:<30} {dtype}")
+
+        looks_right = questionary.confirm(
+            "\n  Do these look right?",
+            default=True,
+        ).ask()
+        if looks_right is None:
+            click.echo("Cancelled.")
+            return
+
+        if not looks_right:
+            # Multi-select: which columns need a different type?
+            to_fix = questionary.checkbox(
+                "Select the columns to change:",
+                choices=file_cols,
+            ).ask()
+            if to_fix is None:
+                click.echo("Cancelled.")
+                return
+
+            # For each selected column, pick the correct type
+            for col in to_fix:
+                current = inferred_types[col]
+                chosen = questionary.select(
+                    f"  '{col}' (currently {current}):",
+                    choices=[
+                        questionary.Choice(
+                            f"{t}{' (current)' if t == current else ''}",
+                            value=t,
+                        )
+                        for t in _DUCKDB_TYPES
+                    ],
+                    default=current,
+                ).ask()
+                if chosen is None:
+                    click.echo("Cancelled.")
+                    return
+                inferred_types[col] = chosen
+
+        column_types = inferred_types
+
     # Build source entry
     source = {
         "name": name,
@@ -439,6 +547,8 @@ def new_source(sources_config, incoming_dir):
     if primary_key:
         source["primary_key"] = primary_key
         source["on_duplicate"] = on_duplicate
+    if column_types:
+        source["column_types"] = column_types
 
     # Write to config
     sources = config.get("sources", [])
@@ -450,8 +560,8 @@ def new_source(sources_config, incoming_dir):
 
     click.echo(f"\n[ok] Source '{name}' added to {src_cfg}")
     click.echo("\nNext steps:")
-    click.echo("  1. Review the entry in sources_config.yaml if needed")
-    click.echo("  2. Run: vp ingest")
+    click.echo("1. Review the entry in sources_config.yaml if needed")
+    click.echo("2. Run: vp ingest")
 
 
 def _is_list_annotation(ann) -> bool:
@@ -659,6 +769,125 @@ def _fill_params(
         check_entries.append(entry)
 
     return check_entries, accumulated_alias, False
+
+
+# ---------------------------------------------------------------------------
+# New command: vp check-func
+# ---------------------------------------------------------------------------
+
+
+@click.command("check-func")
+@click.option(
+    "--custom-checks", default=None, help="Override custom_checks_module path."
+)
+def check_func(custom_checks):
+    """Inspect all check functions and report any that failed validation.
+
+    Loads built-in and custom checks fresh into a temporary registry and
+    prints a structured report: which passed, which failed, and exactly why.
+
+    Checks marked ✗ are silently skipped during vp new-report. Run this
+    command after adding or changing custom checks to confirm they registered.
+
+    \b
+    Example:
+      vp check-func
+      vp check-func --custom-checks path/to/my_checks.py
+    """
+    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+    from proto_pipe.checks.helpers import _DECORATED_CHECKS
+    from proto_pipe.io.settings import load_settings
+    from proto_pipe.registry.base import CheckRegistry as _TempRegistry
+
+    settings = load_settings()
+    module_path = custom_checks or settings.get("custom_checks_module")
+
+    # Snapshot built-in names before register_custom_check can add to BUILT_IN_CHECKS
+    builtin_names: set[str] = set(BUILT_IN_CHECKS.keys())
+
+    # Fresh temporary registry — never touches the global instance
+    tmp = _TempRegistry()
+
+    for name, func in BUILT_IN_CHECKS.items():
+        tmp.register(name, func, kind="check")
+
+    # Load custom checks
+    custom_names: set[str] = set()
+    custom_load_error: str | None = None
+
+    if module_path:
+        path = Path(module_path)
+        if not path.exists():
+            custom_load_error = (
+                f"File not found: '{module_path}'. "
+                f"Check the custom_checks_module path in pipeline.yaml."
+            )
+        else:
+            _DECORATED_CHECKS.clear()
+            spec = spec_from_file_location("_custom_checks_diag", path)
+            module = module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+            except Exception as exc:
+                custom_load_error = (
+                    f"Failed to import '{module_path}': {exc}\n"
+                    f"       Fix: resolve the import error in your custom checks file."
+                )
+
+            if not custom_load_error:
+                if not _DECORATED_CHECKS:
+                    custom_load_error = (
+                        f"Loaded '{module_path}' but found no @custom_check decorated functions. "
+                        f"Add @custom_check to each function you want registered."
+                    )
+                else:
+                    custom_names = set(_DECORATED_CHECKS.keys())
+                    for name, (func, kind) in _DECORATED_CHECKS.items():
+                        tmp.register(name, func, kind=kind)
+
+    # ── Display ───────────────────────────────────────────────────────────────
+    ok = set(tmp.available())
+    bad = tmp.failed()  # {name: reason}
+
+    click.echo("\n── Check Functions ─────────────────────────\n")
+
+    for label, names in [("Built-in", builtin_names), ("Custom", custom_names)]:
+        if label == "Custom" and not module_path:
+            continue
+
+        if label == "Custom" and custom_load_error:
+            click.echo(f"Custom checks ({module_path}):")
+            click.echo(f"  ✗  Module error: {custom_load_error}")
+            click.echo()
+            continue
+
+        group_ok = sorted(n for n in names if n in ok)
+        group_bad = {n: r for n, r in bad.items() if n in names}
+        total = len(group_ok) + len(group_bad)
+
+        click.echo(f"{label} checks ({total}):")
+        for name in group_ok:
+            kind = tmp.get_kind(name)
+            click.echo(f"  ✓  {name}  [{kind}]")
+        for name, reason in sorted(group_bad.items()):
+            click.echo(f"  ✗  {name}")
+            click.echo(f"       {reason}")
+        click.echo()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    total_ok = len(ok)
+    total_bad = len(bad) + (1 if custom_load_error else 0)
+
+    parts = [f"{total_ok} passed"]
+    if total_bad:
+        parts.append(f"{total_bad} failed")
+    click.echo(f"Summary: {', '.join(parts)}")
+
+    if total_bad:
+        click.echo(
+            "\n  Checks marked ✗ are silently skipped during 'vp new-report'."
+            "\n  Fix the issues above and run 'vp check-func' again to confirm."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1409,3 +1638,4 @@ def scaffold_commands(cli):
     cli.add_command(table_reset)
     cli.add_command(new_macro)
     cli.add_command(new_sql)
+    cli.add_command(check_func)

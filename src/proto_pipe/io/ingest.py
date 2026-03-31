@@ -30,13 +30,39 @@ so failures are visible without stopping the entire run.
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Callable
 
 import duckdb
 import pandas as pd  # type: ignore
+
+from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
+
+
+@dataclass
+class IntegrityResult:
+    """The result of a pre-scan integrity check on a single row and column.
+
+    Produced by validators in _ROW_VALIDATORS before any INSERT is attempted.
+    Rows that produce IntegrityResult entries are written to flagged_rows and
+    excluded from the INSERT — clean rows proceed normally.
+
+    Attributes:
+        pk_value:   The primary key value identifying the row. Falls back to
+                    None (and uuid4 flag identity) if no primary key is defined.
+        column:     The column where the incompatibility was detected.
+        reason:     Plain-English description of what went wrong.
+        suggestion: Optional hint for how the user can resolve the issue.
+    """
+
+    pk_value: str | None
+    column: str
+    reason: str
+    suggestion: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Structural checks — lightweight, run per file before loading
@@ -306,23 +332,36 @@ def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
     return result[0] > 0
 
 
-def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
-    """Retrieve the existing column names of a specified table within a DuckDB database.
+def _get_existing_column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
+    """Return {column_name: data_type} for all columns in the table.
 
     This function queries the information schema to gather a set of all column names
     that exist in the specified table. The returned set can be used to verify, process,
     or compare column structures within the database.
 
-    :param conn: The DuckDBPyConnection object used to interact with the DuckDB database.
-    :param table: The name of the table whose column names are to be retrieved.
-    :return: A set containing the names of columns in the specified table.
-    :rtype: set[str]
+    :param conn: DuckDB connection object.
+    :param table: Name of the table to inspect.
+    :return: Dict mapping of a column name to its DuckDB data type (uppercased).
+    :rtype: dict[str, str]
     """
     rows = conn.execute(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?",
         [table],
     ).fetchall()
-    return {row[0] for row in rows}
+    return {row[0]: row[1].upper() for row in rows}
+
+
+def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
+    """Return column names for an existing table.
+
+    Delegates to _get_existing_column_types so type data is always consistent.
+
+    :param conn: DuckDB connection object.
+    :param table: Name of the table to inspect.
+    :return: Set of column names.
+    :rtype: set[str]
+    """
+    return set(_get_existing_column_types(conn, table).keys())
 
 
 def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> list[str]:
@@ -410,6 +449,23 @@ def ingest_directory(
 ) -> dict:
     """Scan a directory, match files to source definitions, and load into DuckDB.
 
+    Two-scenario ingest:
+      Scenario A (first ingest / replace mode):
+        - If source has column_types in config, pre-scan the DataFrame using
+          TRY_CAST against those declared types. Any mismatch fails the file —
+          nothing touches the DB.
+        - If pre-scan passes, apply declared types to the DataFrame before
+          CREATE TABLE so the schema is authoritative.
+        - If no column_types declared, falls back to inference (existing behaviour).
+
+      Scenario B (subsequent ingest, table exists):
+        - Run _ROW_VALIDATORS pre-scan against existing table types.
+        - Rows that fail go to flagged_rows (IntegrityResult → type_conflict).
+        - Clean rows proceed through the normal duplicate-handling and INSERT path.
+
+    All DuckDB write operations are wrapped in try/except — the full exception
+    is printed and logged, and the run continues to the next file.
+
     :param directory: The directory containing files to ingest.
     :param sources: A list of source definitions mapping file patterns to target database tables.
     :param db_path: Path to the DuckDB database file used for data storage and ingestion.
@@ -471,64 +527,131 @@ def ingest_directory(
         table = source["target_table"]
         primary_key = source.get("primary_key")
         on_duplicate = source.get("on_duplicate", "flag" if primary_key else "append")
+        column_types = source.get("column_types", {})
 
         # Adding the pipeline tracking column
         # `_` denotes a pipeline run column, not a real column in the table.
         df["_ingested_at"] = datetime.now(timezone.utc)
 
+        integrity_flagged = 0
+        new_cols: list[str] = []
+        flagged_count = 0
+        skipped_count = 0
+
         # Load into DuckDB
+        # ── Scenario A: first ingest ──────────────────────────────────────────
         if mode == "replace" or not _table_exists(conn, table):
-            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
-            conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
-            new_cols: list[str] = []
-            flagged_count = 0
-            skipped_count = 0
-            print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
-        else:
-            new_cols = _auto_migrate(conn, table, df)
-
-            if primary_key:
-                df, flagged_count, skipped_count = _handle_duplicates(
-                    conn, table, df, primary_key, on_duplicate
+            if column_types:
+                type_issues = _check_type_compatibility(
+                    df, column_types, conn, primary_key
                 )
-            else:
-                if on_duplicate not in ("append", "flag"):
-                    print(
-                        f"[warn] on_duplicate='{on_duplicate}' ignored for "
-                        f"'{table}' — no primary_key defined"
+                if type_issues:
+                    cols_affected = sorted({i.column for i in type_issues})
+                    message = (
+                        f"Type mismatch for column(s): {', '.join(cols_affected)}. "
+                        f"Fix the file values or run 'vp new-source' to update column_types."
                     )
-                flagged_count = 0
-                skipped_count = 0
+                    print(f"[fail] '{path.name}': {message}")
+                    for issue in type_issues[:5]:
+                        print(f"  [{issue.column}] {issue.reason}")
+                        if issue.suggestion:
+                            print(f"           → {issue.suggestion}")
+                    if len(type_issues) > 5:
+                        print(
+                            f"  ... and {len(type_issues) - 5} more. See flagged_rows."
+                        )
+                    _log_ingest(conn, path.name, table, "failed", message=message)
+                    summary[path.name] = {"status": "failed", "message": message}
+                    continue
+                df = _apply_declared_types(df, column_types)
 
-            if not df.empty:
-                col_list = ", ".join(f'"{c}"' for c in df.columns)
-                conn.execute(
-                    f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df'
+            try:
+                conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+                conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
+                print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
+            except Exception as exc:
+                message = f"DuckDB write failed: {exc}"
+                print(f"[fail] '{path.name}': {message}")
+                _log_ingest(conn, path.name, table, "failed", message=message)
+                summary[path.name] = {"status": "failed", "message": message}
+                continue
+
+        # ── Scenario B: subsequent ingest ─────────────────────────────────────
+        else:
+            # Pre-scan for integrity issues before touching the table
+            integrity_issues: list[IntegrityResult] = []
+            for validator in _ROW_VALIDATORS:
+                integrity_issues.extend(validator(conn, table, df, primary_key))
+
+            if integrity_issues:
+                integrity_flagged = _write_integrity_flags(
+                    conn, table, integrity_issues
+                )
+                if primary_key:
+                    bad_pks = {
+                        i.pk_value for i in integrity_issues if i.pk_value is not None
+                    }
+                    if bad_pks:
+                        df = df[~df[primary_key].astype(str).isin(bad_pks)].copy()
+                print(
+                    f"  [integrity] {integrity_flagged} row(s) flagged for type conflicts "
+                    f"— see flagged_rows for details"
                 )
 
-            print(
-                f"[ok] '{path.name}' → '{table}' "
-                f"({len(df)} inserted, {flagged_count} flagged, {skipped_count} skipped)"
-            )
+            try:
+                new_cols = _auto_migrate(conn, table, df)
+
+                if primary_key:
+                    df, flagged_count, skipped_count = _handle_duplicates(
+                        conn, table, df, primary_key, on_duplicate
+                    )
+                else:
+                    if on_duplicate not in ("append", "flag"):
+                        print(
+                            f"[warn] on_duplicate='{on_duplicate}' ignored for "
+                            f"'{table}' — no primary_key defined"
+                        )
+
+                if not df.empty:
+                    col_list = ", ".join(f'"{c}"' for c in df.columns)
+                    conn.execute(
+                        f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df'
+                    )
+
+                print(
+                    f"[ok] '{path.name}' → '{table}' "
+                    f"({len(df)} inserted, "
+                    f"{flagged_count + integrity_flagged} flagged, "
+                    f"{skipped_count} skipped)"
+                )
+            except Exception as exc:
+                message = f"DuckDB write failed: {exc}"
+                print(f"[fail] '{path.name}': {message}")
+                _log_ingest(conn, path.name, table, "failed", message=message)
+                summary[path.name] = {"status": "failed", "message": message}
+                continue
 
         _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
         summary[path.name] = {
             "table": table,
             "rows": len(df),
             "new_cols": new_cols,
-            "flagged": flagged_count,
+            "flagged": flagged_count + integrity_flagged,
             "skipped": skipped_count,
-            "status": "ok"
+            "status": "ok",
         }
 
-        # Optional validation checks
         if run_checks and check_registry and report_registry:
-            _run_inline_checks(conn, table, source, check_registry, report_registry, path.name)
+            _run_inline_checks(
+                conn, table, source, check_registry, report_registry, path.name
+            )
 
     if unmatched:
         print(f"[warn] No source match for: {', '.join(unmatched)}")
         for filename in unmatched:
-            _log_ingest(conn, filename, None, "skipped", message="No matching source pattern")
+            _log_ingest(
+                conn, filename, None, "skipped", message="No matching source pattern"
+            )
 
     conn.close()
     return summary
@@ -992,3 +1115,193 @@ def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
                 print(f"  [macro] Loaded '{sql_file.name}'")
         except Exception as e:
             print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")
+
+
+#############################
+# PRE-SCAN FUNCTIONS
+#############################
+def _check_type_compatibility(
+    df: pd.DataFrame,
+    reference_types: dict[str, str],
+    conn: duckdb.DuckDBPyConnection,
+    pk_col: str | None,
+) -> list[IntegrityResult]:
+    """Check DataFrame values against declared or existing column types using TRY_CAST.
+
+    Used in both Scenario A (first ingest, reference_types from sources_config
+    column_types) and Scenario B (subsequent ingest, reference_types from
+    _get_existing_column_types). Same logic, different source of truth.
+
+    Uses DuckDB's TRY_CAST which returns NULL instead of raising when a cast
+    fails — this catches exactly what a real INSERT would reject.
+
+    Pipeline columns (prefixed with _) are always skipped.
+
+    :param df:              The incoming DataFrame to scan.
+    :param reference_types: {column: declared_type} — what each column should be.
+    :param conn:            Open DuckDB connection. Used to query df via TRY_CAST.
+    :param pk_col:          Primary key column name for row identification, or None.
+    :return: List of IntegrityResult — one per failing row per column.
+    """
+    results: list[IntegrityResult] = []
+
+    for col, declared_type in reference_types.items():
+        if col not in df.columns:
+            continue
+        if col.startswith("_"):
+            continue
+
+        pk_select = f'"{pk_col}"' if pk_col and pk_col in df.columns else "NULL"
+
+        try:
+            failing = conn.execute(f"""
+                SELECT {pk_select} AS pk_value,
+                       CAST("{col}" AS VARCHAR) AS raw_value
+                FROM df
+                WHERE TRY_CAST("{col}" AS {declared_type}) IS NULL
+                AND "{col}" IS NOT NULL
+            """).df()
+        except Exception as exc:
+            # Declared type is itself invalid — flag as config error
+            results.append(
+                IntegrityResult(
+                    pk_value=None,
+                    column=col,
+                    reason=f"Invalid declared type '{declared_type}': {exc}",
+                    suggestion=(
+                        f"Fix the column_types entry for '{col}' in sources_config.yaml. "
+                        f"Valid types include: VARCHAR, DOUBLE, BIGINT, BOOLEAN, TIMESTAMPTZ."
+                    ),
+                )
+            )
+            continue
+
+        for _, row in failing.iterrows():
+            pk_raw = row["pk_value"]
+            pk_value = None if (pk_raw is None or pd.isna(pk_raw)) else str(pk_raw)
+            results.append(
+                IntegrityResult(
+                    pk_value=pk_value,
+                    column=col,
+                    reason=(
+                        f"Value '{row['raw_value']}' cannot be cast to {declared_type}."
+                    ),
+                    suggestion=(
+                        f"Fix the value in the source file, or run 'vp new-source' "
+                        f"to update the declared type for '{col}'."
+                    ),
+                )
+            )
+
+    return results
+
+
+def _check_numeric_type_conflicts(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    df: pd.DataFrame,
+    pk_col: str | None,
+) -> list[IntegrityResult]:
+    """Scenario B validator: find rows with values that cannot cast to the
+    existing numeric column type in the table.
+
+    Only runs against columns typed as numeric in DuckDB (_NUMERIC_DUCKDB_TYPES).
+    Non-numeric columns are skipped — DuckDB handles those implicitly.
+
+    :param conn:   Open DuckDB connection.
+    :param table:  Target table name.
+    :param df:     Incoming DataFrame.
+    :param pk_col: Primary key column name, or None.
+    :return: List of IntegrityResult entries for failing rows.
+    """
+    existing_types = _get_existing_column_types(conn, table)
+    numeric_reference = {
+        col: db_type
+        for col, db_type in existing_types.items()
+        if col in df.columns
+        and not col.startswith("_")
+        and db_type in NUMERIC_DUCKDB_TYPES
+    }
+    return _check_type_compatibility(df, numeric_reference, conn, pk_col)
+
+
+_ROW_VALIDATORS: list[Callable] = [
+    _check_numeric_type_conflicts,
+]
+"""Ordered list of pre-scan validator functions run against every incoming
+DataFrame before INSERT on subsequent ingests (Scenario B).
+
+Each validator signature: (conn, table, df, pk_col) -> list[IntegrityResult].
+Add new validators here as new error classes are identified — the ingest loop
+never needs to change.
+"""
+
+
+def _apply_declared_types(
+    df: pd.DataFrame,
+    column_types: dict[str, str],
+) -> pd.DataFrame:
+    """Cast DataFrame columns to their declared types after a successful pre-scan.
+
+    Only called in Scenario A after _check_type_compatibility confirms all
+    values are castable. Ensures the table is created with the correct DuckDB
+    types rather than whatever pandas inferred.
+
+    :param df:           The incoming DataFrame.
+    :param column_types: {column: declared_type} from sources_config.
+    :return: DataFrame with columns cast to declared types.
+    """
+    df = df.copy()
+    for col, declared_type in column_types.items():
+        if col not in df.columns:
+            continue
+        dt = declared_type.upper()
+        try:
+            if dt in ("DOUBLE", "FLOAT", "REAL"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            elif dt in ("BIGINT", "INTEGER", "INT", "SMALLINT", "TINYINT", "HUGEINT"):
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            elif dt == "BOOLEAN":
+                df[col] = df[col].astype(bool)
+            # VARCHAR, TIMESTAMPTZ, others — leave as-is; DuckDB handles them
+        except Exception:
+            pass  # pre-scan already confirmed castability; ignore edge cases
+    return df
+
+
+def _write_integrity_flags(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    issues: list[IntegrityResult],
+) -> int:
+    """Write IntegrityResult entries to flagged_rows. Returns count written.
+
+    Uses ON CONFLICT DO NOTHING — running the same file twice won't duplicate flags.
+    check_name is set to 'type_conflict' to distinguish from duplicate_conflict entries.
+
+    :param conn:   Open the DuckDB connection.
+    :param table:  Target table name.
+    :param issues: List of IntegrityResult to write.
+    :return: Number of flag entries written.
+    """
+    if not issues:
+        return 0
+
+    flags_df = pd.DataFrame(
+        {
+            "id": [flag_id_for(i.pk_value) for i in issues],
+            "table_name": table,
+            "check_name": "type_conflict",
+            "reason": [f"[{i.column}] {i.reason}"[:500] for i in issues],
+            "flagged_at": datetime.now(timezone.utc),
+        }
+    )
+
+    conn.execute("""
+                 INSERT INTO flagged_rows
+                     (id, table_name, check_name, reason, flagged_at)
+                 SELECT id, table_name, check_name, reason, flagged_at
+                 FROM flags_df
+                     ON CONFLICT (id) DO NOTHING
+                 """)
+    return len(issues)

@@ -267,7 +267,7 @@ def export_validation_report(
                     SELECT column_name
                     FROM information_schema.columns
                     WHERE table_name = ?
-                    AND column_name NOT LIKE '\_%' ESCAPE '\\'
+                    AND column_name NOT LIKE '\\_%' ESCAPE '\\'
                     ORDER BY ordinal_position
                 """, [table_name]).df()["column_name"].tolist()
 

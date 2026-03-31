@@ -11,6 +11,9 @@ from typing import Callable
 import duckdb
 
 
+##############################
+# BASE OBJECTS FOR INSPECTION
+##############################
 @dataclass
 class CheckContract:
     """A vetted check or transform function, ready for the CheckRegistry.
@@ -29,17 +32,42 @@ class CheckContract:
     kind: str = "check"
 
 
+@dataclass
+class CheckAudit:
+    """The result of attempting to validate a check or transform function.
+
+    Returned by validate_check() in all cases — success or failure.
+    CheckRegistry uses this to route: passed audits go to _checks,
+    failed audits go to _bad_checks.
+
+    Attributes:
+        contract: The validated CheckContract, or None if validation failed.
+        failure_reason: Plain-English explanation of why validation failed.
+                        None when the audit passed.
+    """
+
+    contract: CheckContract | None
+    failure_reason: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        """True if the function passed all validation requirements."""
+        return self.contract is not None
+
+
 def validate_check(
     name: str,
     func: Callable,
     kind: str,
-) -> "CheckContract | None":
+) -> CheckAudit:
     """Validate a function against the check contract and return a CheckContract.
 
     This is the single validation gate for all checks and transforms. Uses
     CheckParamInspector to inspect the function. Returns None (and prints a
     user-facing warning) if any requirement is not met — invalid functions
     are never registered.
+
+    Uses `Check Audit` to communicate the outcome of validation.
 
     Requirements:
       - kind must be 'check' or 'transform'
@@ -57,37 +85,41 @@ def validate_check(
     """
     from proto_pipe.checks.result import wrap_series_check
 
+    # [Incorrect `kind` handling]
     if kind not in ("check", "transform"):
-        print(
-            f"[warn] '{name}': kind must be 'check' or 'transform', "
-            f"got '{kind}' — skipping registration."
+        reason = (
+            f"kind must be 'check' or 'transform', got '{kind}'. "
+            f"Change the kind= argument in @custom_check."
         )
-        return None
+        print(f"[warn] `{name}`: {reason}")
+        return CheckAudit(contract=None, failure_reason=reason)
 
     inspector = CheckParamInspector(func)
 
-    if inspector._sig.return_annotation is inspect.Parameter.empty:
+    # [Bad `return` type signature]
+    if inspector.empty_return_annotation():
         if kind == "check":
-            print(
-                f"[warn] '{name}': no return annotation found — skipping registration. "
-                f"Add '-> pd.Series' to your check function signature."
+            reason = (
+                "no return annotation found — skipping registration. "
+                "Add '-> pd.Series' to your check function signature."
             )
-            return None
+            print(f"[warn] '{name}': {reason}")
+            return CheckAudit(contract=None, failure_reason=reason)
         else:
             print(
                 f"[warn] '{name}': no return annotation found — registering as transform anyway. "
                 f"Consider adding '-> pd.Series' or '-> pd.DataFrame' for clarity."
             )
 
+    # [Handling Check `Return` types]
     returns_bool = inspector.returns_boolean_series()
-
     if kind == "check" and not returns_bool:
-        print(
-            f"[warn] '{name}' is kind='check' but its return annotation is not "
-            f"pd.Series[bool] — skipping registration. "
-            f"Fix the annotation or use kind='transform'."
+        reason = (
+            "return annotation is not pd.Series[bool] — skipping registration. "
+            "Fix the annotation or use kind='transform'."
         )
-        return None
+        print(f"[warn] '{name}': {reason}")
+        return CheckAudit(contract=None, failure_reason=reason)
 
     if kind == "transform" and returns_bool:
         print(
@@ -97,7 +129,7 @@ def validate_check(
         )
 
     wrapped_func = wrap_series_check(func) if kind == "check" else func
-    return CheckContract(func=wrapped_func, kind=kind)
+    return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
 
 
 class CheckParamInspector:
@@ -137,6 +169,10 @@ class CheckParamInspector:
         # Accept pd.Series, 'pd.Series', 'pd.Series[bool]'
         ann_str = str(ann) if not isinstance(ann, str) else ann
         return "Series" in ann_str
+
+    def empty_return_annotation(self) -> bool:
+        """True if the function has no return annotation."""
+        return self._sig.return_annotation is inspect.Parameter.empty
 
     def column_params(self) -> list[str]:
         """Return param names that are str type — these are column selectors."""

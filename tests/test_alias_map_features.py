@@ -188,8 +188,8 @@ def test_invalid_kind_skips_registration(capsys):
     def my_check(ctx: dict) -> pd.Series:
         return pd.Series([True])
 
-    contract = validate_check("my_check", my_check, kind="invalid")
-    assert contract is None
+    audit = validate_check("my_check", my_check, kind="invalid")
+    assert audit.contract is None
     assert "warn" in capsys.readouterr().out
 
 

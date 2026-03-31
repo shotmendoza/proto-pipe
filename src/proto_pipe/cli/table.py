@@ -175,7 +175,6 @@ class TextualReview(ReviewInterface):
         return df
 
     def edit(self, df, title: str, pk_col: str | None = None):
-        import pandas as pd
         edited_df = df.copy()
         changes = self._run(df, title, pk_col, editable=True)
         if changes:

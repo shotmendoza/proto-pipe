@@ -1,7 +1,8 @@
 """CheckResult — the contract between check functions and the flagging system."""
 from dataclasses import dataclass, field
-import pandas as pd
 from typing import Callable
+
+import pandas as pd
 
 
 @dataclass

@@ -12,7 +12,6 @@ from os import PathLike
 from pathlib import Path
 from typing import Literal
 
-import click
 import pandas as pd
 from ruamel.yaml import YAML
 
