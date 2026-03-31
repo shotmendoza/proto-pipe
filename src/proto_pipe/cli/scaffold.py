@@ -345,7 +345,7 @@ def new_source(sources_config, incoming_dir):
 
     # Scan incoming dir — hide files already successfully ingested
     files = _scan_incoming(inc_dir)
-    files = _filter_uningested(files, settings["pipeline_db"])
+    files = _filter_uningested(files, settings["paths"]["pipeline_db"])
 
     sample = None
     if files:
