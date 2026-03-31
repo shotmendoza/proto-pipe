@@ -70,4 +70,6 @@ paths:
 # separate check execution. Set to false to always use single-select.
 multi_select_params: true
 
-macros_dir: "macros"
+macros_dir: "macros"  # Name of the directory containing custom SQL macros.
+
+custom_checks_module: "checks/my_checks.py"  # path to your custom checks file

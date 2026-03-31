@@ -45,11 +45,16 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     if not path.exists():
         return _DEFAULTS.copy()
     loaded = load_config(path)
-    # Merge with defaults so missing keys don't cause KeyErrors
     merged = _DEFAULTS.copy()
+
+    # Merge paths sub-dict explicitly so defaults fill any missing keys
     merged["paths"].update(loaded.get("paths", {}))
-    if "macros_dir" in loaded:
-        merged["macros_dir"] = loaded["macros_dir"]
+
+    # Merge all other top-level keys generically — any new key in pipeline.yaml
+    # (e.g. custom_checks_module, macros_dir) is picked up without code changes
+    for key, value in loaded.items():
+        if key != "paths":
+            merged[key] = value
     return merged
 
 
