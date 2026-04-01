@@ -147,7 +147,7 @@ def flagged_cmd(ctx, table, export, limit, pipeline_db):
     if ctx.invoked_subcommand is not None:
         return
 
-    from proto_pipe.cli.table import _get_reviewer
+    from proto_pipe.cli.commands.table import get_reviewer
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
@@ -172,7 +172,7 @@ def flagged_cmd(ctx, table, export, limit, pipeline_db):
             df.to_csv(output_path, index=False)
             click.echo(f"[ok] {len(df)} row(s) exported to: {output_path}")
         else:
-            reviewer = _get_reviewer(edit=False)
+            reviewer = get_reviewer(edit=False)
             reviewer.show(df, title=title)
 
     finally:
@@ -195,7 +195,7 @@ def flagged_edit(table, key, sources_config, pipeline_db):
     Example:
       vp flagged edit --table sales
     """
-    from proto_pipe.cli.table import _get_reviewer
+    from proto_pipe.cli.commands.table import get_reviewer
     from proto_pipe.reports.corrections import import_corrections
     import tempfile
     import os
@@ -219,7 +219,7 @@ def flagged_edit(table, key, sources_config, pipeline_db):
             return
 
         title = f"flagged — {table} ({len(df)} rows, enriched)"
-        reviewer = _get_reviewer(edit=True)
+        reviewer = get_reviewer(edit=True)
         edited_df = reviewer.edit(df, title=title, pk_col=pk_col)
 
         if edited_df is not None and not edited_df.equals(df):
@@ -381,7 +381,7 @@ def validated_cmd(table, report, export, limit, pipeline_db):
       vp validated --table sales
       vp validated --export csv
     """
-    from proto_pipe.cli.table import _get_reviewer
+    from proto_pipe.cli.commands.table import get_reviewer
     from proto_pipe.reports.validation_flags import detail_df
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -428,7 +428,7 @@ def validated_cmd(table, report, export, limit, pipeline_db):
             display_df.to_csv(output_path, index=False)
             click.echo(f"[ok] {len(display_df)} row(s) exported to: {output_path}")
         else:
-            reviewer = _get_reviewer(edit=False)
+            reviewer = get_reviewer(edit=False)
             reviewer.show(display_df, title=title)
 
     finally:

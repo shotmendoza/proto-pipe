@@ -232,7 +232,6 @@ def export_validation_report(
     report_name: str | None = None,
 ) -> tuple[int, int]:
     from pathlib import Path
-    import pandas as pd
 
     det = detail_df(conn, report_name)
     summ = summary_df(conn, report_name)

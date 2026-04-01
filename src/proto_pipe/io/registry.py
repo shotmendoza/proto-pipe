@@ -4,37 +4,15 @@ Reads reports_config.yaml, resolves templates, and registers
 all checks as partials on the registry so the runner never
 needs to know about individual check params.
 """
-import importlib.util
-import sys
 import uuid
 from functools import partial
-from os import PathLike
 from pathlib import Path
 from typing import Literal
 
 import pandas as pd
-from ruamel.yaml import YAML
 
 from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-from proto_pipe.registry.base import CheckRegistry, ReportRegistry
-
-
-def load_config(config_path: str | PathLike) -> dict:
-    """loads and returns a YAML config file, based on the given path
-
-    :param config_path: on the path to the config file you want to load
-    :return: the config dict
-    """
-    with open(config_path) as f:
-        yaml = YAML()
-        return yaml.load(f) or {}
-
-
-def write_config(config: dict, config_path: str | PathLike) -> None:
-    """Writes a YAML config file, based on the given path and config dict"""
-    with open(config_path, "w") as f:
-        yaml = YAML()
-        yaml.dump(config, f)
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckParamInspector
 
 
 def _build_check_keys(
@@ -121,8 +99,6 @@ def _expand_check_with_alias_map(
     :param check_registry: registry to register expanded checks into
     :return: list of registered check names
     """
-
-    from proto_pipe.checks.inspector import CheckParamInspector
 
     func = BUILT_IN_CHECKS.get(func_name)
     if func is None:
@@ -309,63 +285,6 @@ def register_from_config(
                 "resolved_checks": resolved_check_names,
             },
         )
-
-
-def load_custom_checks_module(
-    module_path: str,
-    check_registry: CheckRegistry,
-) -> None:
-    """
-    Import a user-supplied Python module and register any functions decorated
-    with @custom_check into both BUILT_IN_CHECKS and the check registry.
-
-    Called automatically at CLI startup when `custom_checks_module` is set
-    in pipeline.yaml. Safe to call multiple times — already-registered names
-    are overwritten with the latest definition.
-
-    Args:
-        module_path:    Path to the .py file, relative to the working directory.
-        check_registry: The CheckRegistry instance to register checks into.
-
-    Raises:
-        SystemExit: If the module file is not found or raises an import error,
-                    a clear message is printed and the pipeline exits rather than
-                    proceeding with missing checks.
-    """
-    from proto_pipe.checks.helpers import (
-        _DECORATED_CHECKS,
-        register_custom_check,
-    )
-
-    path = Path(module_path)
-    if not path.exists():
-        print(
-            f"\n[error] custom_checks_module: '{module_path}' not found.\n"
-            f"Check the path in pipeline.yaml and try again."
-        )
-        sys.exit(1)
-
-    # Load the module from its file path without requiring it to be installed
-    spec = importlib.util.spec_from_file_location("_custom_checks", path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        print(
-            f"\n[error] Failed to import custom_checks_module '{module_path}':\n"
-            f"{e}"
-        )
-        sys.exit(1)
-
-    if not _DECORATED_CHECKS:
-        print(
-            f"[warn] Loaded '{module_path}' but found no @custom_check decorated functions."
-        )
-        return
-
-    for name, (func, kind) in _DECORATED_CHECKS.items():
-        register_custom_check(name, func, check_registry, kind=kind)
-        print(f"[custom_check] Registered '{name}' (kind={kind}) from '{module_path}'")
 
 
 # ---------------------------------------------------------------------------

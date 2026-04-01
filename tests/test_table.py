@@ -17,11 +17,11 @@ import pandas as pd
 import pytest
 from click.testing import CliRunner
 
-from proto_pipe.cli.table import (
+from proto_pipe.io.db import get_all_tables
+from proto_pipe.cli.commands.table import (
     RichReview,
     TextualReview,
-    _get_all_tables,
-    _get_reviewer,
+    get_reviewer,
     table_cmd,
 )
 
@@ -87,7 +87,7 @@ def empty_db(tmp_path) -> str:
 class TestGetAllTables:
     def test_returns_all_tables(self, db_with_sales):
         conn = duckdb.connect(db_with_sales)
-        tables = _get_all_tables(conn)
+        tables = get_all_tables(conn)
         conn.close()
         assert "sales" in tables
         assert "flagged_rows" in tables
@@ -96,7 +96,7 @@ class TestGetAllTables:
     def test_empty_db_returns_empty_list(self, tmp_path):
         db_path = str(tmp_path / "empty.db")
         conn = duckdb.connect(db_path)
-        tables = _get_all_tables(conn)
+        tables = get_all_tables(conn)
         conn.close()
         assert tables == []
 
@@ -135,20 +135,20 @@ class TestRichReview:
 
 class TestGetReviewer:
     def test_returns_rich_review_when_not_edit(self):
-        reviewer = _get_reviewer(edit=False)
+        reviewer = get_reviewer(edit=False)
         assert isinstance(reviewer, RichReview)
 
     def test_returns_textual_review_when_edit_and_available(self):
         try:
             import textual  # noqa
-            reviewer = _get_reviewer(edit=True)
+            reviewer = get_reviewer(edit=True)
             assert isinstance(reviewer, TextualReview)
         except ImportError:
             pytest.skip("textual not installed")
 
     def test_falls_back_to_rich_when_textual_unavailable(self):
         with patch.dict("sys.modules", {"textual": None}):
-            reviewer = _get_reviewer(edit=True)
+            reviewer = get_reviewer(edit=True)
             assert isinstance(reviewer, RichReview)
 
 
@@ -232,7 +232,7 @@ class TestTableCmd:
         """vp table sales displays the table."""
         runner = CliRunner()
         with patch(
-            "proto_pipe.cli.table.config_path_or_override", return_value=db_with_sales
+            "proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales
         ):
             result = runner.invoke(table_cmd, ["sales"], env={"PAGER": "cat"})
         assert result.exit_code == 0
@@ -240,7 +240,7 @@ class TestTableCmd:
     def test_unknown_table_shows_error(self, db_with_sales):
         """vp table nonexistent shows error message."""
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=db_with_sales):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
             result = runner.invoke(table_cmd, ["nonexistent"], env={"PAGER": "cat"})
         assert result.exit_code == 0
         assert "error" in result.output.lower() or "not found" in result.output.lower()
@@ -248,7 +248,7 @@ class TestTableCmd:
     def test_empty_table_shows_message(self, empty_db):
         """vp table on an empty table shows empty message."""
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=empty_db):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=empty_db):
             result = runner.invoke(table_cmd, ["sales"], env={"PAGER": "cat"})
         assert result.exit_code == 0
         assert "empty" in result.output.lower()
@@ -257,7 +257,7 @@ class TestTableCmd:
         """vp table sales --export out.csv writes a CSV file."""
         export_path = str(tmp_path / "out.csv")
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=db_with_sales):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
             result = runner.invoke(table_cmd, ["sales", "--export", export_path], env={"PAGER": "cat"})
         assert result.exit_code == 0
         assert Path(export_path).exists()
@@ -269,7 +269,7 @@ class TestTableCmd:
         """Exported CSV has the correct number of rows."""
         export_path = str(tmp_path / "out.csv")
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=db_with_sales):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
             runner.invoke(table_cmd, ["sales", "--export", export_path], env={"PAGER": "cat"})
         df = pd.read_csv(export_path)
         assert len(df) == 3
@@ -278,7 +278,7 @@ class TestTableCmd:
         """--limit restricts the number of rows displayed."""
         export_path = str(tmp_path / "out.csv")
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=db_with_sales):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
             runner.invoke(table_cmd, ["sales", "--export", export_path, "--limit", "2"], env={"PAGER": "cat"})
         df = pd.read_csv(export_path)
         assert len(df) == 2
@@ -286,7 +286,7 @@ class TestTableCmd:
     def test_infrastructure_tables_accessible(self, db_with_sales):
         """Pipeline infrastructure tables like flagged_rows can be viewed."""
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=db_with_sales):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
             result = runner.invoke(table_cmd, ["flagged_rows"], env={"PAGER": "cat"})
         assert result.exit_code == 0
 
@@ -295,7 +295,7 @@ class TestTableCmd:
         db_path = str(tmp_path / "empty.db")
         duckdb.connect(db_path).close()
         runner = CliRunner()
-        with patch("proto_pipe.cli.table.config_path_or_override", return_value=db_path):
+        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_path):
             result = runner.invoke(table_cmd, [], env={"PAGER": "cat"})
         assert result.exit_code == 0
         assert "no tables" in result.output.lower()

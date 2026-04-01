@@ -28,9 +28,9 @@ def funcs_cmd(custom_checks):
       vp check-func --custom-checks path/to/my_checks.py
     """
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-    from proto_pipe.checks.helpers import _DECORATED_CHECKS
-    from proto_pipe.io.settings import load_settings
-    from proto_pipe.registry.base import CheckRegistry as _TempRegistry
+    from proto_pipe.checks.helpers import DECORATED_CHECKS
+    from proto_pipe.io.config import load_settings
+    from proto_pipe.checks.registry import CheckRegistry as _TempRegistry
 
     settings = load_settings()
     module_path = custom_checks or settings.get("custom_checks_module")
@@ -56,7 +56,7 @@ def funcs_cmd(custom_checks):
                 f"Check the custom_checks_module path in pipeline.yaml."
             )
         else:
-            _DECORATED_CHECKS.clear()
+            DECORATED_CHECKS.clear()
             spec = spec_from_file_location("_custom_checks_diag", path)
             module = module_from_spec(spec)
             try:
@@ -68,14 +68,14 @@ def funcs_cmd(custom_checks):
                 )
 
             if not custom_load_error:
-                if not _DECORATED_CHECKS:
+                if not DECORATED_CHECKS:
                     custom_load_error = (
                         f"Loaded '{module_path}' but found no @custom_check decorated functions. "
                         f"Add @custom_check to each function you want registered."
                     )
                 else:
-                    custom_names = set(_DECORATED_CHECKS.keys())
-                    for name, (func, kind) in _DECORATED_CHECKS.items():
+                    custom_names = set(DECORATED_CHECKS.keys())
+                    for name, (func, kind) in DECORATED_CHECKS.items():
                         tmp.register(name, func, kind=kind)
 
     # ── Display ───────────────────────────────────────────────────────────────

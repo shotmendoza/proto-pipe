@@ -3,8 +3,8 @@
 import click
 
 from proto_pipe.reports.validation_flags import count_validation_flags, summary_df
-from .helpers import load_custom_checks
-from ..io.config import config_path_or_override
+from proto_pipe.checks.helpers import load_custom_checks
+from proto_pipe.io.config import config_path_or_override, load_config
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +34,8 @@ def validate(pipeline_db, watermark_db, reports_config, table):
       vp validate
       vp validate --table sales
     """
-    from proto_pipe.io.registry import load_config, register_from_config
-    from proto_pipe.registry.base import check_registry, report_registry
+    from proto_pipe.io.registry import register_from_config
+    from proto_pipe.checks.registry import check_registry, report_registry
     from proto_pipe.pipelines.watermark import WatermarkStore
     from proto_pipe.reports.runner import run_all_reports
 

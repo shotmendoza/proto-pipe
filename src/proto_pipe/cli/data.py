@@ -4,8 +4,8 @@ from pathlib import Path
 
 import click
 
-from .helpers import load_custom_checks
-from ..io.config import config_path_or_override
+from ..checks.helpers import load_custom_checks
+from ..io.config import config_path_or_override, load_config
 
 
 # ---------------------------------------------------------------------------
@@ -43,9 +43,9 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
       vp ingest --mode replace
       vp ingest --validate
     """
-    from proto_pipe.io.registry import load_config, register_from_config
+    from proto_pipe.io.registry import register_from_config
     from proto_pipe.io.ingest import ingest_directory
-    from proto_pipe.registry.base import check_registry, report_registry
+    from proto_pipe.checks.registry import check_registry, report_registry
 
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -205,11 +205,9 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
     from proto_pipe.io.ingest import (
         load_file,
     )
-    from ..io.migration import _auto_migrate
-    from ..io.db import table_exists
-    from ..io.db import log_ingest
-    from ..io.db import init_ingest_log
-    from proto_pipe.io.registry import load_config
+    from ..io.migration import auto_migrate
+    from ..io.db import table_exists, log_ingest, init_ingest_log
+    from ..io.config import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     src_cfg = config_path_or_override("sources_config", sources_config)
@@ -241,7 +239,7 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
         new_cols = []
         click.echo(f"[ok] '{table}' replaced from '{path.name}' ({len(df)} rows)")
     else:
-        new_cols = _auto_migrate(conn, table, df)
+        new_cols = auto_migrate(conn, table, df)
         conn.execute(f'INSERT INTO "{table}" SELECT * FROM df')
         click.echo(f"[ok] '{table}' updated from '{path.name}' ({len(df)} rows appended)")
 

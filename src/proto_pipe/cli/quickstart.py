@@ -5,8 +5,8 @@ from pathlib import Path
 
 import click
 
-from proto_pipe.io.config import config_settings, config_path_or_override
-from proto_pipe.io.settings import DEFAULT_SETTINGS_PATH, set_path, VALID_PATH_KEYS
+from proto_pipe.io.config import config_settings, config_path_or_override, set_path
+from proto_pipe.constants import VALID_PATH_KEYS, DEFAULT_SETTINGS_PATH
 from proto_pipe.reports.validation_flags import init_validation_flags_table
 
 _TEMPLATES_DIR = files("proto_pipe") / "templates"

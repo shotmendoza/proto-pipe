@@ -19,7 +19,7 @@ import pytest
 from proto_pipe.io.ingest import init_db, ingest_directory
 from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
-from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.reports.query import execute_sql_file
 from proto_pipe.reports.runner import run_all_reports
 

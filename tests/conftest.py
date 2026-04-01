@@ -356,13 +356,13 @@ def populated_db(pipeline_db, sales_df, inventory_df) -> str:
 
 @pytest.fixture()
 def check_registry():
-    from proto_pipe.registry.base import CheckRegistry
+    from proto_pipe.checks.registry import CheckRegistry
     return CheckRegistry()
 
 
 @pytest.fixture()
 def report_registry():
-    from proto_pipe.registry.base import ReportRegistry
+    from proto_pipe.checks.registry import ReportRegistry
     return ReportRegistry()
 
 

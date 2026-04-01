@@ -12,17 +12,23 @@ kind="check" — returns pd.Series[bool], failures written to validation_flags
 kind="transform" — returns pd.Series or pd.DataFrame, result written back to the
                    report table in DuckDB after all checks have run
 """
+from __future__ import annotations
+
+import importlib.util
+import sys
 
 from functools import partial
+from pathlib import Path
 from typing import Callable, Literal
 
 from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-from proto_pipe.registry.base import CheckRegistry
+from proto_pipe.checks.registry import CheckRegistry
+from proto_pipe.io.config import config_settings
 
 # Staging area for functions decorated with @custom_check.
 # Maps check name -> (func, kind). Not validated yet — validation happens
 # when load_custom_checks_module calls check_registry.register() for each entry.
-_DECORATED_CHECKS: dict[str, tuple[Callable, str]] = {}
+DECORATED_CHECKS: dict[str, tuple[Callable, str]] = {}
 
 
 def custom_check(
@@ -64,7 +70,7 @@ def custom_check(
         raise ValueError(f"kind must be 'check' or 'transform', got '{kind}'")
 
     def decorator(func: Callable) -> Callable:
-        _DECORATED_CHECKS[name] = (func, kind)
+        DECORATED_CHECKS[name] = (func, kind)
         return func
 
     return decorator
@@ -94,3 +100,69 @@ def register_custom_check(
         check_registry.register(name, partial(func, **default_params), kind=kind)
     else:
         check_registry.register(name, func, kind=kind)
+
+
+def load_custom_checks(check_registry: CheckRegistry) -> None:
+    """Loads custom checks into the given check registry by importing a custom checks
+    module defined in the configuration settings. If no custom checks module is
+    specified in the configuration settings, this function performs no action.
+
+    :param check_registry: The registry where custom checks will be loaded.
+    :return: None
+    """
+
+    module_path = config_settings().get("custom_checks_module")
+    if module_path:
+        load_custom_checks_module(module_path, check_registry)
+
+
+def load_custom_checks_module(
+    module_path: str,
+    check_registry: CheckRegistry,
+) -> None:
+    """
+    Import a user-supplied Python module and register any functions decorated
+    with @custom_check into both BUILT_IN_CHECKS and the check registry.
+
+    Called automatically at CLI startup when `custom_checks_module` is set
+    in pipeline.yaml. Safe to call multiple times — already-registered names
+    are overwritten with the latest definition.
+
+    Args:
+        module_path:    Path to the .py file, relative to the working directory.
+        check_registry: The CheckRegistry instance to register checks into.
+
+    Raises:
+        SystemExit: If the module file is not found or raises an import error,
+                    a clear message is printed and the pipeline exits rather than
+                    proceeding with missing checks.
+    """
+    path = Path(module_path)
+    if not path.exists():
+        print(
+            f"\n[error] custom_checks_module: '{module_path}' not found.\n"
+            f"Check the path in pipeline.yaml and try again."
+        )
+        sys.exit(1)
+
+    # Load the module from its file path without requiring it to be installed
+    spec = importlib.util.spec_from_file_location("_custom_checks", path)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        print(
+            f"\n[error] Failed to import custom_checks_module '{module_path}':\n"
+            f"{e}"
+        )
+        sys.exit(1)
+
+    if not DECORATED_CHECKS:
+        print(
+            f"[warn] Loaded '{module_path}' but found no @custom_check decorated functions."
+        )
+        return
+
+    for name, (func, kind) in DECORATED_CHECKS.items():
+        register_custom_check(name, func, check_registry, kind=kind)
+        print(f"[custom_check] Registered '{name}' (kind={kind}) from '{module_path}'")

@@ -9,7 +9,7 @@ from proto_pipe.checks.runner import run_checks, run_checks_and_flag
 from proto_pipe.io.data import load_from_duckdb
 from proto_pipe.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from proto_pipe.pipelines.watermark import WatermarkStore, _watermark_lock
-from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.reports.query import _log_run, init_report_runs_table
 
 
@@ -46,7 +46,21 @@ def _apply_transforms(
         try:
             result = check_registry.run(name, {"df": working_df})
             if isinstance(result, pd.DataFrame):
-                working_df = result
+                overwrite_cols = result.attrs.get("overwrite_cols")
+                if overwrite_cols:
+                    # Partial overwrite — only write specified columns back
+                    working_df = working_df.copy()
+                    for col in overwrite_cols:
+                        if col in result.columns:
+                            working_df[col] = result[col].values
+                        else:
+                            print(
+                                f"  [transform-warn] '{name}' overwrite_col '{col}' "
+                                f"not found in returned DataFrame — skipped"
+                            )
+                else:
+                    # Full replacement — existing behaviour
+                    working_df = result
             elif isinstance(result, pd.Series):
                 col_name = result.name
                 if col_name and col_name in working_df.columns:

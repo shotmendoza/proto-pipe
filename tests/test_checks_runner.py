@@ -24,7 +24,7 @@ import pytest
 from proto_pipe.checks.built_in import check_nulls, check_range
 from proto_pipe.checks.result import CheckResult
 from proto_pipe.checks.runner import run_check_safe, run_checks, run_checks_and_flag
-from proto_pipe.registry.base import CheckRegistry
+from proto_pipe.checks.registry import CheckRegistry
 from proto_pipe.reports.validation_flags import (
     count_validation_flags,
     detail_df,

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import duckdb
 
-from proto_pipe.io.registry import load_config
+from proto_pipe.io.config import load_config
 
 
 # ---------------------------------------------------------------------------

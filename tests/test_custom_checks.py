@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from proto_pipe.checks.helpers import custom_check, _DECORATED_CHECKS
+from proto_pipe.checks.helpers import custom_check, DECORATED_CHECKS, load_custom_checks_module
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +35,8 @@ class TestCustomCheckDecorator:
         def my_fn(context) -> pd.Series:
             return pd.Series([True])
 
-        assert "_test_decorator_check" in _DECORATED_CHECKS
-        func, kind = _DECORATED_CHECKS["_test_decorator_check"]
+        assert "_test_decorator_check" in DECORATED_CHECKS
+        func, kind = DECORATED_CHECKS["_test_decorator_check"]
         assert func is my_fn
         assert kind == "check"
 
@@ -68,7 +68,6 @@ class TestLoadCustomChecksModule:
             "    df = context['df']\n"
             "    return df[col] >= 0.2\n"
         ))
-        from proto_pipe.io.registry import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
         assert "margin_check" in check_registry.available()
@@ -84,7 +83,7 @@ class TestLoadCustomChecksModule:
             "    df = context['df']\n"
             "    return df[col] <= 1.0\n"
         ))
-        from proto_pipe.io.registry import load_custom_checks_module
+        from proto_pipe.checks.helpers import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
         df = pd.DataFrame({"pct": [0.5, 1.5, 0.9]})
@@ -95,14 +94,14 @@ class TestLoadCustomChecksModule:
         assert result.mask.sum() == 1  # 1 row fails (1.5 > 1.0)
 
     def test_missing_module_exits(self, tmp_path, check_registry):
-        from proto_pipe.io.registry import load_custom_checks_module
+        from proto_pipe.checks.helpers import load_custom_checks_module
         with pytest.raises(SystemExit):
             load_custom_checks_module(str(tmp_path / "nonexistent.py"), check_registry)
 
     def test_module_with_syntax_error_exits(self, tmp_path, check_registry):
         module_path = tmp_path / "bad_checks.py"
         _write_module(module_path, "def broken(:\n    pass\n")
-        from proto_pipe.io.registry import load_custom_checks_module
+        from proto_pipe.checks.helpers import load_custom_checks_module
         with pytest.raises(SystemExit):
             load_custom_checks_module(str(module_path), check_registry)
 
@@ -112,14 +111,14 @@ class TestLoadCustomChecksModule:
         module_path = tmp_path / "empty_checks.py"
         _write_module(module_path, "# no decorated functions here\nX = 1\n")
 
-        original = dict(_DECORATED_CHECKS)
-        _DECORATED_CHECKS.clear()
+        original = dict(DECORATED_CHECKS)
+        DECORATED_CHECKS.clear()
 
-        from proto_pipe.io.registry import load_custom_checks_module
+        from proto_pipe.checks.helpers import load_custom_checks_module
         try:
             load_custom_checks_module(str(module_path), check_registry)
         finally:
-            _DECORATED_CHECKS.update(original)
+            DECORATED_CHECKS.update(original)
 
         captured = capsys.readouterr()
         assert "warn" in captured.out.lower() or "no" in captured.out.lower()
@@ -142,9 +141,9 @@ class TestCustomCheckEndToEnd:
             "    return pd.Series([True] * len(df), index=df.index)\n"
         ))
         from proto_pipe.io.registry import (
-            load_custom_checks_module,
             register_from_config,
         )
+        from proto_pipe.checks.helpers import load_custom_checks_module
         load_custom_checks_module(str(module_path), check_registry)
 
         config = {

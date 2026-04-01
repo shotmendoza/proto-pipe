@@ -1,4 +1,7 @@
 """Shared constants used across proto_pipe modules."""
+from __future__ import annotations
+
+from pathlib import Path
 
 # Tables created and managed by the pipeline itself.
 # Excluded from user-facing table lists (e.g. vp new-report, vp table).
@@ -18,3 +21,33 @@ NUMERIC_DUCKDB_TYPES = frozenset({
     "DECIMAL", "NUMERIC",
 })
 """DuckDB numeric column types that may conflict with mixed-type incoming data."""
+
+
+DATE_FORMATS = [
+    ("%Y-%m-%d",  "2026-01-06"),
+    ("%m/%d/%Y",  "01/06/2026"),
+    ("%m-%d-%y",  "01-06-26"),
+    ("%d/%m/%Y",  "06/01/2026"),
+    ("%Y/%m/%d",  "2026/01/06"),
+    ("%m/%d/%y",  "01/06/26"),
+]
+
+# Common DuckDB types shown in all type selection prompts
+DUCKDB_TYPES = ["VARCHAR", "DOUBLE", "BIGINT", "BOOLEAN", "DATE", "TIMESTAMPTZ"]
+_DEFAULTS = {
+    "paths": {
+        "sources_config": "config/sources_config.yaml",
+        "reports_config": "config/reports_config.yaml",
+        "deliverables_config": "config/deliverables_config.yaml",
+        "views_config": "config/views_config.yaml",
+        "pipeline_db": "data/pipeline.db",
+        "watermark_db": "data/watermarks.db",
+        "incoming_dir": "data/incoming/",
+        "output_dir": "output/reports/",
+        "sql_dir": "sql/",
+    },
+    "multi_select_params": True,
+    "macros_dir": "macros",
+}
+VALID_PATH_KEYS = list(_DEFAULTS["paths"].keys())
+DEFAULT_SETTINGS_PATH = Path("pipeline.yaml")

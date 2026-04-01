@@ -1,19 +1,18 @@
 """CLI package — assembles all command groups onto the root `cli` group."""
 
 import click
-
 from .data import data_commands
-from .delete import delete_commands
-from .edit import edit_commands
+from proto_pipe.cli.commands.delete import delete_commands
+from proto_pipe.cli.commands.edit import edit_commands
 from .flagged import flagged_commands
-from .funcs import funcs_commands
-from .new import new_commands
+from proto_pipe.cli.commands.funcs import funcs_commands
+from proto_pipe.cli.commands.new import new_commands
 from .quickstart import setup_commands
 from .reports import reports_commands
 from .scaffold import scaffold_commands
-from .table import table_commands
-from .validation import validation_commands
-from .view import view_commands
+from proto_pipe.cli.commands.table import table_commands
+from proto_pipe.cli.commands.validation import validation_commands
+from proto_pipe.cli.commands.view import view_commands
 
 
 @click.group(context_settings={"max_content_width": 120})

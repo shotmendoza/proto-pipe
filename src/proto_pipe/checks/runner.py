@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from proto_pipe.checks.result import CheckResult
-from proto_pipe.registry.base import CheckRegistry
+from proto_pipe.checks.registry import CheckRegistry, CheckParamInspector
 
 
 def _get_check_args(check_name: str, registry) -> str | None:
@@ -13,7 +13,6 @@ def _get_check_args(check_name: str, registry) -> str | None:
     """
     import functools
     import inspect
-    from proto_pipe.checks.inspector import CheckParamInspector
 
     func = registry.get(check_name)
     if func is None:

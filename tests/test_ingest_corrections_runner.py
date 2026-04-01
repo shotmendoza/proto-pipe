@@ -646,7 +646,7 @@ class TestWatermarkOnlyAdvancesOnFullPass:
 
     def test_watermark_held_when_check_fails(self, tmp_path):
         from proto_pipe.reports.runner import run_report
-        from proto_pipe.registry.base import CheckRegistry
+        from proto_pipe.checks.registry import CheckRegistry
         from proto_pipe.pipelines.watermark import WatermarkStore
 
         watermark_store = WatermarkStore(str(tmp_path / "watermarks.db"))

@@ -29,7 +29,7 @@ from proto_pipe.pipelines.integrity import (
 # _auto_migrate (moved from ingest.py)
 # ---------------------------------------------------------------------------
 
-def _auto_migrate(
+def auto_migrate(
     conn: duckdb.DuckDBPyConnection,
     table: str,
     df: pd.DataFrame,

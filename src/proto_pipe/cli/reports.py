@@ -2,8 +2,9 @@
 
 import click
 
-from .helpers import load_custom_checks
-from ..io.config import config_path_or_override
+from ..io.registry import register_from_config
+from ..checks.helpers import load_custom_checks
+from ..io.config import config_path_or_override, load_config
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +40,6 @@ def pull_report(
     """
     import duckdb
 
-    from proto_pipe.io.registry import load_config
     from proto_pipe.reports.runner import run_deliverable
     from proto_pipe.reports.query import query_table
 
@@ -147,8 +147,8 @@ def run_all(
       vp run-all --deliverable monthly_pack --ignore-flagged
     """
     from proto_pipe.pipelines.watermark import WatermarkStore
-    from proto_pipe.registry.base import check_registry, report_registry
-    from proto_pipe.io.registry import load_config, register_from_config
+    from proto_pipe.checks.registry import check_registry, report_registry
+    from proto_pipe.io.config import load_config
     from proto_pipe.reports.runner import run_all_reports
     from proto_pipe.reports.runner import run_deliverable
     from proto_pipe.reports.query import query_table

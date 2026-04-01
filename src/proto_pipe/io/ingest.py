@@ -43,7 +43,7 @@ from proto_pipe.io.db import (
     get_column_types as get_existing_column_types,
     table_exists,
 )
-from proto_pipe.io.migration import _auto_migrate
+from proto_pipe.io.migration import auto_migrate
 from proto_pipe.pipelines.integrity import apply_declared_types, check_type_compatibility, IntegrityResult
 
 # ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
     write_to_db is idempotent and only updates when the function source changes.
     """
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-    from proto_pipe.checks.inspector import CheckParamInspector
+    from proto_pipe.checks.registry import CheckParamInspector
 
     for name, func in BUILT_IN_CHECKS.items():
         inspector = CheckParamInspector(func)
@@ -409,7 +409,7 @@ def ingest_directory(
                 )
 
             try:
-                new_cols = _auto_migrate(conn, table, df)
+                new_cols = auto_migrate(conn, table, df)
 
                 if primary_key:
                     df, flagged_count, skipped_count = _handle_duplicates(

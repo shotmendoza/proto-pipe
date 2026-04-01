@@ -90,7 +90,7 @@ when you're building checks programmatically rather than from a module file.
 ```python
 import pandas as pd
 from proto_pipe.checks.helpers import register_custom_check
-from proto_pipe.registry.base import check_registry
+from proto_pipe.checks.registry import check_registry
 
 
 def check_margin(context: dict, col: str = "margin", threshold: float = 0.2) -> pd.Series:

@@ -17,9 +17,8 @@ from functools import partial
 import pandas as pd
 import pytest
 
-from proto_pipe.checks.inspector import CheckParamInspector
 from proto_pipe.checks.result import wrap_series_check
-from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckParamInspector
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +356,6 @@ class TestResolveCheckUuidExpansion:
 
 class TestMultiSelectParamsSetting:
     def test_defaults_to_true(self):
-        from proto_pipe.io.settings import load_settings
+        from proto_pipe.io.config import load_settings
         settings = load_settings()
         assert settings.get("multi_select_params") is True

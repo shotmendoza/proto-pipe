@@ -1,7 +1,7 @@
 """
 Tests for:
   - CheckAudit dataclass and validate_check return type (inspector.py)
-  - CheckRegistry._bad_checks, failed(), register() routing (base.py)
+  - CheckRegistry._bad_checks, failed(), register() routing (registry.py)
   - IntegrityResult dataclass (ingest.py)
   - _get_existing_column_types (ingest.py)
   - _check_type_compatibility (ingest.py)
@@ -15,7 +15,6 @@ import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.checks.inspector import CheckAudit, CheckContract, validate_check
 from proto_pipe.cli.scaffold import _filter_uningested
 from proto_pipe.io.db import init_ingest_log, get_column_types
 from proto_pipe.io.ingest import (
@@ -24,7 +23,7 @@ from proto_pipe.io.ingest import (
     ingest_directory,
 )
 from proto_pipe.pipelines.integrity import check_type_compatibility, IntegrityResult
-from proto_pipe.registry.base import CheckRegistry
+from proto_pipe.checks.registry import CheckRegistry, CheckContract, CheckAudit, validate_check
 
 
 # ---------------------------------------------------------------------------

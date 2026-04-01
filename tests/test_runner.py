@@ -21,11 +21,12 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
+from proto_pipe.checks.helpers import register_custom_check
 from proto_pipe.checks.built_in import check_nulls, check_range
 from proto_pipe.checks.result import CheckResult
 from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
-from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.reports.runner import run_report, run_all_reports
 from proto_pipe.reports.validation_flags import (
     count_validation_flags,
@@ -334,7 +335,6 @@ class TestRunAllReports:
         _init_pipeline_db(pipeline_db)
         _seed_table(pipeline_db, "sales", sales_df)
 
-        from proto_pipe import register_custom_check
 
         def check_negative_price(ctx, col: str = "price") -> pd.Series:
             df = ctx["df"]

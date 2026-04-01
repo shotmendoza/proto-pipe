@@ -22,7 +22,7 @@ from proto_pipe.cli.scaffold import (
     _get_param_suggestions,
     _record_param_history,
     _sort_views,
-    _build_sql_scaffold,
+    _build_rich_sql_scaffold,
 )
 
 
@@ -336,7 +336,7 @@ class TestBuildSqlScaffold:
         rep_cfg, src_cfg = self._make_configs([
             {"table": "sales", "primary_key": "order_id"}
         ])
-        sql = _build_sql_scaffold(
+        sql = _build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation"],
             rep_cfg,
@@ -350,7 +350,7 @@ class TestBuildSqlScaffold:
             {"table": "sales", "primary_key": "order_id"},
             {"table": "customers", "primary_key": "order_id"},
         ])
-        sql = _build_sql_scaffold(
+        sql = _build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation", "customers_validation"],
             rep_cfg,
@@ -364,7 +364,7 @@ class TestBuildSqlScaffold:
             {"table": "sales", "primary_key": "order_id"},
             {"table": "inventory", "primary_key": "sku"},
         ])
-        sql = _build_sql_scaffold(
+        sql = _build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation", "inventory_validation"],
             rep_cfg,
@@ -378,7 +378,7 @@ class TestBuildSqlScaffold:
             {"table": "sales", "primary_key": None},
             {"table": "customers", "primary_key": None},
         ])
-        sql = _build_sql_scaffold(
+        sql = _build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation", "customers_validation"],
             rep_cfg,
@@ -391,7 +391,7 @@ class TestBuildSqlScaffold:
         rep_cfg, src_cfg = self._make_configs([
             {"table": "sales", "primary_key": "order_id"}
         ])
-        sql = _build_sql_scaffold(
+        sql = _build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation"],
             rep_cfg,
@@ -403,7 +403,7 @@ class TestBuildSqlScaffold:
         rep_cfg, src_cfg = self._make_configs([
             {"table": "sales", "primary_key": "order_id"}
         ])
-        sql = _build_sql_scaffold(
+        sql = _build_rich_sql_scaffold(
             "my_deliverable",
             ["sales_validation"],
             rep_cfg,
@@ -412,6 +412,6 @@ class TestBuildSqlScaffold:
         assert "my_deliverable" in sql
 
     def test_empty_selected_reports_returns_placeholder(self):
-        sql = _build_sql_scaffold("carrier_a", [], {}, {})
+        sql = _build_rich_sql_scaffold("carrier_a", [], {}, {})
         assert "SELECT" in sql
         assert "<table>" in sql

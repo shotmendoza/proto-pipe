@@ -5,17 +5,9 @@ from pathlib import Path
 import click
 import duckdb
 
-from proto_pipe.io.config import config_path_or_override
+from proto_pipe.io.config import config_path_or_override, load_config, load_settings
 from proto_pipe.constants import PIPELINE_TABLES
-
-
-def _get_all_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
-    """Return all tables in the pipeline DB."""
-    return conn.execute("""
-                        SELECT table_name FROM information_schema.tables
-                        WHERE table_schema = 'main'
-                        ORDER BY table_name
-                        """).df()["table_name"].tolist()
+from proto_pipe.io.db import get_all_tables
 
 
 def _get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
@@ -143,8 +135,8 @@ class TextualReview(ReviewInterface):
                     def compose(self) -> ComposeResult:
                         yield Input(value=current_val, placeholder=f"Edit {col_name}")
 
-                    def on_input_submitted(self, event: Input.Submitted) -> None:
-                        self.dismiss(event.value)
+                    def on_input_submitted(self, sub_event: Input.Submitted) -> None:
+                        self.dismiss(sub_event.value)
 
                 def handle_edit(new_val):
                     if new_val is not None:
@@ -183,7 +175,7 @@ class TextualReview(ReviewInterface):
         return edited_df
 
 
-def _get_reviewer(edit: bool = False) -> ReviewInterface:
+def get_reviewer(edit: bool = False) -> ReviewInterface:
     """Return the best available reviewer."""
     if edit:
         try:
@@ -213,9 +205,9 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
 
     \b
     Examples:
-      vp table                        # select table interactively
-      vp table sales                  # view sales table
-      vp table flagged_rows --edit    # edit flagged rows inline
+      vp table # select table interactively
+      vp table sales # view sales table
+      vp table flagged_rows --edit # edit flagged rows inline
       vp table ingest_log --export ingest_log.csv
     """
     import questionary
@@ -224,7 +216,7 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
     conn = duckdb.connect(p_db)
 
     try:
-        all_tables = _get_all_tables(conn)
+        all_tables = get_all_tables(conn)
 
         if not all_tables:
             click.echo("  No tables found in the pipeline DB. Run: vp ingest")
@@ -274,8 +266,6 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
             return
 
         # Get primary key for this table if it's a user table
-        from proto_pipe.io.registry import load_config
-        from proto_pipe.io.settings import load_settings
 
         settings = load_settings()
         pk_col = None
@@ -288,7 +278,7 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
         except Exception:
             pass
 
-        reviewer = _get_reviewer(edit=edit)
+        reviewer = get_reviewer(edit=edit)
 
         if edit:
             edited_df = reviewer.edit(

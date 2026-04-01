@@ -11,8 +11,7 @@ import pandas as pd
 import pytest
 
 from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-from proto_pipe.checks.helpers import _DECORATED_CHECKS, custom_check, register_custom_check
-from proto_pipe.checks.inspector import CheckContract
+from proto_pipe.checks.helpers import DECORATED_CHECKS, custom_check, register_custom_check
 from proto_pipe.io.db import init_ingest_log, table_exists
 from proto_pipe.io.ingest import (
     init_db,
@@ -25,7 +24,7 @@ from proto_pipe.io.registry import (
     _expand_check_with_alias_map,
     register_from_config,
 )
-from proto_pipe.registry.base import CheckRegistry, ReportRegistry
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckContract, validate_check
 from proto_pipe.reports.runner import _apply_transforms
 
 
@@ -181,7 +180,6 @@ def test_registry_run_unpacks_entry():
 
 def test_invalid_kind_skips_registration(capsys):
     """Invalid kind should warn and skip registration, not raise."""
-    from proto_pipe.checks.inspector import validate_check
 
     def my_check(ctx: dict) -> pd.Series:
         return pd.Series([True])
@@ -200,8 +198,8 @@ def test_custom_check_decorator_stores_tuple():
     def my_check(ctx: dict) -> pd.Series:
         return pd.Series([True])
 
-    assert "_test_check_tuple" in _DECORATED_CHECKS
-    func, kind = _DECORATED_CHECKS["_test_check_tuple"]
+    assert "_test_check_tuple" in DECORATED_CHECKS
+    func, kind = DECORATED_CHECKS["_test_check_tuple"]
     assert callable(func)
     assert kind == "check"
 
@@ -211,7 +209,7 @@ def test_custom_check_decorator_transform_kind():
     def my_transform(ctx: dict) -> pd.Series:
         return ctx["df"]["val"]
 
-    func, kind = _DECORATED_CHECKS["_test_transform_tuple"]
+    func, kind = DECORATED_CHECKS["_test_transform_tuple"]
     assert kind == "transform"
 
 
@@ -825,7 +823,7 @@ def test_load_macros_idempotent(tmp_path):
 
 def test_new_macro_creates_sql_file(tmp_path):
     from click.testing import CliRunner
-    from proto_pipe.cli.scaffold import new_macro
+    from proto_pipe.cli.commands.new import new_macro
 
     macros_dir = tmp_path / "macros"
     runner = CliRunner()
@@ -841,7 +839,7 @@ def test_new_macro_creates_sql_file(tmp_path):
 
 def test_new_macro_skips_existing_file(tmp_path):
     from click.testing import CliRunner
-    from proto_pipe.cli.scaffold import new_macro
+    from proto_pipe.cli.commands.new import new_macro
 
     macros_dir = tmp_path / "macros"
     macros_dir.mkdir()
