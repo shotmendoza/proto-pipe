@@ -1,19 +1,29 @@
-"""Flagged-row commands — flagged-summary, flagged-list, flagged-clear,
-export-flagged, import-corrections, check-null-overwrites."""
+"""Flagged and validated commands.
+
+vp flagged            — view raw flagged_rows (ingest conflicts)
+vp flagged edit       — enriched editable view joined to source table
+vp flagged clear      — clear flags without applying corrections
+vp flagged retry      — apply corrected file, clear resolved flags
+vp validated          — view validation_flags (check failures)
+
+Kept as top-level:
+  vp check-null-overwrites
+"""
 
 from pathlib import Path
 
 import click
+import duckdb
 
-from proto_pipe.cli.helpers import config_path_or_override
+from proto_pipe.io.config import config_path_or_override
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _resolve_primary_key(table: str, sources_config: str | None) -> str | None:
-    """Look up the primary key for a table from sources_config.yaml.
-
-    Returns the key string if found, or None after printing an error message.
-    """
-    from proto_pipe.cli.helpers import config_path_or_override
+    """Look up the primary key for a table from sources_config.yaml."""
     from proto_pipe.io.config import SourceConfig
 
     src_cfg = config_path_or_override("sources_config", sources_config)
@@ -40,157 +50,223 @@ def _resolve_primary_key(table: str, sources_config: str | None) -> str | None:
     return primary_key
 
 
-# ---------------------------------------------------------------------------
-# flagged-summary
-# ---------------------------------------------------------------------------
-
-
-@click.command("flagged-summary")
-@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-def flagged_summary(pipeline_db):
-    """Print a count of open flagged rows by table and reason.
-
-    Use this as a quick health check after ingest or validate to see
-    whether anything needs attention before running pull-report.
-
-    \b
-    Example:
-      vp flagged-summary
+def _get_flagged_df(
+    conn: duckdb.DuckDBPyConnection,
+    table: str | None,
+) -> "pd.DataFrame":
+    """Return raw flagged_rows, optionally filtered by table_name."""
+    query = """
+        SELECT
+            table_name,
+            check_name,
+            reason,
+            flagged_at,
+            id AS _flag_id
+        FROM flagged_rows
     """
-    import duckdb
+    params = []
+    if table:
+        query += " WHERE table_name = ?"
+        params.append(table)
+    query += " ORDER BY flagged_at DESC"
+    return conn.execute(query, params).df()
 
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    conn = duckdb.connect(p_db)
-    try:
-        df = conn.execute("""
-            SELECT
-                table_name,
-                check_name,
-                reason,
-                count(*) AS flagged_count,
-                min(flagged_at) AS first_flagged,
-                max(flagged_at) AS last_flagged
-            FROM flagged_rows
-            GROUP BY table_name, check_name, reason
-            ORDER BY table_name, flagged_count DESC
-        """).df()
 
-        if df.empty:
-            click.echo("\n  No flagged rows — all clear.")
-            return
+def _get_enriched_flagged_df(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    pk_col: str,
+) -> "pd.DataFrame":
+    """Join flagged_rows to the source table via md5 identity.
 
-        total = df["flagged_count"].sum()
-        click.echo(f"\n{total} flagged row(s) across {df['table_name'].nunique()} table(s):\n")
+    flagged_rows.id = md5(str(pk_value)) — set at flag time in ingest.
+    Join: md5(CAST(source.pk_col AS VARCHAR)) = flagged_rows.id
+    """
+    source_cols = conn.execute(f"""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = ?
+        AND column_name NOT LIKE '\\_%' ESCAPE '\\'
+        ORDER BY ordinal_position
+    """, [table]).df()["column_name"].tolist()
 
-        current_table = None
-        for _, row in df.iterrows():
-            if row["table_name"] != current_table:
-                current_table = row["table_name"]
-                click.echo(f"{current_table}")
-            click.echo(f"{row['flagged_count']:>4}  [{row['check_name']}]  {row['reason']}")
+    if not source_cols:
+        return _get_flagged_df(conn, table)
 
-        click.echo(f"\nRun: vp flagged-list --table <n>    to see affected rows")
-        click.echo(f"Run: vp export-flagged --table <n>  to export for correction")
-    finally:
-        conn.close()
+    col_select = ", ".join([f's."{c}"' for c in source_cols])
+
+    return conn.execute(f"""
+        SELECT
+            f.id          AS _flag_id,
+            f.check_name  AS _check_name,
+            f.reason      AS _flag_reason,
+            f.flagged_at  AS _flagged_at,
+            {col_select}
+        FROM flagged_rows f
+        LEFT JOIN "{table}" s
+            ON md5(CAST(s."{pk_col}" AS VARCHAR)) = f.id
+        WHERE f.table_name = ?
+        ORDER BY f.flagged_at DESC
+    """, [table]).df()
 
 
 # ---------------------------------------------------------------------------
-# flagged-list
+# vp flagged (group)
 # ---------------------------------------------------------------------------
-@click.command("flagged-list")
-@click.option("--table", required=True, help="Table to list flagged rows for.")
-@click.option("--check", default=None, help="Filter by check name (e.g. duplicate_conflict).")
-@click.option("--limit", default=50, show_default=True, help="Max rows to display.")
+
+@click.group(
+    "flagged",
+    invoke_without_command=True,
+    context_settings={"max_content_width": 120},
+)
+@click.option("--table", default=None, help="Filter by source table name.")
+@click.option(
+    "--export",
+    default=None,
+    type=click.Choice(["csv", "term"]),
+    help="Export format: csv writes a file, term prints to terminal.",
+)
+@click.option("--limit", default=500, show_default=True, help="Max rows to display.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-def flagged_list(table, check, limit, pipeline_db):
-    """Print flagged rows for a table inline in the terminal.
+@click.pass_context
+def flagged_cmd(ctx, table, export, limit, pipeline_db):
+    """View ingest-time flagged rows (duplicate conflicts, type errors).
 
-    Shows the flag metadata alongside the source row data so you can
-    assess the issue without opening a SQL client or exporting a file.
+    Shows the raw flagged_rows table through a rich paged display.
+    Use --table to scope to one source table.
 
     \b
     Examples:
-      vp flagged-list --table sales
-      vp flagged-list --table sales --check duplicate_conflict
-      vp flagged-list --table sales --limit 20
+      vp flagged
+      vp flagged --table sales
+      vp flagged --export csv
+      vp flagged edit --table sales
+      vp flagged clear --table sales
+      vp flagged retry corrected.csv --table sales
     """
-    import duckdb
+    if ctx.invoked_subcommand is not None:
+        return
+
+    from proto_pipe.cli.table import _get_reviewer
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
+
     try:
-        query  = """
-            SELECT id AS _flag_id, row_index, check_name, reason AS _flag_reason, flagged_at
-            FROM flagged_rows
-            WHERE table_name = ?
-        """
-        params = [table]
-        if check:
-            query += " AND check_name = ?"
-            params.append(check)
-        query += " ORDER BY flagged_at DESC"
+        df = _get_flagged_df(conn, table)
 
-        flags = conn.execute(query, params).df()
-
-        if flags.empty:
-            click.echo(f"\n  No flagged rows for '{table}'.")
+        if df.empty:
+            scope = f"'{table}'" if table else "any table"
+            click.echo(f"\n  No flagged rows for {scope} — all clear.")
             return
 
-        total = len(flags)
-        shown = min(total, limit)
-        click.echo(f"\n  {total} flagged row(s) for '{table}' (showing {shown}):\n")
+        df = df.head(limit)
+        title = f"flagged_rows{f' — {table}' if table else ''} ({len(df)} rows)"
 
-        # Pull matching source rows
-        source_df = conn.execute(f'SELECT * FROM "{table}"').df()
-        source_df["_row_index"] = source_df.index
+        if export == "csv":
+            from proto_pipe.reports.corrections import dated_export_path
+            out_dir = config_path_or_override("output_dir")
+            table_label = table or "all"
+            output_path = dated_export_path(out_dir, f"flagged_{table_label}")
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(output_path, index=False)
+            click.echo(f"[ok] {len(df)} row(s) exported to: {output_path}")
+        else:
+            reviewer = _get_reviewer(edit=False)
+            reviewer.show(df, title=title)
 
-        merged = (
-            flags.head(limit)
-            .merge(source_df, left_on="row_index", right_on="_row_index", how="left")
-            .drop(columns=["_row_index", "row_index", "_flag_id"])
-        )
-
-        for _, row in merged.iterrows():
-            click.echo(f"  ── [{row['check_name']}] {row['_flag_reason']}")
-            click.echo(f"     flagged: {row['flagged_at']}")
-            skip = {"check_name", "_flag_reason", "flagged_at"}
-            for col in [c for c in merged.columns if c not in skip]:
-                click.echo(f"     {col}: {row[col]}")
-            click.echo()
-
-        if total > limit:
-            click.echo(
-                f"  ... {total - limit} more row(s) not shown. "
-                f"Use --limit or vp export-flagged to see all."
-            )
     finally:
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# flagged-clear
-# ---------------------------------------------------------------------------
-@click.command("flagged-clear")
+@flagged_cmd.command("edit")
+@click.option("--table", required=True, help="Source table to review and edit.")
+@click.option("--key", default=None, help="Override primary key column.")
+@click.option("--sources-config", default=None, help="Override sources config path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def flagged_edit(table, key, sources_config, pipeline_db):
+    """Open flagged rows in an enriched editable view joined to source data.
+
+    Requires textual (uv add 'proto-pipe[tui]') for inline editing.
+    Falls back to a read-only rich display if textual is not installed.
+    Edits are saved via 'vp flagged retry' logic automatically on save.
+
+    \b
+    Example:
+      vp flagged edit --table sales
+    """
+    from proto_pipe.cli.table import _get_reviewer
+    from proto_pipe.reports.corrections import import_corrections
+    import tempfile
+    import os
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    pk_col = key or _resolve_primary_key(table, sources_config)
+
+    if not pk_col:
+        click.echo(
+            f"[error] Cannot build enriched view without a primary key for '{table}'.\n"
+            f"Set primary_key in sources_config.yaml or use --key."
+        )
+        return
+
+    conn = duckdb.connect(p_db)
+    try:
+        df = _get_enriched_flagged_df(conn, table, pk_col)
+
+        if df.empty:
+            click.echo(f"\n  No flagged rows for '{table}'.")
+            return
+
+        title = f"flagged — {table} ({len(df)} rows, enriched)"
+        reviewer = _get_reviewer(edit=True)
+        edited_df = reviewer.edit(df, title=title, pk_col=pk_col)
+
+        if edited_df is not None and not edited_df.equals(df):
+            save_cols = [
+                c for c in edited_df.columns
+                if c not in ("_check_name", "_flag_reason", "_flagged_at")
+            ]
+            corrections_df = edited_df[save_cols]
+
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+                corrections_path = f.name
+            try:
+                corrections_df.to_csv(corrections_path, index=False)
+                result = import_corrections(conn, table, corrections_path, pk_col)
+                click.echo(f"[ok] {result['updated']} row(s) updated in '{table}'")
+                if result["flagged_cleared"]:
+                    click.echo(
+                        f"[ok] {result['flagged_cleared']} flag(s) cleared from flagged_rows"
+                    )
+            finally:
+                os.unlink(corrections_path)
+        else:
+            click.echo("  No changes made.")
+
+    except Exception as e:
+        click.echo(f"[error] Could not build enriched view: {e}")
+        click.echo("  Run 'vp flagged --table' for the raw flags view.")
+    finally:
+        conn.close()
+
+
+@flagged_cmd.command("clear")
 @click.option("--table", required=True, help="Table to clear flags for.")
 @click.option("--check", default=None, help="Only clear flags for this check name.")
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 def flagged_clear(table, check, yes, pipeline_db):
-    """Clear all flagged rows for a table without applying corrections.
+    """Clear flagged rows for a table without applying corrections.
 
     Use this when you've reviewed the flags and decided to proceed without
-    making corrections (e.g. the data is acceptable as-is). This action
-    cannot be undone.
+    making corrections. This action cannot be undone.
 
     \b
     Examples:
-      vp flagged-clear --table sales
-      vp flagged-clear --table sales --check duplicate_conflict
-      vp flagged-clear --table sales --yes
+      vp flagged clear --table sales
+      vp flagged clear --table sales --check duplicate_conflict --yes
     """
-    import duckdb
-
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
@@ -228,108 +304,49 @@ def flagged_clear(table, check, yes, pipeline_db):
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# export-flagged
-# ---------------------------------------------------------------------------
-@click.command("export-flagged")
-@click.option("--table", required=True, help="Table to export flagged rows from.")
-@click.option("--key", default=None, help="Override primary key column (default: from sources_config.yaml).")
-@click.option("--output", default=None,  help="Output CSV path. Defaults to flagged_<table>.csv in output_dir.")
-@click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
-@click.option("--sources-config", default=None, help="Override sources config path.")
-def export_flagged(table, key, output, pipeline_db, sources_config):
-    """Export flagged rows for a table to CSV for manual correction.
-
-    The file includes all source columns plus _flag_id and _flag_reason.
-    Fix the values in the file, then run import-corrections to apply them.
-
-    \b
-    Example:
-      vp export-flagged --table sales
-      vp export-flagged --table sales --output /tmp/sales_fixes.csv
-      vp export-flagged --table sales --key order_id
-    """
-    import duckdb
-    from proto_pipe.reports.corrections import export_flagged as _export, dated_export_path
-
-    primary_key = key or _resolve_primary_key(table, sources_config)
-    if not primary_key:
-        return
-
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    out_dir = config_path_or_override("output_dir")
-    output_path = output or dated_export_path(out_dir, table)
-
-    conn = duckdb.connect(p_db)
-    try:
-        count = _export(conn, table, output_path, primary_key)
-        click.echo(f"[ok] {count} flagged row(s) exported to: {output_path}")
-        click.echo(f"\nFix the values, then run:")
-        click.echo(f"vp import-corrections {output_path} --table {table}")
-    except ValueError as e:
-        click.echo(f"[error] {e}")
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# import-corrections
-# ---------------------------------------------------------------------------
-
-
-@click.command("import-corrections")
+@flagged_cmd.command("retry")
 @click.argument("filepath")
 @click.option("--table", required=True, help="Table to apply corrections to.")
-@click.option("--key", default=None,  help="Override primary key column (default: from sources_config.yaml).")
-@click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
-@click.option("--sources-config", default=None,  help="Override sources config path.")
-def import_corrections(filepath, table, key, pipeline_db, sources_config):
-    """Apply a corrected CSV back to the source table and clear resolved flags.
+@click.option("--key", default=None, help="Override primary key column.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--sources-config", default=None, help="Override sources config path.")
+def flagged_retry(filepath, table, key, pipeline_db, sources_config):
+    """Apply a corrected file back to the source table and clear resolved flags.
 
-    Primary key is read from sources_config.yaml or overridden with --key.
-    Only columns present in both the file and the table are updated.
+    Takes the corrected CSV (typically from 'vp flagged --export csv'),
+    updates matching rows in the source table by primary key, and clears
+    any flags that are now resolved.
 
     \b
     Example:
-      vp import-corrections flagged_sales.csv --table sales
-      vp import-corrections flagged_sales.csv --table sales --key order_id
+      vp flagged retry flagged_sales_2026-01-06.csv --table sales
+      vp flagged retry corrected.csv --table sales --key policy_id
     """
-    import duckdb
-
-    from proto_pipe.reports.corrections import import_corrections as _import
-    from proto_pipe.io.registry import load_config
+    from proto_pipe.reports.corrections import import_corrections
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
-    src_cfg = config_path_or_override("sources_config", sources_config)
     path = Path(filepath)
 
     if not path.exists():
         click.echo(f"[error] File not found: {filepath}")
         return
 
-    # Resolve primary key: --key overrides sources_config.yaml
     primary_key = key or _resolve_primary_key(table, sources_config)
     if not primary_key:
-        _config = load_config(src_cfg)
-        sources = {s["target_table"]: s for s in _config["sources"]}
-        if table not in sources:
-            click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
-            click.echo("Use --key to specify the primary key directly.")
-            return
-        primary_key = sources[table].get("primary_key")
-        if not primary_key:
-            click.echo(f"[error] No primary_key defined for '{table}' in sources_config.yaml")
-            click.echo("Add primary_key to the source or use --key.")
-            return
+        return
 
     conn = duckdb.connect(p_db)
     try:
-        result = _import(conn, table, str(path), primary_key)
+        result = import_corrections(conn, table, str(path), primary_key)
         click.echo(f"[ok] {result['updated']} row(s) updated in '{table}'")
         if result["flagged_cleared"]:
-            click.echo(f"[ok] {result['flagged_cleared']} ingest conflict(s) cleared from flagged_rows")
+            click.echo(
+                f"[ok] {result['flagged_cleared']} ingest conflict(s) cleared from flagged_rows"
+            )
         if result["validation_cleared"]:
-            click.echo(f"[ok] {result['validation_cleared']} validation flag(s) cleared from validation_flags")
+            click.echo(
+                f"[ok] {result['validation_cleared']} validation flag(s) cleared from validation_flags"
+            )
     except (ValueError, FileNotFoundError) as e:
         click.echo(f"[error] {e}")
     finally:
@@ -337,44 +354,107 @@ def import_corrections(filepath, table, key, pipeline_db, sources_config):
 
 
 # ---------------------------------------------------------------------------
-# check-null-overwrites
+# vp validated
 # ---------------------------------------------------------------------------
+
+@click.command("validated")
+@click.option("--table", default=None, help="Filter by source table name.")
+@click.option("--report", default=None, help="Filter by report name.")
+@click.option(
+    "--export",
+    default=None,
+    type=click.Choice(["csv", "term"]),
+    help="Export format: csv writes a file, term prints to terminal.",
+)
+@click.option("--limit", default=500, show_default=True, help="Max rows to display.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def validated_cmd(table, report, export, limit, pipeline_db):
+    """View validation flags (check failures from vp validate).
+
+    These warn but do not block deliverables. The correction path is:
+    fix at source → re-ingest → re-validate.
+
+    \b
+    Examples:
+      vp validated
+      vp validated --report daily_sales_validation
+      vp validated --table sales
+      vp validated --export csv
+    """
+    from proto_pipe.cli.table import _get_reviewer
+    from proto_pipe.reports.validation_flags import detail_df
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    conn = duckdb.connect(p_db)
+
+    try:
+        try:
+            df = detail_df(conn, report_name=report)
+        except Exception as e:
+            click.echo(f"[error] Could not read validation_flags: {e}")
+            click.echo("Has 'vp db-init' been run yet?")
+            return
+
+        if table:
+            df = df[df["table_name"] == table].copy()
+
+        if df.empty:
+            parts = []
+            if report:
+                parts.append(f"report '{report}'")
+            if table:
+                parts.append(f"table '{table}'")
+            scope = " / ".join(parts) if parts else "any report"
+            click.echo(f"\n  No validation flags for {scope} — all clear.")
+            return
+
+        df = df.head(limit)
+        display_df = df.drop(columns=["_flag_id"], errors="ignore")
+
+        parts = []
+        if report:
+            parts.append(report)
+        if table:
+            parts.append(table)
+        label = " / ".join(parts) if parts else "all reports"
+        title = f"validation_flags — {label} ({len(display_df)} rows)"
+
+        if export == "csv":
+            from proto_pipe.reports.corrections import dated_export_path
+            out_dir = config_path_or_override("output_dir")
+            label_safe = (report or table or "all").replace(" ", "_")
+            output_path = dated_export_path(out_dir, f"validated_{label_safe}")
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            display_df.to_csv(output_path, index=False)
+            click.echo(f"[ok] {len(display_df)} row(s) exported to: {output_path}")
+        else:
+            reviewer = _get_reviewer(edit=False)
+            reviewer.show(display_df, title=title)
+
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Kept as top-level: check-null-overwrites
+# ---------------------------------------------------------------------------
+
 @click.command("check-null-overwrites")
 @click.option("--table", required=True, help="Table to scan for duplicate conflicts.")
-@click.option("--pipeline-db", default=None,  help="Override pipeline DB path.")
-@click.option("--sources-config", default=None,  help="Override sources config path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--sources-config", default=None, help="Override sources config path.")
 def check_null_overwrites_cmd(table, pipeline_db, sources_config):
-    """Manually scan a table for rows with the same primary key but different
-    content, and flag any new conflicts not already in flagged_rows.
-
-    Useful after a schema change or to audit an existing table without
-    waiting for a new ingest run.
+    """Scan a table for rows with the same primary key but different content.
 
     \b
     Example:
       vp check-null-overwrites --table sales
     """
-    import duckdb
-
     from proto_pipe.io.ingest import check_null_overwrites
-    from proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
-    src_cfg = config_path_or_override("sources_config", sources_config)
-
-    _config = load_config(src_cfg)
-    sources = {s["target_table"]: s for s in _config["sources"]}
-
-    if table not in sources:
-        click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
-        return
-
     primary_key = _resolve_primary_key(table, sources_config)
     if not primary_key:
-        click.echo(
-            f"  [error] No primary_key defined for '{table}' in sources_config.yaml\n"
-            f"  Add primary_key to the source definition to enable conflict detection."
-        )
         return
 
     conn = duckdb.connect(p_db)
@@ -382,17 +462,18 @@ def check_null_overwrites_cmd(table, pipeline_db, sources_config):
         flagged = check_null_overwrites(conn, table, primary_key)
         if flagged:
             click.echo(f"[ok] {flagged} new conflict(s) flagged in '{table}'")
-            click.echo(f"Run: vp export-flagged --table {table}")
+            click.echo(f"Run: vp flagged --table {table}")
         else:
             click.echo(f"[ok] No new conflicts found in '{table}'")
     finally:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 def flagged_commands(cli):
-    cli.add_command(flagged_summary)
-    cli.add_command(flagged_list)
-    cli.add_command(flagged_clear)
-    cli.add_command(export_flagged)
-    cli.add_command(import_corrections)
+    cli.add_command(flagged_cmd)
+    cli.add_command(validated_cmd)
     cli.add_command(check_null_overwrites_cmd)

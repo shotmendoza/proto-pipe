@@ -13,7 +13,7 @@ import click
 import duckdb
 import questionary
 
-from proto_pipe.cli.helpers import config_path_or_override
+from proto_pipe.io.config import config_path_or_override
 from proto_pipe.constants import PIPELINE_TABLES
 from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry

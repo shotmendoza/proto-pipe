@@ -1,31 +1,5 @@
-from proto_pipe.io.settings import load_settings
+from proto_pipe.io.config import config_settings
 from proto_pipe.registry.base import CheckRegistry
-
-
-def config_settings():
-    """A utility function to load and return configurations.
-
-    This function serves as a wrapper for loading application
-    settings or configurations using the load_settings method.
-    It operates internally and is not intended to be accessed
-    outside the module.
-
-    :return: Loaded application settings or configurations.
-    """
-    return load_settings()
-
-
-def config_path_or_override(
-        key: str,
-        override: str | None = None
-) -> str:
-    """Return a path from settings, optionally overridden by a CLI flag.
-
-    :param key: The key used to identify the path in the settings dictionary.
-    :param override: An optional value that overrides the value fetched from the settings dictionary. Defaults to None.
-    :return: The path configuration value, either from the settings dictionary or the override if provided.
-    """
-    return override or config_settings()["paths"][key]
 
 
 def load_custom_checks(check_registry: CheckRegistry) -> None:

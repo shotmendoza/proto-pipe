@@ -2,7 +2,8 @@
 
 import click
 
-from .helpers import config_path_or_override, load_custom_checks
+from .helpers import load_custom_checks
+from ..io.config import config_path_or_override
 
 
 # ---------------------------------------------------------------------------

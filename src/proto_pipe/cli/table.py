@@ -5,7 +5,7 @@ from pathlib import Path
 import click
 import duckdb
 
-from proto_pipe.cli.helpers import config_path_or_override
+from proto_pipe.io.config import config_path_or_override
 from proto_pipe.constants import PIPELINE_TABLES
 
 
