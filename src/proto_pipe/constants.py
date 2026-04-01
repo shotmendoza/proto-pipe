@@ -9,6 +9,7 @@ PIPELINE_TABLES: frozenset[str] = frozenset({
     "validation_flags",
     "check_params_history",
     "check_registry_metadata",
+    "column_type_registry",
 })
 
 NUMERIC_DUCKDB_TYPES = frozenset({

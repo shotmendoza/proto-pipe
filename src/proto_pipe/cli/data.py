@@ -203,11 +203,11 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
 
     from proto_pipe.io.ingest import (
         load_file,
-        _init_ingest_log,
-        _table_exists,
-        _auto_migrate,
-        _log_ingest,
     )
+    from ..io.migration import _auto_migrate
+    from ..io.db import table_exists
+    from ..io.db import log_ingest
+    from ..io.db import init_ingest_log
     from proto_pipe.io.registry import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -232,9 +232,9 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
         return
 
     conn = duckdb.connect(p_db)
-    _init_ingest_log(conn)
+    init_ingest_log(conn)
 
-    if mode == "replace" or not _table_exists(conn, table):
+    if mode == "replace" or not table_exists(conn, table):
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
         new_cols = []
@@ -244,7 +244,7 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
         conn.execute(f'INSERT INTO "{table}" SELECT * FROM df')
         click.echo(f"[ok] '{table}' updated from '{path.name}' ({len(df)} rows appended)")
 
-    _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
+    log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
     conn.close()
 
 

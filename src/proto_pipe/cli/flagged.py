@@ -8,32 +8,28 @@ import click
 from proto_pipe.cli.helpers import config_path_or_override
 
 
-def _resolve_primary_key(
-        table: str,
-        sources_config: str | None
-) -> str | None:
+def _resolve_primary_key(table: str, sources_config: str | None) -> str | None:
     """Look up the primary key for a table from sources_config.yaml.
 
     Returns the key string if found, or None after printing an error message.
-    The caller should return early when this returns None.
     """
-    from proto_pipe.io.registry import load_config
+    from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.config import SourceConfig
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     try:
-        _config = load_config(src_cfg)
+        config = SourceConfig(src_cfg)
     except FileNotFoundError:
         click.echo(f"[error] Could not find sources config at '{src_cfg}'")
         return None
 
-    sources = {s["target_table"]: s for s in _config["sources"]}
-
-    if table not in sources:
+    source = config.get_by_table(table)
+    if source is None:
         click.echo(f"[error] No source defined for '{table}' in sources_config.yaml")
         click.echo("Use --key to specify the primary key directly.")
         return None
 
-    primary_key = sources[table].get("primary_key")
+    primary_key = source.get("primary_key")
     if not primary_key:
         click.echo(
             f"[error] No primary_key defined for '{table}' in sources_config.yaml"

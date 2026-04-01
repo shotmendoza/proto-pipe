@@ -138,30 +138,13 @@ def _get_column_registry_hints(
 
 
 def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
-    """Remove files already successfully logged in ingest_log.
-
-    Files with status='ok' are hidden from new-source — they're already
-    accounted for and don't need a source configured.
-    Files with status='failed' or no record remain visible so the user
-    can see and resolve unprocessed files.
-
-    Falls back to returning all files if the DB doesn't exist yet
-    (e.g. before vp db-init has been run).
-
-    :param files:        List of filenames from _scan_incoming.
-    :param pipeline_db:  Path to the pipeline DuckDB file.
-    :return: Filtered list with successfully ingested files removed.
-    """
+    """Remove files already successfully logged in ingest_log."""
     try:
+        from proto_pipe.io.db import get_ingested_filenames
         with duckdb.connect(pipeline_db) as conn:
-            ingested = (
-                conn.execute("SELECT filename FROM ingest_log WHERE status = 'ok'")
-                .df()["filename"]
-                .tolist()
-            )
+            ingested_set = get_ingested_filenames(conn)
     except Exception:
         return files
-    ingested_set = set(ingested)
     return [f for f in files if f not in ingested_set]
 
 
@@ -448,34 +431,36 @@ def new_source(sources_config, incoming_dir):
     """
     from fnmatch import fnmatch
     from proto_pipe.cli.helpers import config_path_or_override
-    from proto_pipe.io.ingest import load_file, write_registry_types
-    from proto_pipe.io.registry import load_config, write_config
+    from proto_pipe.io.ingest import load_file
     from proto_pipe.io.settings import load_settings
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
-
-    config = load_config(src_cfg)
-    existing_names = [s["name"] for s in config.get("sources", [])]
     settings = load_settings()
     pipeline_db = settings["paths"]["pipeline_db"]
 
+    config = SourceConfig(src_cfg)
+    existing_names = config.names()
+
     click.echo("\n── New Source ──────────────────────────────")
 
-    # Scan incoming dir — hide files already successfully ingested
+    # Scan incoming dir — hide already-ingested files
     files = _scan_incoming(inc_dir)
     files = _filter_uningested(files, pipeline_db)
 
     sample = None
+    selected_file = None
+
     if files:
-        selected_file = questionary.select(
+        selected_file_choice = questionary.select(
             "Which file are you configuring a source for?",
             choices=files + ["None of these — define manually"],
         ).ask()
 
-        if selected_file == "None of these — define manually":
+        if selected_file_choice == "None of these — define manually":
             selected_file = None
-        elif selected_file:
+        elif selected_file_choice:
+            selected_file = selected_file_choice
             suggested_pattern = _suggest_pattern(selected_file)
             matching = [f for f in files if fnmatch(f, suggested_pattern)]
             if len(matching) > 1:
@@ -489,226 +474,79 @@ def new_source(sources_config, incoming_dir):
             f"You can still define a source manually, or add files first.\n"
             f"You can also edit {src_cfg} directly."
         )
-        selected_file = None
+
+    # Load sample for column inspection
+    if selected_file:
+        try:
+            sample = load_file(Path(inc_dir) / selected_file)
+        except Exception:
+            pass
+
+    # Load registry hints for column type display
+    registry_hints: dict = {}
+    if sample is not None:
+        file_cols = [c for c in sample.columns if not c.startswith("_")]
+        try:
+            with duckdb.connect(pipeline_db) as conn:
+                registry_hints = get_registry_hints(conn, file_cols)
+        except Exception:
+            pass
+
+    prompter = SourceConfigPrompter(
+        sample_df=sample,
+        registry_hints=registry_hints,
+    )
 
     # Name
-    name = questionary.text(
-        "Source name — a label for this data source"
-        " (e.g. 'sales' for sales reports, 'inventory' for stock files):"
-    ).ask()
+    name = prompter.prompt_name(existing_names)
     if not name:
         click.echo("Cancelled.")
         return
 
-    if name in existing_names:
-        overwrite = questionary.confirm(
-            f"Source '{name}' already exists. Edit it?"
-        ).ask()
-        if not overwrite:
-            click.echo("Cancelled.")
-            return
-
     # Pattern
     suggested = _suggest_pattern(selected_file) if selected_file else "*.csv"
-    pattern_input = questionary.text(
-        "File pattern(s) — the naming convention used for these files, comma separated"
-        " (e.g. sales_*.csv, Sales_*.xlsx).\n  Use * as a wildcard to match dates or"
-        " version numbers in filenames:",
-        default=suggested,
-    ).ask()
-    if not pattern_input:
+    patterns = prompter.prompt_pattern(suggested)
+    if not patterns:
         click.echo("Cancelled.")
         return
-    patterns = [p.strip() for p in pattern_input.split(",")]
 
     # Target table
-    table = questionary.text(
-        "Target table name — the name of the database table these files will be loaded"
-        " into (press Enter to use source name):",
-        default=name,
-    ).ask()
-    table = table.strip() if table else name
-
-    # Load sample file for column inspection
-    file_cols = []
-    if selected_file:
-        try:
-            sample = load_file(Path(inc_dir) / selected_file)
-            file_cols = [c for c in sample.columns if not c.startswith("_")]
-        except Exception:
-            pass
+    table = prompter.prompt_target_table(default=name)
+    if not table:
+        click.echo("Cancelled.")
+        return
 
     # Primary key
-    if file_cols:
-        pk_choice = questionary.select(
-            "Primary key column — the column that uniquely identifies each row."
-            " Select 'None' if not applicable:",
-            choices=file_cols + ["None — no primary key"],
-        ).ask()
-        primary_key = None if pk_choice == "None — no primary key" else pk_choice
-    else:
-        pk_input = questionary.text(
-            "Primary key column — the column that uniquely identifies each row"
-            " (e.g. 'order_id', 'sku'). Leave blank if none:"
-        ).ask()
-        primary_key = pk_input.strip() if pk_input else None
-
+    primary_key = prompter.prompt_primary_key()
     if not primary_key:
         click.echo(
             "\n  [warn] No primary key defined — all rows will be appended"
             " and duplicates won't be detected."
         )
 
-    # on_duplicate and timestamp — only when primary key defined
+    # on_duplicate + timestamp — only when PK defined
     on_duplicate = None
     timestamp_col = None
     if primary_key:
-        on_duplicate = questionary.select(
-            "Duplicate row handling — what should happen when a new file contains"
-            " a row whose primary key already exists?",
-            choices=[
-                questionary.Choice(
-                    "flag   — flag conflicts for manual review (recommended)",
-                    value="flag",
-                ),
-                questionary.Choice(
-                    "upsert — replace existing row with incoming row",
-                    value="upsert",
-                ),
-                questionary.Choice(
-                    "append — insert all rows, allow duplicates",
-                    value="append",
-                ),
-                questionary.Choice(
-                    "skip   — keep existing row, ignore incoming",
-                    value="skip",
-                ),
-            ],
-        ).ask()
-
-        if file_cols:
-            ts_choice = questionary.select(
-                "Timestamp column — the column that tracks when each row was created or"
-                " updated.\n  Used for incremental runs. Select 'None' to use"
-                " _ingested_at (the pipeline ingestion time):",
-                choices=file_cols + ["None — use _ingested_at"],
-            ).ask()
-            timestamp_col = (
-                None if ts_choice == "None — use _ingested_at" else ts_choice
-            )
-        else:
-            ts_input = questionary.text(
-                "Timestamp column — the column that tracks when each row was created or"
-                " updated (e.g. 'updated_at').\n  Leave blank to use _ingested_at:"
-            ).ask()
-            timestamp_col = ts_input.strip() if ts_input else None
-
-    # Column type confirmation
-    confirmed_types: dict[str, str] = {}
-    if sample is not None and file_cols:
-        _DUCKDB_TYPES = ["VARCHAR", "DOUBLE", "BIGINT", "BOOLEAN", "TIMESTAMPTZ"]
-
-        # Infer types from the sample DataFrame
-        inferred_types = {col: _infer_duckdb_type(sample[col]) for col in file_cols}
-
-        # Read registry hints — {col: {source_name: declared_type}}
-        registry_hints = _get_column_registry_hints(pipeline_db, file_cols)
-
-        # Build working types — registry wins when all sources agree on one type
-        working_types: dict[str, str] = {}
-        for col in file_cols:
-            hints = registry_hints.get(col, {})
-            unique_types = set(hints.values())
-            if len(unique_types) == 1:
-                working_types[col] = next(iter(unique_types))
-            else:
-                working_types[col] = inferred_types[col]
-
-        # Show summary with registry notes
-        click.echo("\n  Inferred column types:")
-        for col in file_cols:
-            hints = registry_hints.get(col, {})
-            unique_types = set(hints.values())
-            dtype = working_types[col]
-
-            if len(unique_types) == 0:
-                note = ""
-            elif len(unique_types) == 1:
-                source_names = ", ".join(f"'{s}'" for s in hints.keys())
-                note = f"  (registered in {source_names})"
-            else:
-                # Conflict — show what each source declared
-                conflict_parts = ", ".join(f"{t} in '{s}'" for s, t in hints.items())
-                note = f"  ⚠ conflict: {conflict_parts}"
-
-            click.echo(f"    {col:<30} {dtype}{note}")
-
-        looks_right = questionary.confirm(
-            "\n  Do these look right?",
-            default=True,
-        ).ask()
-        if looks_right is None:
+        on_duplicate = prompter.prompt_on_duplicate()
+        if on_duplicate is None:
             click.echo("Cancelled.")
             return
+        timestamp_col = prompter.prompt_timestamp_col()
 
-        if not looks_right:
-            # Checkbox shows type inline so it stays visible while selecting
-            to_fix = questionary.checkbox(
-                "Select the columns to change:",
-                choices=[
-                    questionary.Choice(
-                        f"{col:<30} {working_types[col]}",
-                        value=col,
-                    )
-                    for col in file_cols
-                ],
-            ).ask()
-            if to_fix is None:
-                click.echo("Cancelled.")
-                return
+    # Column type confirmation
+    confirmed_types = prompter.prompt_column_types()
 
-            for col in to_fix:
-                current = working_types[col]
-                hints = registry_hints.get(col, {})
-                unique_types = set(hints.values())
-
-                # Surface conflict note before the select prompt
-                if len(unique_types) > 1:
-                    conflict_parts = ", ".join(
-                        f"{t} in '{s}'" for s, t in hints.items()
-                    )
-                    click.echo(
-                        f"  ⚠ '{col}' has conflicting registry types: {conflict_parts}"
-                    )
-
-                chosen = questionary.select(
-                    f"  '{col}' (currently {current}):",
-                    choices=[
-                        questionary.Choice(
-                            f"{t}{' (current)' if t == current else ''}",
-                            value=t,
-                        )
-                        for t in _DUCKDB_TYPES
-                    ],
-                    default=current,
-                ).ask()
-                if chosen is None:
-                    click.echo("Cancelled.")
-                    return
-                working_types[col] = chosen
-
-        confirmed_types = working_types
-
-        # Write confirmed types to registry — non-fatal if registry not ready yet
+    # Write confirmed types to registry
+    if confirmed_types:
         try:
             with duckdb.connect(pipeline_db) as conn:
                 write_registry_types(conn, name, confirmed_types)
         except Exception:
             pass
 
-    # Build source entry — column_types no longer written to config,
-    # registry is now the source of truth
-    source = {
+    # Build source entry — no column_types in config, registry is source of truth
+    source: dict = {
         "name": name,
         "patterns": patterns,
         "target_table": table,
@@ -719,13 +557,7 @@ def new_source(sources_config, incoming_dir):
         source["primary_key"] = primary_key
         source["on_duplicate"] = on_duplicate
 
-    # Write to config
-    sources = config.get("sources", [])
-    if name in existing_names:
-        sources = [s for s in sources if s["name"] != name]
-    sources.append(source)
-    config["sources"] = sources
-    write_config(config, src_cfg)
+    config.add_or_update(source)
 
     click.echo(f"\n[ok] Source '{name}' added to {src_cfg}")
     click.echo("\nNext steps:")
@@ -1074,7 +906,7 @@ def new_report(reports_config, pipeline_db):
     from proto_pipe.io.registry import load_custom_checks_module
     from proto_pipe.io.settings import load_settings
     from proto_pipe.checks.inspector import CheckParamInspector
-    from proto_pipe.io.ingest import _init_check_registry_metadata
+    from proto_pipe.io.db import init_check_registry_metadata
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -1111,7 +943,7 @@ def new_report(reports_config, pipeline_db):
 
     conn = duckdb.connect(p_db)
 
-    _init_check_registry_metadata(conn)
+    init_check_registry_metadata(conn)
     for check_name in check_registry.available():
         original = _get_original_func(check_name, check_registry)
         if original is not None:

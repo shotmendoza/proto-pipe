@@ -15,13 +15,12 @@ from proto_pipe.checks.built_in import BUILT_IN_CHECKS
 from proto_pipe.checks.helpers import _DECORATED_CHECKS, custom_check, register_custom_check
 from proto_pipe.checks.inspector import CheckContract
 from proto_pipe.io.ingest import (
-    _init_ingest_log,
-    _table_exists,
     init_db,
     ingest_directory,
     load_macros,
     reset_report,
 )
+from proto_pipe.io.db import init_ingest_log, table_exists
 from proto_pipe.io.registry import (
     _build_alias_param_map,
     _expand_check_with_alias_map,
@@ -73,7 +72,7 @@ def _read_table(db_path: str, table_name: str) -> pd.DataFrame:
 def _setup_db_with_table(db_path: str, table_name: str, df: pd.DataFrame) -> None:
     init_db(db_path)
     conn = duckdb.connect(db_path)
-    _init_ingest_log(conn)
+    init_ingest_log(conn)
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" AS SELECT * FROM df')
     conn.execute("""
         INSERT INTO ingest_log (id, filename, table_name, status, rows, ingested_at)
@@ -685,7 +684,7 @@ def test_reset_report_drops_table(tmp_path):
     reset_report("sales", db_path)
 
     conn = duckdb.connect(db_path)
-    assert not _table_exists(conn, "sales")
+    assert not table_exists(conn, "sales")
     conn.close()
 
 
@@ -714,7 +713,7 @@ def test_reset_report_does_not_affect_other_tables(tmp_path):
     db_path = str(tmp_path / "pipeline.db")
     init_db(db_path)
     conn = duckdb.connect(db_path)
-    _init_ingest_log(conn)
+    init_ingest_log(conn)
     conn.execute("""
         INSERT INTO ingest_log (id, filename, table_name, status, rows, ingested_at)
         VALUES
@@ -749,13 +748,13 @@ def test_reset_report_allows_reingest(tmp_path):
     reset_report("sales", db_path)
 
     conn = duckdb.connect(db_path)
-    assert not _table_exists(conn, "sales")
+    assert not table_exists(conn, "sales")
     conn.close()
 
     ingest_directory(str(incoming), sources, db_path)
 
     conn = duckdb.connect(db_path)
-    assert _table_exists(conn, "sales")
+    assert table_exists(conn, "sales")
     rows = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
     conn.close()
     assert rows == 2

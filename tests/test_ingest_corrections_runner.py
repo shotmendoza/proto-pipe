@@ -38,9 +38,10 @@ import pytest
 
 from proto_pipe.io.ingest import (
     ingest_directory, _handle_duplicates, check_null_overwrites,
-    _init_ingest_log, CHUNK_SIZE,
+    CHUNK_SIZE,
     flag_id_for, _write_flag,
 )
+from proto_pipe.io.db import init_ingest_log
 from proto_pipe.reports.corrections import export_flagged, import_corrections, dated_export_path
 
 
@@ -173,7 +174,7 @@ class TestDirectoryValidation:
     def test_missing_directory_raises(self, tmp_path):
         db = _make_db(tmp_path)
         conn = duckdb.connect(db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.close()
         with pytest.raises(ValueError, match="Incoming directory not found"):
             ingest_directory(str(tmp_path / "nonexistent"), [], db)
@@ -183,7 +184,7 @@ class TestDirectoryValidation:
         not_dir = tmp_path / "file.txt"
         not_dir.write_text("hello")
         conn = duckdb.connect(db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.close()
         with pytest.raises(ValueError, match="is not a directory"):
             ingest_directory(str(not_dir), [], db)

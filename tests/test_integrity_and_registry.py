@@ -19,14 +19,13 @@ from proto_pipe.checks.inspector import CheckAudit, CheckContract, validate_chec
 from proto_pipe.registry.base import CheckRegistry
 from proto_pipe.io.ingest import (
     IntegrityResult,
-    _get_existing_column_types,
     _check_type_compatibility,
     _check_numeric_type_conflicts,
     _write_integrity_flags,
-    _init_ingest_log,
     ingest_directory,
     flag_id_for,
 )
+from proto_pipe.io.db import init_ingest_log, get_column_types
 from proto_pipe.cli.scaffold import _filter_uningested
 
 
@@ -199,7 +198,7 @@ class TestGetExistingColumnTypes:
                 active  BOOLEAN
             )
         """)
-        types = _get_existing_column_types(conn, "t")
+        types = get_column_types(conn, "t")
         assert types["id"] == "VARCHAR"
         assert types["amount"] == "DOUBLE"
         assert types["count"] == "BIGINT"
@@ -208,14 +207,14 @@ class TestGetExistingColumnTypes:
 
     def test_returns_empty_for_missing_table(self, tmp_path):
         conn = _make_conn(tmp_path)
-        types = _get_existing_column_types(conn, "nonexistent")
+        types = get_column_types(conn, "nonexistent")
         assert types == {}
         conn.close()
 
     def test_types_are_uppercased(self, tmp_path):
         conn = _make_conn(tmp_path)
         conn.execute("CREATE TABLE t (x DOUBLE)")
-        types = _get_existing_column_types(conn, "t")
+        types = get_column_types(conn, "t")
         assert types["x"] == types["x"].upper()
         conn.close()
 
@@ -436,7 +435,7 @@ class TestIngestDirectoryScenarioA:
     def _seed_registry(self, pipeline_db: str, column_types: dict) -> None:
         """Write column types to column_type_registry so ingest_directory can read them."""
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS column_type_registry (
                 column_name   VARCHAR NOT NULL,
@@ -446,7 +445,7 @@ class TestIngestDirectoryScenarioA:
                 PRIMARY KEY (column_name, source_name)
             )
         """)
-        from proto_pipe.io.ingest import write_registry_types
+        from proto_pipe.io.db import write_registry_types
         write_registry_types(conn, "sales", column_types)
         conn.close()
 
@@ -506,7 +505,7 @@ class TestIngestDirectoryScenarioA:
         sales_df.to_csv(tmp_path / "sales_2026-01.csv", index=False)
         # No registry seeded — should fall back to inference and succeed
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS column_type_registry (
                 column_name   VARCHAR NOT NULL,
@@ -540,7 +539,7 @@ class TestIngestDirectoryScenarioB:
     def _seed_table(self, pipeline_db, df):
         """Create the policies table with initial clean data."""
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.execute("CREATE TABLE policies AS SELECT * FROM df")
         conn.execute("""
             INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
@@ -656,7 +655,7 @@ class TestFilterUningested:
     def test_hides_ok_files(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.execute("""
             INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
             VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'ok',
@@ -672,7 +671,7 @@ class TestFilterUningested:
     def test_keeps_failed_files(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.execute("""
             INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
             VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'failed',
@@ -686,7 +685,7 @@ class TestFilterUningested:
     def test_keeps_files_not_in_log(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.close()
 
         result = _filter_uningested(["brand_new.csv"], pipeline_db)
@@ -695,7 +694,7 @@ class TestFilterUningested:
     def test_returns_empty_when_all_ingested(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         for fname in ["a.csv", "b.csv", "c.csv"]:
             conn.execute(f"""
                 INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
@@ -710,7 +709,7 @@ class TestFilterUningested:
     def test_empty_input_returns_empty(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        _init_ingest_log(conn)
+        init_ingest_log(conn)
         conn.close()
         result = _filter_uningested([], pipeline_db)
         assert result == []

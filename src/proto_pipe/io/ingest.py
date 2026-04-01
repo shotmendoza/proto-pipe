@@ -28,7 +28,6 @@ Each ingest run logs results (including failures) to the `ingest_log` table
 so failures are visible without stopping the entire run.
 """
 import hashlib
-import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,95 +39,17 @@ import duckdb
 import pandas as pd  # type: ignore
 
 from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
+from proto_pipe.io.migration import _auto_migrate
+from proto_pipe.io.db import (
+    get_columns as get_existing_columns,
+    get_column_types as get_existing_column_types,
+    table_exists,
+)
 
 
 # ---------------------------------------------------------------------------
 # New: column_type_registry
 # ---------------------------------------------------------------------------
-
-
-def _init_column_type_registry(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the column_type_registry table if it doesn't exist.
-
-    Called by vp db-init. Safe to call multiple times.
-
-    Schema stores one row per (column_name, source_name) pair so that
-    multiple sources can declare the same column with different types —
-    conflicts are visible and queryable.
-    """
-    conn.execute("""
-                 CREATE TABLE IF NOT EXISTS column_type_registry (
-                                                                     column_name   VARCHAR NOT NULL,
-                                                                     source_name   VARCHAR NOT NULL,
-                                                                     declared_type VARCHAR NOT NULL,
-                                                                     recorded_at   TIMESTAMPTZ NOT NULL,
-                                                                     PRIMARY KEY (column_name, source_name)
-                     )
-                 """)
-
-
-def get_registry_types(
-    conn: duckdb.DuckDBPyConnection,
-    columns: list[str] | None = None,
-) -> dict[str, str]:
-    """Return {column_name: declared_type} from column_type_registry.
-
-    When a column has entries from multiple sources, the most recently
-    confirmed type wins. Returns only columns that have a registry entry.
-
-    If column_type_registry doesn't exist yet (before vp db-init), returns {}.
-
-    :param conn:    Open DuckDB connection.
-    :param columns: If provided, only return entries for these columns.
-    :return: Dict mapping column name to its most recently confirmed type.
-    """
-    try:
-        query = """
-                SELECT DISTINCT ON (column_name) column_name, declared_type
-                FROM column_type_registry
-                ORDER BY column_name, recorded_at DESC \
-                """
-        rows = conn.execute(query).fetchall()
-    except Exception:
-        return {}
-
-    result = {row[0]: row[1] for row in rows}
-    if columns is not None:
-        result = {k: v for k, v in result.items() if k in columns}
-    return result
-
-
-def write_registry_types(
-    conn: duckdb.DuckDBPyConnection,
-    source_name: str,
-    column_types: dict[str, str],
-) -> None:
-    """Write confirmed column types to column_type_registry.
-
-    Upserts — if the (column_name, source_name) pair already exists,
-    updates the type and recorded_at. Called by vp new-source after
-    the user confirms or overrides the inferred types.
-
-    :param conn:         Open DuckDB connection.
-    :param source_name:  The source name being configured (from vp new-source).
-    :param column_types: {column_name: declared_type} confirmed by the user.
-    """
-    if not column_types:
-        return
-
-    now = datetime.now(timezone.utc)
-    for col, dtype in column_types.items():
-        conn.execute(
-            """
-                     INSERT INTO column_type_registry
-                         (column_name, source_name, declared_type, recorded_at)
-                     VALUES (?, ?, ?, ?)
-                         ON CONFLICT (column_name, source_name)
-            DO UPDATE SET declared_type = excluded.declared_type,
-                                            recorded_at   = excluded.recorded_at
-                     """,
-            [col, source_name, dtype, now],
-        )
 
 
 @dataclass
@@ -165,21 +86,6 @@ _MAX_DIFF_COLS = 5  # cap reason string to avoid wall-of-text in flagged_rows
 # Number of primary keys processed per SQL IN (...) clause.
 CHUNK_SIZE = 1000
 """GLOBAL: Maximum number of rows to process in a single SQL IN (...) clause"""
-
-
-def _init_check_registry_metadata(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create check_registry_metadata table if it doesn't exist."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS check_registry_metadata (
-            id                      VARCHAR PRIMARY KEY,
-            check_name              VARCHAR NOT NULL UNIQUE,
-            check_key               VARCHAR NOT NULL,
-            is_multiselect_eligible BOOLEAN NOT NULL,
-            column_params           VARCHAR,
-            scalar_params           VARCHAR,
-            recorded_at             TIMESTAMPTZ NOT NULL
-        )
-    """)
 
 
 def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
@@ -277,82 +183,6 @@ def _structural_checks(
 # ingest_log table
 # ---------------------------------------------------------------------------
 
-def _init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
-    """Initializes the ingest log table in the provided DuckDB connection.
-
-    This table is used for logging details about data ingestion activities,
-    such as the status, number of rows processed, and additional columns added during the
-    process.
-
-    The ingest log table includes the following columns:
-        - id: Primary key for identifying each log entry.
-        - filename: The name of the file being ingested.
-        - table_name: Name of the destination table, if applicable.
-        - status: Status of the ingestion (e.g., 'ok', 'failed', 'skipped').
-        - rows: Number of rows processed during the ingestion.
-        - new_cols: JSON list of columns added during the ingestion.
-        - message: Additional information or error message for logging.
-        - ingested_at: Timestamp of when the ingestion occurred.
-
-    :param conn: The DuckDB connection where the ingest log table should be initialized.
-    :type conn: duckdb.DuckDBPyConnection
-    :return: None
-    """
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS ingest_log (
-            id          VARCHAR PRIMARY KEY,
-            filename    VARCHAR NOT NULL,
-            table_name  VARCHAR,
-            status      VARCHAR NOT NULL,   -- 'ok' | 'failed' | 'skipped'
-            rows        INTEGER,
-            new_cols    VARCHAR,            -- JSON list of added columns
-            message     VARCHAR,
-            ingested_at TIMESTAMPTZ NOT NULL
-        )
-    """)
-
-
-def _log_ingest(
-        conn: duckdb.DuckDBPyConnection,
-        filename: str,
-        table_name: str | None,
-        status: str,
-        rows: int | None = None,
-        new_cols: list[str] | None = None,
-        message: str | None = None
-) -> None:
-    """Logs a single ingestion detail into the ingestion_log database.
-
-    This function inserts information about a data ingestion process into
-    an `ingest_log` database table. It keeps a record of filenames,
-    table names, statuses, row counts, new columns, and optional messages
-    related to the ingestion. Every log entry is timestamped with the
-    current UTC time.
-
-    :param conn: A database connection object used to execute the SQL insert statement.
-    :param filename: The name of the file being ingested.
-    :param table_name: The name of the database table associated with the ingestion.
-    :param status: The status of the ingestion operation.
-    :param rows: The count of rows ingested. Optional.
-    :param new_cols: A list of new columns added during ingestion. Optional.
-    :param message: An additional message or comment about the ingestion process. Optional.
-    :return: None
-    """
-    conn.execute("""
-        INSERT INTO ingest_log
-            (id, filename, table_name, status, rows, new_cols, message, ingested_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        str(uuid.uuid4()),
-        filename,
-        table_name,
-        status,
-        rows,
-        json.dumps(new_cols) if new_cols else None,
-        message,
-        datetime.now(timezone.utc),
-    ])
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -403,111 +233,24 @@ def load_file(path: Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported file type: {path.suffix}")
 
 
-def _table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
-    """Checks if a table exists in the given database connection.
-
-    This function queries the `information_schema.tables` to determine whether the
-    specified table exists in the database connected through the DuckDB connection.
-
-    :param conn: The DuckDB connection object used to execute the query.
-    :param table: The name of the table to check for existence.
-    :return: Boolean value indicating whether the table exists in the database.
-    :rtype: bool
-    """
-    result = conn.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
-        [table],
-    ).fetchone()
-    return result[0] > 0
-
-
-def _get_existing_column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
-    """Return {column_name: data_type} for all columns in the table.
-
-    This function queries the information schema to gather a set of all column names
-    that exist in the specified table. The returned set can be used to verify, process,
-    or compare column structures within the database.
-
-    :param conn: DuckDB connection object.
-    :param table: Name of the table to inspect.
-    :return: Dict mapping of a column name to its DuckDB data type (uppercased).
-    :rtype: dict[str, str]
-    """
-    rows = conn.execute(
-        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?",
-        [table],
-    ).fetchall()
-    return {row[0]: row[1].upper() for row in rows}
-
-
-def _get_existing_columns(conn: duckdb.DuckDBPyConnection, table: str) -> set[str]:
-    """Return column names for an existing table.
-
-    Delegates to _get_existing_column_types so type data is always consistent.
-
-    :param conn: DuckDB connection object.
-    :param table: Name of the table to inspect.
-    :return: Set of column names.
-    :rtype: set[str]
-    """
-    return set(_get_existing_column_types(conn, table).keys())
-
-
-def _auto_migrate(conn: duckdb.DuckDBPyConnection, table: str, df: pd.DataFrame) -> list[str]:
-    """Automatically migrates the schema of an existing DuckDB table to align with the columns of a given
-    Pandas DataFrame. Any new columns in the DataFrame that are not present in the table will be added
-    to the table with an appropriate data type.
-
-    :param conn: DuckDB connection object.
-    :type conn: duckdb.DuckDBPyConnection
-    :param table: Name of the table to be migrated.
-    :type table: str
-    :param df: DataFrame containing the desired schema.
-    :type df: pd.DataFrame
-    :return: List of column names that were added to the table.
-    :rtype: list[str]
-    """
-    existing = _get_existing_columns(conn, table)
-    new_cols = [col for col in df.columns if col not in existing]
-
-    for col in new_cols:
-        dtype = df[col].dtype
-        if pd.api.types.is_integer_dtype(dtype):
-            sql_type = "BIGINT"
-        elif pd.api.types.is_float_dtype(dtype):
-            sql_type = "DOUBLE"
-        elif pd.api.types.is_bool_dtype(dtype):
-            sql_type = "BOOLEAN"
-        elif pd.api.types.is_datetime64_any_dtype(dtype):
-            sql_type = "TIMESTAMPTZ"
-        else:
-            sql_type = "VARCHAR"
-
-        conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {sql_type}')
-        print(f"  [migrate] Added column '{col}' ({sql_type}) to '{table}'")
-
-    return new_cols
-
-
 # ---------------------------------------------------------------------------
 # DB initialisation
 # ---------------------------------------------------------------------------
 
+
 def init_db(db_path: str) -> None:
     """Initializes the database by creating the necessary directory structure
-    and establishing a connection to the database file. This function also
-    prepares the ingest log for future use. The connection to the database
-    is closed after the initialization process is completed.
+    and establishing a connection to the database file.
 
     :param db_path: The path to the database file to be initialized.
     :type db_path: str
     :return: None
     """
+    from proto_pipe.io.db import init_all_pipeline_tables
+
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(db_path) as conn:
-        _init_ingest_log(conn)
-        _init_check_registry_metadata(conn)
-        _init_column_type_registry(conn)
+        init_all_pipeline_tables(conn)
         _populate_builtin_metadata(conn)
 
 
@@ -517,7 +260,7 @@ def init_source_tables(db_path: str, sources: list[dict]):
     with duckdb.connect(db_path) as conn:
         for source in sources:
             table = source["target_table"]
-            if _table_exists(conn, table):
+            if table_exists(conn, table):
                 print(f"[skip] Table '{table}' already exists")
                 continue
             conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" (_placeholder VARCHAR)')
@@ -543,20 +286,17 @@ def ingest_directory(
     Two-scenario ingest:
       Scenario A (first ingest / replace mode):
         - Queries column_type_registry for user-confirmed types.
-        - If registry entries exist for columns in this file, pre-scans the
-          DataFrame using TRY_CAST. Any mismatch fails the file — nothing
-          touches the DB.
-        - If pre-scan passes, applies declared types before CREATE TABLE so
-          the schema is authoritative.
+        - If registry entries exist, pre-scans with TRY_CAST. Mismatch fails the file.
+        - If registry entries exist and pass, applies declared types before CREATE TABLE.
         - If no registry entries exist, falls back to inference.
 
       Scenario B (subsequent ingest, table exists):
         - Runs _ROW_VALIDATORS pre-scan against existing table types.
         - Rows that fail go to flagged_rows (IntegrityResult → type_conflict).
-        - Clean rows proceed through the normal duplicate-handling and INSERT path.
+        - Clean rows proceed through duplicate-handling and INSERT.
 
-    All DuckDB write operations are wrapped in try/except — the full exception
-    is printed and logged, and the run continues to the next file.
+    All DuckDB write operations are wrapped in try/except — exception is
+    printed and logged, run continues to next file.
 
     :param directory:       Directory containing files to ingest.
     :param sources:         Source definitions from sources_config.yaml.
@@ -567,6 +307,14 @@ def ingest_directory(
     :param report_registry: ReportRegistry instance (required when run_checks=True).
     :return: Summary dict keyed by filename.
     """
+    from proto_pipe.io.db import (
+        table_exists as _table_exists,
+        get_registry_types,
+        init_ingest_log as _init_ingest_log,
+        log_ingest as _log_ingest,
+        already_ingested as _already_ingested,
+    )
+
     directory_path = Path(directory)
     if not directory_path.exists():
         raise ValueError(
@@ -621,7 +369,6 @@ def ingest_directory(
         primary_key = source.get("primary_key")
         on_duplicate = source.get("on_duplicate", "flag" if primary_key else "append")
 
-        # Pipeline tracking column — _ prefix marks it as internal
         df["_ingested_at"] = datetime.now(timezone.utc)
 
         integrity_flagged = 0
@@ -631,7 +378,6 @@ def ingest_directory(
 
         # ── Scenario A: first ingest ──────────────────────────────────────────
         if mode == "replace" or not _table_exists(conn, table):
-            # Query registry for user-confirmed types for this file's columns
             user_cols = [c for c in df.columns if not c.startswith("_")]
             registry_types = get_registry_types(conn, user_cols)
 
@@ -643,7 +389,7 @@ def ingest_directory(
                     cols_affected = sorted({i.column for i in type_issues})
                     message = (
                         f"Type mismatch for column(s): {', '.join(cols_affected)}. "
-                        f"Fix the file values or run 'vp new-source' to review "
+                        f"Fix the file values or run 'vp source edit' to review "
                         f"the registered types."
                     )
                     print(f"[fail] '{path.name}': {message}")
@@ -796,18 +542,6 @@ def _run_inline_checks(
 # ---------------------------------------------------------------------------
 # NEW — file deduplication
 # ---------------------------------------------------------------------------
-def _already_ingested(
-        conn: duckdb.DuckDBPyConnection,
-        filename: str
-) -> bool:
-    """Return True if this filename was already successfully ingested.
-    Only 'ok' status counts — failed files are retried on every run.
-    """
-    result = conn.execute("""
-            SELECT count(*) FROM ingest_log
-            WHERE filename = ? AND status = 'ok'
-        """, [filename]).fetchone()
-    return result[0] > 0  # type: ignore
 
 
 def _row_hash_expr(cols: list[str], alias: str | None = None) -> str:
@@ -936,7 +670,7 @@ def _handle_duplicates(
     comparable_cols = [
         column for column in non_null_df.columns
         if column != primary_key and
-        column in _get_existing_columns(conn, table) and not
+           column in get_existing_columns(conn, table) and not
         str(column).startswith("_")
     ]
 
@@ -1159,7 +893,7 @@ def reset_report(table_name: str, db_path: str) -> None:
     """
     conn = duckdb.connect(db_path)
     try:
-        if _table_exists(conn, table_name):
+        if table_exists(conn, table_name):
             conn.execute(f'DROP TABLE "{table_name}"')
             print(f"  [reset] Dropped table '{table_name}'")
         else:
@@ -1306,7 +1040,7 @@ def _check_numeric_type_conflicts(
     :param pk_col: Primary key column name, or None.
     :return: List of IntegrityResult entries for failing rows.
     """
-    existing_types = _get_existing_column_types(conn, table)
+    existing_types = get_existing_column_types(conn, table)
     numeric_reference = {
         col: db_type
         for col, db_type in existing_types.items()

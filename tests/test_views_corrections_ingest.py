@@ -16,11 +16,9 @@ import pandas as pd
 import pytest
 
 from proto_pipe.io.ingest import (
-    _already_ingested,
-    _init_ingest_log,
-    _log_ingest,
     flag_id_for,
 )
+from proto_pipe.io.db import init_ingest_log, log_ingest, already_ingested
 from proto_pipe.reports.corrections import import_corrections, export_flagged
 from proto_pipe.reports.validation_flags import init_validation_flags_table
 from proto_pipe.reports.views import (
@@ -90,7 +88,7 @@ def conn_with_sales(conn):
 @pytest.fixture
 def conn_with_ingest_log(conn):
     """Connection with ingest_log table bootstrapped."""
-    _init_ingest_log(conn)
+    init_ingest_log(conn)
     return conn
 
 
@@ -738,37 +736,37 @@ class TestImportCorrections:
 
 class TestAlreadyIngested:
     def test_returns_false_for_unknown_file(self, conn_with_ingest_log):
-        assert _already_ingested(conn_with_ingest_log, "sales_jan.csv") is False
+        assert already_ingested(conn_with_ingest_log, "sales_jan.csv") is False
 
     def test_returns_true_after_ok_log(self, conn_with_ingest_log):
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
-        assert _already_ingested(conn_with_ingest_log, "sales_jan.csv") is True
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
+        assert already_ingested(conn_with_ingest_log, "sales_jan.csv") is True
 
     def test_returns_false_after_failed_log(self, conn_with_ingest_log):
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "failed",
-                    message="empty file")
-        assert _already_ingested(conn_with_ingest_log, "sales_jan.csv") is False
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "failed",
+                   message="empty file")
+        assert already_ingested(conn_with_ingest_log, "sales_jan.csv") is False
 
     def test_returns_false_after_skipped_log(self, conn_with_ingest_log):
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "skipped",
-                    message="no match")
-        assert _already_ingested(conn_with_ingest_log, "sales_jan.csv") is False
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "skipped",
+                   message="no match")
+        assert already_ingested(conn_with_ingest_log, "sales_jan.csv") is False
 
     def test_returns_true_even_if_also_has_prior_failure(self, conn_with_ingest_log):
         # File failed once, then succeeded — should be considered ingested
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "failed",
-                    message="bad file")
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
-        assert _already_ingested(conn_with_ingest_log, "sales_jan.csv") is True
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "failed",
+                   message="bad file")
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
+        assert already_ingested(conn_with_ingest_log, "sales_jan.csv") is True
 
     def test_different_filenames_are_independent(self, conn_with_ingest_log):
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
-        assert _already_ingested(conn_with_ingest_log, "sales_feb.csv") is False
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
+        assert already_ingested(conn_with_ingest_log, "sales_feb.csv") is False
 
     def test_filename_match_is_exact(self, conn_with_ingest_log):
-        _log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
-        assert _already_ingested(conn_with_ingest_log, "sales_jan") is False
-        assert _already_ingested(conn_with_ingest_log, "SALES_JAN.CSV") is False
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "ok", rows=10)
+        assert already_ingested(conn_with_ingest_log, "sales_jan") is False
+        assert already_ingested(conn_with_ingest_log, "SALES_JAN.CSV") is False
 
 
 # ===========================================================================

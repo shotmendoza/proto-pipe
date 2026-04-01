@@ -14,10 +14,10 @@ from proto_pipe.io.ingest import (
     resolve_source,
     _structural_checks,
     init_db,
-    _table_exists,
     ingest_directory,
     init_source_tables,
 )
+from proto_pipe.io.db import table_exists
 
 
 # ---------------------------------------------------------------------------
@@ -108,15 +108,15 @@ class TestInitDb:
         init_db(pipeline_db)
         init_source_tables(pipeline_db, sources_config["sources"])
         conn = duckdb.connect(pipeline_db)
-        assert _table_exists(conn, "sales")
-        assert _table_exists(conn, "inventory")
+        assert table_exists(conn, "sales")
+        assert table_exists(conn, "inventory")
         conn.close()
 
     def test_creates_ingest_log(self, pipeline_db, sources_config):
         init_db(pipeline_db)
         init_source_tables(pipeline_db, sources_config["sources"])
         conn = duckdb.connect(pipeline_db)
-        assert _table_exists(conn, "ingest_log")
+        assert table_exists(conn, "ingest_log")
         conn.close()
 
     def test_idempotent(self, pipeline_db, sources_config):
@@ -125,7 +125,7 @@ class TestInitDb:
         init_db(pipeline_db)
         init_source_tables(pipeline_db, sources_config["sources"])  # should not raise
         conn = duckdb.connect(pipeline_db)
-        assert _table_exists(conn, "sales")
+        assert table_exists(conn, "sales")
         conn.close()
 
 
