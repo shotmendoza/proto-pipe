@@ -16,7 +16,9 @@ from proto_pipe.cli.scaffold import (
     _get_original_func,
     _get_unconfigured_tables,
     _build_rich_sql_scaffold,
-    _scan_macros
+    _scan_macros,
+    _filter_unconfigured,
+    _group_files_by_pattern,
 )
 from proto_pipe.io.config import load_config, write_config, load_settings
 from proto_pipe.constants import DEFAULT_SETTINGS_PATH
@@ -50,9 +52,8 @@ def new_source(sources_config, incoming_dir):
 
     \b
     Example:
-      vp new-source
+      vp new source
     """
-    from fnmatch import fnmatch
     from proto_pipe.io.config import config_path_or_override, SourceConfig
     from proto_pipe.io.ingest import load_file
     from proto_pipe.cli.prompts import SourceConfigPrompter
@@ -67,41 +68,44 @@ def new_source(sources_config, incoming_dir):
 
     click.echo("\n── New Source ──────────────────────────────")
 
-    files = _scan_incoming(inc_dir)
-    files = _filter_uningested(files, pipeline_db)
+    all_files = _scan_incoming(inc_dir)
+    files = _filter_unconfigured(all_files, config.all())
 
     sample = None
-    selected_file = None
+    suggested = "*.csv"
 
     if files:
-        selected_file_choice = questionary.select(
-            "Which file are you configuring a source for?",
-            choices=files + ["None of these — define manually"],
-        ).ask()
+        file_groups = _group_files_by_pattern(files)
+        selected_file, suggested = SourceConfigPrompter.prompt_file_group(file_groups)
 
-        if selected_file_choice == "None of these — define manually":
-            selected_file = None
-        elif selected_file_choice:
-            selected_file = selected_file_choice
-            suggested_pattern = _suggest_pattern(selected_file)
-            matching = [f for f in files if fnmatch(f, suggested_pattern)]
-            if len(matching) > 1:
+        if suggested is None:
+            click.echo("Cancelled.")
+            return
+
+        if selected_file:
+            if len(file_groups.get(suggested, [])) > 1:
                 click.echo(
-                    f"\n  {len(matching)} files match the pattern '{suggested_pattern}'"
+                    f"\n  {len(file_groups[suggested])} files match '{suggested}'"
                     f" — they will all be ingested into the same table.\n"
                 )
+            try:
+                sample = load_file(Path(inc_dir) / selected_file)
+            except Exception:
+                pass
     else:
-        click.echo(
-            f"\nNo files found in '{inc_dir}'.\n"
-            f"You can still define a source manually, or add files first.\n"
-            f"You can also edit {src_cfg} directly."
-        )
-
-    if selected_file:
-        try:
-            sample = load_file(Path(inc_dir) / selected_file)
-        except Exception:
-            pass
+        if all_files:
+            click.echo(
+                f"\n  All {len(all_files)} file(s) in '{inc_dir}' are already covered"
+                f" by an existing source pattern.\n"
+                f"  You can still define a source manually below,"
+                f" or edit {src_cfg} directly."
+            )
+        else:
+            click.echo(
+                f"\nNo files found in '{inc_dir}'.\n"
+                f"You can still define a source manually, or add files first.\n"
+                f"You can also edit {src_cfg} directly."
+            )
 
     registry_hints: dict = {}
     if sample is not None:
@@ -112,7 +116,6 @@ def new_source(sources_config, incoming_dir):
         except Exception:
             pass
 
-    suggested = _suggest_pattern(selected_file) if selected_file else "*.csv"
     prompter = SourceConfigPrompter(sample_df=sample, registry_hints=registry_hints)
 
     if not prompter.run(config.names(), suggested):

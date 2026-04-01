@@ -366,6 +366,45 @@ class SourceConfigPrompter:
             return custom.strip() if custom else None
         return chosen
 
+    @staticmethod
+    def prompt_file_group(
+        file_groups: "dict[str, list[str]]",
+    ) -> "tuple[str | None, str | None]":
+        """Show a pattern-grouped file picker.
+
+        Each choice represents one suggested pattern and shows how many files
+        it would cover. The user picks a pattern rather than an individual file.
+
+        Returns (selected_file, suggested_pattern) where:
+          - selected_file is the first file from the chosen group (used for
+            column sampling). None if the user chose to define manually.
+          - suggested_pattern is the chosen pattern string, pre-filled in the
+            subsequent prompt_pattern step. None if the user cancelled (ESC).
+        """
+        choices = [
+            questionary.Choice(
+                title=f"{pattern}  ({len(files)} file{'s' if len(files) != 1 else ''})",
+                value=pattern,
+            )
+            for pattern, files in sorted(
+                file_groups.items(), key=lambda x: (-len(x[1]), x[0])
+            )
+        ] + ["None of these — define manually"]
+
+        selected = questionary.select(
+            "Which file pattern are you configuring a source for?",
+            choices=choices,
+        ).ask()
+
+        if selected is None:
+            return None, None  # ESC — cancelled
+
+        if selected == "None of these — define manually":
+            return None, "*.csv"
+
+        matched_files = file_groups[selected]
+        return matched_files[0], selected
+
 
 # ---------------------------------------------------------------------------
 # ReportConfigPrompter

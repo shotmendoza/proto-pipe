@@ -351,6 +351,26 @@ def _suggest_pattern(filename: str) -> str:
     return f"{pattern}{suffix}"
 
 
+def _group_files_by_pattern(files: list[str]) -> dict[str, list[str]]:
+    """Group files by their suggested glob pattern.
+
+    Returns {pattern: [file, ...]} — files within each group are sorted.
+    Useful for showing the user one entry per pattern rather than per file.
+
+    Example:
+        ["sales_2026-01.csv", "sales_2026-02.csv", "inventory_2026-01.csv"]
+        → {"sales_*.csv": ["sales_2026-01.csv", "sales_2026-02.csv"],
+           "inventory_*.csv": ["inventory_2026-01.csv"]}
+    """
+    groups: dict[str, list[str]] = {}
+    for f in files:
+        pattern = _suggest_pattern(f)
+        groups.setdefault(pattern, []).append(f)
+    for pattern in groups:
+        groups[pattern] = sorted(groups[pattern])
+    return groups
+
+
 def _scan_incoming(incoming_dir: str) -> list[str]:
     """Return supported filenames from the incoming directory."""
     supported = {".csv", ".xlsx", ".xls"}

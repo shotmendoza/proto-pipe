@@ -31,7 +31,7 @@ def _display_rich_table(df, title: str) -> None:
     for col in df.columns:
         table.add_column(str(col), overflow="fold")
 
-    rows = df.fillna("").astype(str).values.tolist()
+    rows = df.astype(object).fillna("").astype(str).values.tolist()
     for row in rows:
         table.add_row(*row)
 
@@ -198,7 +198,7 @@ def get_reviewer(edit: bool = False) -> ReviewInterface:
     "--edit", is_flag=True, default=False, help="Open table in interactive editor."
 )
 @click.option("--export", default=None, help="Export table to CSV at this path.")
-@click.option("--limit", default=100, show_default=True, help="Max rows to display.")
+@click.option("--limit", default=None, show_default=True, help="Max rows to display.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 def table_cmd(table_name, edit, export, limit, pipeline_db):
     """View, edit, or export any pipeline table.
@@ -251,7 +251,7 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
             click.echo(f"Available: {', '.join(all_tables)}")
             return
 
-        df = _get_table_df(conn, table_name, limit)
+        df = _get_table_df(conn, table_name, limit or 100)
 
         if df.empty:
             click.echo(f"'{table_name}' is empty.")
@@ -259,10 +259,22 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
 
         # Export path
         if export:
+            # Fetch without limit for export
+            export_df = conn.execute(
+                f'SELECT * FROM "{table_name}"'
+                + (f" LIMIT {limit}" if limit is not None else "")
+            ).df()
+            # Resolve path — if no directory given, use output_dir from settings
             export_path = Path(export)
+            if not export_path.is_absolute() and export_path.parent == Path("."):
+                try:
+                    out_dir = load_settings()["paths"]["output_dir"]
+                    export_path = Path(out_dir) / export_path
+                except Exception:
+                    pass
             export_path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_csv(export_path, index=False)
-            click.echo(f"[ok] {len(df)} row(s) exported to {export_path}")
+            export_df.to_csv(export_path, index=False)
+            click.echo(f"[ok] {len(export_df)} row(s) exported to {export_path}")
             return
 
         # Get primary key for this table if it's a user table
