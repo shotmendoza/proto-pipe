@@ -2,20 +2,34 @@
 
 Deliverables define what gets written to disk — which reports to include,
 what format to use, how to query the data, and where to put the output.
-They live entirely in `config/deliverables_config.yaml`.
 
-Each report inside a deliverable has two query paths:
+The easiest way is the interactive wizard:
 
-| Path       | When to use                                                      |
-|------------|------------------------------------------------------------------|
-| `sql_file` | Joins across tables, carrier-specific columns, custom date logic |
-| `filters`  | Simple single-table queries with date and field filters          |
+```bash
+vp new deliverable
+```
+
+The wizard walks you through selecting reports, naming the deliverable,
+choosing format, and scaffolding a SQL file — then writes to
+`config/deliverables_config.yaml` automatically.
+
+---
+
+## Two query paths per report
+
+| Path | When to use |
+|---|---|
+| `sql_file` | Joins across tables, carrier-specific column names, custom date logic |
+| `filters` | Simple single-table queries with date and field filters |
+
+Only one should be set per report. If `sql_file` is present it takes
+precedence and `filters` is ignored.
 
 ---
 
 ## Minimal examples
 
-**With a SQL file (joins, custom logic):**
+**With a SQL file:**
 
 ```yaml
 deliverables:
@@ -28,7 +42,7 @@ deliverables:
         sql_file: "config/sql/carrier_a_sales.sql"
 ```
 
-**With filters (simple single-table query):**
+**With filters:**
 
 ```yaml
 deliverables:
@@ -49,7 +63,7 @@ deliverables:
 
 ```yaml
 deliverables:
-  - name: "my_export"                         # Unique name — used on the CLI:
+  - name: "my_export"                         # Unique name — used on CLI:
                                               #   vp pull-report my_export
     format: xlsx                              # "xlsx" = one file, one sheet per report
                                               # "csv"  = one file per report
@@ -62,95 +76,34 @@ deliverables:
         sheet: "My Sheet"                     # xlsx only. Defaults to report name if omitted.
 
         # --- Query path A: SQL file ---
-        sql_file: "config/sql/my_report.sql"  # Path to a .sql file.
-                                              # Executes directly — filters ignored.
-                                              # Date logic lives inside the SQL.
+        sql_file: "config/sql/my_report.sql"  # Executes directly — filters ignored.
 
-        # --- Query path B: filters (used when sql_file is absent) ---
+        # --- Query path B: filters ---
         filters:
           date_filters:
             - col: "order_date"
-              from: "start_of_month"          # Optional. Supports dynamic tokens.
-              to:   "end_of_last_month"        # Optional. Supports dynamic tokens.
+              from: "start_of_month"
+              to:   "end_of_last_month"
           field_filters:
             - col: "region"
               values: ["EMEA", "APAC"]
 ```
 
-Only one of `sql_file` or `filters` should be set per report. If `sql_file`
-is present it takes precedence and `filters` is ignored entirely.
-
 ---
 
-## Scaffolding a SQL file
+## SQL files
 
-Use `vp new-sql` to scaffold an annotated SQL file for any combination of
-reports without creating a new deliverable entry. This is the fastest way
-to start writing a carrier-specific query.
-
-```bash
-vp new-sql carrier_a_sales
-```
-
-The wizard asks which reports to include, then generates a `.sql` file with:
-
-- Notes about which transforms are already applied to each table
-- A list of available macros you can call inline
-- A `LEFT JOIN` stub pre-filled with primary keys where they can be resolved
-- Inline comments on how to add columns from joined tables
-- A `WHERE _ingested_at >= '<from_date>'` filter to edit as needed
-
-Example output for a two-table query with a macro registered:
-
-```sql
--- carrier_a_sales.sql
--- Deliverable query for: carrier_a_sales
---
--- The tables below have transforms applied before this query runs.
--- Any @custom_check(kind='transform') functions registered for
--- these reports are already reflected in the data.
---
--- Available macros (call inline in your SELECT):
---   normalize_transaction_type(val)
---
--- Columns prefixed with _ are internal pipeline columns
--- (e.g. _ingested_at) — exclude from your SELECT.
-
-SELECT
-    a.*
-    -- Example macro usage (uncomment and adapt):
-    -- , normalize_transaction_type(a.<col>) AS <col>
-    -- , b.<column>  -- add columns from inventory as needed
-FROM sales a
-LEFT JOIN inventory b
-    ON a.order_id = b.order_id
-WHERE a._ingested_at >= '<from_date>'
-ORDER BY a._ingested_at DESC;
-```
-
-Once you've edited the file, wire it up in `deliverables_config.yaml`:
-
-```yaml
-reports:
-  - name: "carrier_a_sales"
-    sheet: "Sales"
-    sql_file: "sql/carrier_a_sales.sql"
-```
-
----
-
-
-the DuckDB connection. They can join any tables that exist in `pipeline.db`,
-use any DuckDB SQL features, and handle date logic natively.
+SQL files contain a single `SELECT` executed directly against `pipeline.db`.
+They can join any tables, use any DuckDB SQL features, and handle date logic
+natively.
 
 ```sql
 -- config/sql/carrier_a_sales.sql
 SELECT
     s.order_id,
-    s.price,
+    s.gross_premium,       -- Carrier A's column name for premium
     s.quantity,
-    c.customer_name,
-    c.region
+    c.customer_name
 FROM sales s
 JOIN customers c ON s.customer_id = c.customer_id
 WHERE s.order_date <= (date_trunc('month', current_date) - INTERVAL '1 day')
@@ -169,71 +122,60 @@ WHERE s.order_date <= (date_trunc('month', current_date) - INTERVAL '1 day')
 | Start of this quarter | `date_trunc('quarter', current_date)` |
 | End of last quarter | `date_trunc('quarter', current_date) - INTERVAL '1 day'` |
 
-SQL files are fully self-contained — open the file and you see exactly
-what data the deliverable will produce.
-
 ---
 
-## SQL macros
+## Carrier-specific pattern and alias_map
 
-Macros are named SQL expressions registered at pipeline startup and available
-in any SQL file — views, deliverables, or anywhere in DuckDB.
+Different carriers often use different column names for the same data.
+The pipeline handles this at two levels:
 
-Use macros for transformations that are shared across multiple carriers,
-such as normalising transaction types, standardising region codes, or
-applying business logic that would otherwise be duplicated across SQL files.
-
-**Scaffold a new macro:**
-
-```bash
-vp new-macro normalize_transaction_type
-```
-
-This creates a template file in your `macros/` directory and registers the
-directory in `pipeline.yaml`:
+**In the SQL file** — write the SQL using the carrier's actual column names:
 
 ```sql
--- macros/normalize_transaction_type.sql
-CREATE OR REPLACE MACRO normalize_transaction_type(val) AS
-    CASE
-        WHEN val = 'Issuance' THEN 'Reinstatement'
-        ELSE val
-    END;
+-- carrier_a_sales.sql — Carrier A calls it gross_premium
+SELECT order_id, gross_premium, region FROM sales WHERE region = 'EMEA'
+
+-- carrier_b_sales.sql — Carrier B calls it written_premium
+SELECT order_id, written_premium, region FROM sales WHERE region = 'APAC'
 ```
 
-Edit the file with your logic. Macros are loaded at startup, so after
-editing run `vp db-init` to re-register them.
+**In reports_config.yaml via alias_map** — map different column names to
+the same check parameter so one check function runs against both:
 
-**Use the macro in any SQL file:**
+```yaml
+reports:
+  - name: "carrier_a_validation"
+    source:
+      table: "carrier_a_sales"
+    alias_map:
+      - param: col
+        column: gross_premium      # Carrier A's column name
+    checks:
+      - name: null_check
 
-```sql
--- config/sql/carrier_a_sales.sql
-SELECT
-    order_id,
-    normalize_transaction_type(transaction_type) AS transaction_type,
-    price
-FROM sales
-WHERE order_date <= current_date
+  - name: "carrier_b_validation"
+    source:
+      table: "carrier_b_sales"
+    alias_map:
+      - param: col
+        column: written_premium    # Carrier B's column name
+    checks:
+      - name: null_check           # same check function, different column
 ```
 
-The same macro works in carrier B, C, or any view — write it once, use it
-everywhere.
-
-**Rules:**
-- Use `CREATE OR REPLACE MACRO` so re-running `vp db-init` is idempotent.
-- Macros are loaded in filename order. If one macro references another,
-  name the dependency so it sorts first.
-- The `macros_dir` path in `pipeline.yaml` defaults to `macros/`.
+The check function is written once with a generic `col` parameter.
+Each carrier's report maps their specific column to it via `alias_map`.
+The `vp new report` wizard handles this interactively — column params
+show available columns from the selected table with alias_map suggestions
+surfaced first.
 
 ---
 
 ## Shared views
 
-If multiple deliverables need the same transformation logic — standardising
-region codes, zeroing out negatives, joining a lookup table — define it once
-as a view in `config/views_config.yaml` and reference it by name in any SQL
-file. Views produce intermediate tables; macros produce reusable expressions.
-Use views for table-level transformations and macros for column-level ones.
+If multiple deliverables need the same transformation — standardising region
+codes, zeroing out negatives, joining a lookup table — define it once as a
+view and reference it in any SQL file.
 
 ```yaml
 # config/views_config.yaml
@@ -246,38 +188,28 @@ views:
 -- config/sql/views/clean_sales.sql
 SELECT
     order_id,
+    CASE WHEN region = 'Europe' THEN 'EMEA' ELSE region END AS region,
     GREATEST(price, 0) AS price,
     order_date
 FROM sales
 ```
 
-Any deliverable SQL file can then reference the view like a table:
-
 ```sql
--- config/sql/carrier_a_sales.sql
-SELECT order_id, price
+-- config/sql/carrier_a_sales.sql — reference the view like a table
+SELECT order_id, price, region
 FROM clean_sales
-WHERE order_date >= date_trunc('month', current_date)
+WHERE region = 'EMEA'
 ```
 
 **Creation order matters** — if a view references another view, list the
 dependency first in `views_config.yaml`.
 
-Views are created by `vp db-init` and refreshed by `vp refresh-views`.
-They are also refreshed automatically during `vp run-all`.
-
-```bash
-vp refresh-views
-vp run-all --deliverable carrier_a_pack
-```
+Views are refreshed by `vp refresh-views` and automatically before
+deliverables in `vp run-all`.
 
 ---
 
 ## Dynamic date tokens (filter path only)
-
-When using `filters:` instead of `sql_file:`, date values support
-dynamic tokens that resolve at runtime. Hardcoded dates like `"2026-01-01"`
-still work and pass through unchanged.
 
 | Token | Resolves to |
 |---|---|
@@ -293,11 +225,11 @@ still work and pass through unchanged.
 | `today-Nd` | N days ago (e.g. `today-30d`) |
 | `today+Nd` | N days from now (e.g. `today+7d`) |
 
-Omitting `from:` or `to:` means no lower or upper bound.
+Omitting `from:` or `to:` means no bound on that end.
 
 ---
 
-## Format: `xlsx` vs `csv`
+## Format: xlsx vs csv
 
 **xlsx** — all reports in one file, one sheet each:
 
@@ -316,8 +248,6 @@ reports:
           from: "start_of_month"
 ```
 
-Produces: `monthly_pack_2026-03-26.xlsx` with two sheets.
-
 **csv** — one file per report:
 
 ```yaml
@@ -328,52 +258,31 @@ reports:
     sql_file: "config/sql/sales.sql"
 ```
 
-Produces: `sales_report_2026-03-26.csv`.
+---
+
+## CLI date overrides
+
+Date flags only apply to filter-based reports. SQL file reports ignore them.
+
+```bash
+vp pull-report my_export \
+  --date-col order_date \
+  --date-from 2026-01-01 \
+  --date-to   2026-03-31
+```
 
 ---
 
-## Carrier-specific pattern
+## Running a deliverable
 
-Each carrier gets its own deliverable pointing to its own SQL file.
-Shared reports can still be included in multiple deliverables without
-duplication.
-
-```yaml
-deliverables:
-  - name: "carrier_a_pack"
-    format: xlsx
-    filename_template: "carrier_a_{date}.xlsx"
-    reports:
-      - name: "carrier_a_sales"
-        sheet: "Sales"
-        sql_file: "config/sql/carrier_a_sales.sql"   # carrier-specific join + columns
-      - name: "inventory_validation"
-        sheet: "Inventory"
-        filters:
-          date_filters:
-            - col: "updated_at"
-              to: "end_of_last_month"
-
-  - name: "carrier_b_pack"
-    format: xlsx
-    filename_template: "carrier_b_{date}.xlsx"
-    reports:
-      - name: "carrier_b_sales"
-        sheet: "Sales"
-        sql_file: "config/sql/carrier_b_sales.sql"   # different SQL, different shape
-      - name: "inventory_validation"
-        sheet: "Inventory"
-        filters:
-          date_filters:
-            - col: "updated_at"
-              to: "end_of_last_month"
+```bash
+vp pull-report my_export
+vp run-all --deliverable my_export
 ```
 
 ---
 
 ## Tracking what was produced
-
-Every run is logged to the `report_runs` table in `pipeline.db`:
 
 ```sql
 SELECT * FROM report_runs ORDER BY created_at DESC;
@@ -387,7 +296,6 @@ Columns: `deliverable_name`, `report_name`, `filename`, `output_dir`,
 ## Notes
 
 - `name` must be unique across all deliverables.
-- Output files are never auto-deleted. Re-running on the same date
-  overwrites the file.
-- `output_dir` on the deliverable overrides `pipeline.yaml`. If neither
-  is set, defaults to `output/reports/`.
+- Output files are never auto-deleted. Re-running on the same date overwrites.
+- `output_dir` on the deliverable overrides `pipeline.yaml`. If neither is
+  set, defaults to `output/reports/`.

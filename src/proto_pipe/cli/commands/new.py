@@ -146,7 +146,7 @@ def new_report(reports_config, pipeline_db):
 
     \b
     Example:
-      vp new-report
+      vp new report
     """
     from proto_pipe.checks.registry import CheckRegistry, CheckParamInspector
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
@@ -180,7 +180,7 @@ def new_report(reports_config, pipeline_db):
         click.echo(
             "\n  No unconfigured tables found. Either all tables already have "
             "reports defined, or no tables have been ingested yet.\n"
-            "  Run: vp ingest   to load files first."
+            "  Run: vp ingest to load files first."
         )
         return
 
@@ -424,7 +424,7 @@ def new_sql(name, reports_config, sources_config, sql_dir):
     available_reports = [r["name"] for r in rep_config.get("reports", [])]
 
     if not available_reports:
-        click.echo("  No reports configured yet. Run: vp new-report")
+        click.echo("  No reports configured yet. Run: vp new report")
         return
 
     click.echo("\n── New SQL File ────────────────────────────")

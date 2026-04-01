@@ -13,7 +13,8 @@ all driven by YAML with no code changes required for new sources or reports.
 ## Documentation
 
 - [First Time Setup](first_time_setup) — install, scaffold, and run your first pipeline
-- [Adding Reports & Checks](adding_checks) — define validation checks for your data
+- [Adding Checks](adding_checks) — write custom check and transform functions
+- [Adding Reports](adding_reports) — define validation checks for your data
 - [Adding Deliverables](adding_deliverables) — configure output files and carriers
 - [Reviewing Flagged Rows](reviewing_flagged_rows) — investigate and correct flagged data
 
@@ -21,31 +22,55 @@ all driven by YAML with no code changes required for new sources or reports.
 
 ## Quick reference
 
-### Setting Up a Pipeline
-> This is how you quickly get started with proto-pipe and get a pipeline up and running.
+### Day-to-day
 
-| Step | Task                  | Command                     |
-|------|-----------------------|-----------------------------|
-| 1    | First-time setup      | `vp init` then `vp db-init` |
-| 2    | Load new files        | `vp ingest`                 |
-| 3    | Run checks            | `vp validate`               |
-| 4    | Produce a deliverable | `vp pull-report <name>`     |
-| 5    | Review flagged rows   | `vp review-flagged-rows`    |
+| Step | Task                  | Command                           |
+|------|-----------------------|-----------------------------------|
+| 1    | Load new files        | `vp ingest`                       |
+| 2    | Run checks            | `vp validate`                     |
+| 3    | Produce a deliverable | `vp pull-report <name>`           |
+| —    | Or run everything     | `vp run-all --deliverable <name>` |
 
-### Setting up configs, checks, and infrastructure
+### First-time setup
 
-| Step                                 | Task                       | Command               |
-|--------------------------------------|----------------------------|-----------------------|
-| Raw data from folder                 | Scaffold a new source      | `vp new-source`       |
-| Name and identify a report           | Scaffold a new report      | `vp new-report`       |
-| Create final report for stakeholders | Scaffold a new deliverable | `vp new-deliverable`  |
-| Create reusable sql queries          | Scaffold a macro           | `vp new-macro <name>` |
-| Create a new SQL file                | Scaffold a new SQL file    | `vp new-sql <name>`   |
+| Step | Task                     | Command              |
+|------|--------------------------|----------------------|
+| 1    | Scaffold config files    | `vp init`            |
+| 2    | Initialise database      | `vp db-init`         |
+| 3    | Define a data source     | `vp new source`      |
+| 4    | Define validation checks | `vp new report`      |
+| 5    | Define output            | `vp new deliverable` |
 
-### Troubleshooting
-| Task                 | Command                           |
-|----------------------|-----------------------------------|
-| Run everything       | `vp run-all --deliverable <name>` |
-| Reset a report table | `vp table-reset`                  |
-| Check current paths  | `vp config show`                  |
-| Update a path        | `vp config set <key> <value>`     |
+### Scaffold
+
+| Task                     | Command              |
+|--------------------------|----------------------|
+| New data source          | `vp new source`      |
+| New report               | `vp new report`      |
+| New deliverable          | `vp new deliverable` |
+| New SQL view             | `vp new view`        |
+| New SQL macro            | `vp new macro`       |
+| New deliverable SQL file | `vp new sql`         |
+
+### Review & fix
+
+| Task                       | Command                        |
+|----------------------------|--------------------------------|
+| Browse ingest conflicts    | `vp flagged --table <n>`       |
+| Open conflicts for editing | `vp flagged open <table>`      |
+| Apply corrections          | `vp flagged retry <table>`     |
+| Clear flags                | `vp flagged clear --table <n>` |
+| Browse check failures      | `vp validated`                 |
+| Export check failures      | `vp export-validation`         |
+
+### Explore & manage
+
+| Task                    | Command                       |
+|-------------------------|-------------------------------|
+| View source table       | `vp view source <table>`      |
+| View deliverable output | `vp view deliverable <name>`  |
+| Browse any table        | `vp table <n>`                |
+| Inspect check functions | `vp funcs`                    |
+| Check path settings     | `vp config show`              |
+| Update a path           | `vp config set <key> <value>` |
+| Workflow guide          | `vp help`                     |

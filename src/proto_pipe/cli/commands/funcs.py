@@ -19,13 +19,13 @@ def funcs_cmd(custom_checks):
     Loads built-in and custom checks fresh into a temporary registry and
     prints a structured report: which passed, which failed, and exactly why.
 
-    Checks marked ✗ are silently skipped during vp new-report. Run this
+    Checks marked ✗ are silently skipped during vp new report. Run this
     command after adding or changing custom checks to confirm they registered.
 
     \b
     Example:
-      vp check-func
-      vp check-func --custom-checks path/to/my_checks.py
+      vp funcs
+      vp funcs --custom-checks path/to/my_checks.py
     """
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
     from proto_pipe.checks.helpers import DECORATED_CHECKS

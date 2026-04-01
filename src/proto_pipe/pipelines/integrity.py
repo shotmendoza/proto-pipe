@@ -20,7 +20,7 @@ import duckdb
 import pandas as pd
 
 from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
-from proto_pipe.io.db import get_column_types, init_flagged_rows, flag_id_for
+from proto_pipe.io.db import get_column_types, flag_id_for
 
 
 # ---------------------------------------------------------------------------

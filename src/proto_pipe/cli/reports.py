@@ -200,9 +200,9 @@ def run_all(
             "These are rows that arrived with conflicting values for existing records."
         )
         click.echo(
-            "Run: vp flagged-summary — to see a breakdown by table"
+            "Run: vp flagged — to see a breakdown by table"
         )
-        click.echo("Run: vp export-flagged --table <n> — to export for correction")
+        click.echo("Run: vp flagged --export csv — to export for correction")
         click.echo("Re-run with --ignore-flagged to produce the deliverable anyway.")
         return
 

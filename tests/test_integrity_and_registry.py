@@ -18,13 +18,13 @@ import pytest
 from proto_pipe.cli.scaffold import _filter_uningested
 from proto_pipe.io.db import init_ingest_log, get_column_types
 from proto_pipe.io.ingest import (
-    _check_numeric_type_conflicts,
     ingest_directory,
 )
 from proto_pipe.pipelines.integrity import (
     check_type_compatibility,
     IntegrityResult,
     write_integrity_flags,
+    _check_numeric_type_conflicts,
 )
 from proto_pipe.checks.registry import CheckRegistry, CheckContract, CheckAudit, validate_check
 

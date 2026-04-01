@@ -49,6 +49,7 @@ from proto_pipe.pipelines.integrity import (
     write_integrity_flags
 )
 
+
 # ---------------------------------------------------------------------------
 # Structural checks — lightweight, run per file before loading
 # ---------------------------------------------------------------------------
@@ -236,7 +237,7 @@ def ingest_directory(
     directory: str,
     sources: list[dict],
     db_path: str,
-    mode: Literal["append", "replace"] = "append",
+    mode: str = "append",
     run_checks: bool = False,
     check_registry=None,
     report_registry=None,
@@ -247,31 +248,18 @@ def ingest_directory(
       Scenario A (first ingest / replace mode):
         - Queries column_type_registry for user-confirmed types.
         - If registry entries exist, pre-scans with TRY_CAST. Mismatch fails the file.
-        - If registry entries exist and pass, applies declared types before CREATE TABLE.
-        - If no registry entries exist, falls back to inference.
+        - CSV: reloaded via DuckDB read_csv with declared types.
+        - Excel: apply_declared_types.
+        - If no registry entries, falls back to inference.
 
       Scenario B (subsequent ingest, table exists):
-        - Runs _ROW_VALIDATORS pre-scan against existing table types.
-        - Rows that fail go to flagged_rows (IntegrityResult → type_conflict).
-        - Clean rows proceed through duplicate-handling and INSERT.
-
-    All DuckDB write operations are wrapped in try/except — exception is
-    printed and logged, run continues to next file.
-
-    :param directory:       Directory containing files to ingest.
-    :param sources:         Source definitions from sources_config.yaml.
-    :param db_path:         Path to the DuckDB pipeline database.
-    :param mode:            'append' or 'replace'.
-    :param run_checks:      Run validation checks after each file loads.
-    :param check_registry:  CheckRegistry instance (required when run_checks=True).
-    :param report_registry: ReportRegistry instance (required when run_checks=True).
-    :return: Summary dict keyed by filename.
+        - CSV: loaded via DuckDB read_csv with declared types before validators run.
+        - Excel: apply_declared_types.
+        - _ROW_VALIDATORS pre-scan; failing rows go to flagged_rows.
+        - Clean rows through duplicate handling and INSERT.
     """
     from proto_pipe.io.db import (
-        table_exists as _table_exists,
-        get_registry_types,
         init_ingest_log as _init_ingest_log,
-        log_ingest as _log_ingest,
         already_ingested as _already_ingested,
     )
 
@@ -304,161 +292,28 @@ def ingest_directory(
             summary[path.name] = {"status": "skipped", "message": "already ingested"}
             continue
 
-        # Load file
-        try:
-            df = load_file(path)
-        except Exception as exc:
-            message = f"Could not load file: {exc}"
-            print(f"[fail] '{path.name}': {message}")
-            _log_ingest(conn, path.name, None, "failed", message=message)
-            summary[path.name] = {"status": "failed", "message": message}
-            continue
+        result = ingest_single_file(conn, path, source, mode=mode)
+        summary[path.name] = result
 
-        # Structural checks
-        issues = _structural_checks(df, source)
-        if issues:
-            message = "; ".join(issues)
-            print(f"[fail] '{path.name}': {message}")
-            _log_ingest(
-                conn, path.name, source["target_table"], "failed", message=message
-            )
-            summary[path.name] = {"status": "failed", "message": message}
-            continue
-
-        table = source["target_table"]
-        primary_key = source.get("primary_key")
-        on_duplicate = source.get("on_duplicate", "flag" if primary_key else "append")
-
-        df["_ingested_at"] = datetime.now(timezone.utc)
-
-        integrity_flagged = 0
-        new_cols: list[str] = []
-        flagged_count = 0
-        skipped_count = 0
-
-        # ── Scenario A: first ingest ──────────────────────────────────────────
-        if mode == "replace" or not _table_exists(conn, table):
-            user_cols = [c for c in df.columns if not c.startswith("_")]
-            registry_types = get_registry_types(conn, user_cols)
-
-            if registry_types:
-                type_issues = check_type_compatibility(
-                    df, registry_types, conn, primary_key
-                )
-                if type_issues:
-                    cols_affected = sorted({i.column for i in type_issues})
-                    message = (
-                        f"Type mismatch for column(s): {', '.join(cols_affected)}. "
-                        f"Fix the file values or run 'vp source edit' to review "
-                        f"the registered types."
-                    )
-                    print(f"[fail] '{path.name}': {message}")
-                    for issue in type_issues[:5]:
-                        print(f"  [{issue.column}] {issue.reason}")
-                        if issue.suggestion:
-                            print(f"           → {issue.suggestion}")
-                    if len(type_issues) > 5:
-                        print(f"  ... and {len(type_issues) - 5} more.")
-                    _log_ingest(conn, path.name, table, "failed", message=message)
-                    summary[path.name] = {"status": "failed", "message": message}
-                    continue
-                df = apply_declared_types(df, registry_types)
-
-            try:
-                conn.execute(f'DROP TABLE IF EXISTS "{table}"')
-                conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
-                print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
-            except Exception as exc:
-                message = f"DuckDB write failed: {exc}"
-                print(f"[fail] '{path.name}': {message}")
-                _log_ingest(conn, path.name, table, "failed", message=message)
-                summary[path.name] = {"status": "failed", "message": message}
-                continue
-
-        # ── Scenario B: subsequent ingest ─────────────────────────────────────
-        else:
-            # Apply declared types BEFORE validators so pandas float64 nullability
-            # artefacts (e.g. 17.0 for a BIGINT column with nulls) are resolved
-            # before TRY_CAST runs. Without this, whole-number floats like 17.0
-            # incorrectly fail TRY_CAST AS BIGINT, creating phantom flags that
-            # block watermark advancement and cause infinite re-processing.
-            user_cols = [c for c in df.columns if not c.startswith("_")]
-            registry_types = get_registry_types(conn, user_cols)
-            if registry_types:
-                df = apply_declared_types(df, registry_types)
-
-            integrity_issues: list[IntegrityResult] = []
-            for validator in _ROW_VALIDATORS:
-                issues = validator(conn, table, df, primary_key)
-                for issue in issues:
-                    issue.filename = path.name  # tag with source filename
-                integrity_issues.extend(issues)
-
-            if integrity_issues:
-                integrity_flagged = write_integrity_flags(
-                    conn, table, integrity_issues
-                )
-                if primary_key:
-                    bad_pks = {
-                        i.pk_value for i in integrity_issues if i.pk_value is not None
-                    }
-                    if bad_pks:
-                        df = df[~df[primary_key].astype(str).isin(bad_pks)].copy()
-                print(
-                    f"  [integrity] {integrity_flagged} row(s) flagged for type conflicts "
-                    f"— see flagged_rows for details"
-                )
-
-            try:
-                new_cols = auto_migrate(conn, table, df)
-
-                if primary_key:
-                    df, flagged_count, skipped_count = _handle_duplicates(
-                        conn, table, df, primary_key, on_duplicate
-                    )
-                else:
-                    if on_duplicate not in ("append", "flag"):
-                        print(
-                            f"[warn] on_duplicate='{on_duplicate}' ignored for "
-                            f"'{table}' — no primary_key defined"
-                        )
-
-                if not df.empty:
-                    col_list = ", ".join(f'"{c}"' for c in df.columns)
-                    conn.execute(
-                        f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df'
-                    )
-
-                print(
-                    f"[ok] '{path.name}' → '{table}' "
-                    f"({len(df)} inserted, "
-                    f"{flagged_count + integrity_flagged} flagged, "
-                    f"{skipped_count} skipped)"
-                )
-            except Exception as exc:
-                message = f"DuckDB write failed: {exc}"
-                print(f"[fail] '{path.name}': {message}")
-                _log_ingest(conn, path.name, table, "failed", message=message)
-                summary[path.name] = {"status": "failed", "message": message}
-                continue
-
-        _log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
-        summary[path.name] = {
-            "table": table,
-            "rows": len(df),
-            "new_cols": new_cols,
-            "flagged": flagged_count + integrity_flagged,
-            "skipped": skipped_count,
-            "status": "ok",
-        }
-
-        if run_checks and check_registry and report_registry:
+        if (
+            run_checks
+            and check_registry
+            and report_registry
+            and result.get("status") == "ok"
+        ):
             _run_inline_checks(
-                conn, table, source, check_registry, report_registry, path.name
+                conn,
+                source["target_table"],
+                source,
+                check_registry,
+                report_registry,
+                path.name,
             )
 
     if unmatched:
         print(f"[warn] No source match for: {', '.join(unmatched)}")
+        from proto_pipe.io.db import log_ingest as _log_ingest
+
         for filename in unmatched:
             _log_ingest(
                 conn, filename, None, "skipped", message="No matching source pattern"
@@ -599,6 +454,7 @@ def _changed_columns(
             old_str = "NULL" if old_null else str(old_val)
             new_str = "NULL" if new_null else str(new_val)
             diffs.append(f"{col}: {old_str} -> {new_str}")
+            continue
     return diffs
 
 
@@ -921,42 +777,235 @@ def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
 #############################
 
 
-def _check_numeric_type_conflicts(
+def _load_csv_with_types(
     conn: duckdb.DuckDBPyConnection,
-    table: str,
-    df: pd.DataFrame,
-    pk_col: str | None,
-) -> list[IntegrityResult]:
-    """Scenario B validator: find rows with values that cannot cast to the
-    existing numeric column type in the table.
+    path: Path,
+    registry_types: dict[str, str],
+) -> pd.DataFrame:
+    """Load a CSV file via DuckDB with declared column types applied natively.
 
-    Only runs against columns typed as numeric in DuckDB (_NUMERIC_DUCKDB_TYPES).
-    Non-numeric columns are skipped — DuckDB handles those implicitly.
+    Uses DuckDB's read_csv with a dtype mapping so type enforcement happens
+    inside DuckDB rather than in pandas. This eliminates float64 artefacts
+    (e.g. 12500.0 for a BIGINT column) that cause phantom duplicate-conflict
+    flags when comparing against DuckDB-stored integer values.
 
-    :param conn:   Open DuckDB connection.
-    :param table:  Target table name.
-    :param df:     Incoming DataFrame.
-    :param pk_col: Primary key column name, or None.
-    :return: List of IntegrityResult entries for failing rows.
+    Columns with a date format suffix (e.g. DATE|%m-%d-%y) are loaded as
+    VARCHAR first, then converted via apply_declared_types — DuckDB's read_csv
+    dtype parameter does not support strptime format strings.
+
+    :param conn:           Open DuckDB connection.
+    :param path:           Path to the CSV file.
+    :param registry_types: {column: declared_type} — may include format suffix.
+    :return: DataFrame with columns typed per declared types.
     """
-    existing_types = get_existing_column_types(conn, table)
-    numeric_reference = {
-        col: db_type
-        for col, db_type in existing_types.items()
-        if col in df.columns
-        and not col.startswith("_")
-        and db_type in NUMERIC_DUCKDB_TYPES
+    dtype: dict[str, str] = {}
+    date_format_cols: dict[str, str] = {}
+
+    for col, declared_type in registry_types.items():
+        if "|" in declared_type:
+            # Date with format suffix — load as VARCHAR, convert after
+            date_format_cols[col] = declared_type
+            dtype[col] = "VARCHAR"
+        else:
+            dtype[col] = declared_type
+
+    df = conn.read_csv(str(path), dtype=dtype).df()
+
+    if date_format_cols:
+        df = apply_declared_types(df, date_format_cols)
+
+    return df
+
+
+def ingest_single_file(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    source: dict,
+    mode: str = "append",
+    on_duplicate_override: str | None = None,
+    log_status_override: str | None = None,
+    strip_pipeline_cols: bool = False,
+) -> dict:
+    """Process one file for a known source. Returns a summary dict entry.
+
+    Extracted from ingest_directory to allow direct invocation for correction
+    retries without going through the full directory scan.
+
+    :param conn:                  Open DuckDB connection.
+    :param path:                  Path to the file to ingest.
+    :param source:                Source definition dict from sources_config.yaml.
+    :param on_duplicate_override: When set, overrides source.on_duplicate.
+                                  Pass 'upsert' from vp flagged retry to force
+                                  correction rows to overwrite existing data.
+    :param log_status_override:   When set, overrides the ingest_log status.
+                                  Pass 'correction' from vp flagged retry for
+                                  auditability — corrections are distinguishable
+                                  from normal ingests in ingest_log.
+    :param strip_pipeline_cols:   When True, drops all _-prefixed columns after
+                                  load. Pass True from vp flagged retry to strip
+                                  flag metadata columns (_flag_id, _flag_reason,
+                                  etc.) from the correction CSV before ingest.
+    :return: Summary dict: {status, table, rows, new_cols, flagged, skipped}
+             or {status: 'failed', message} on failure.
+    """
+    from proto_pipe.io.db import (
+        table_exists as _table_exists,
+        get_registry_types,
+        log_ingest as _log_ingest,
+    )
+    from proto_pipe.pipelines.integrity import (
+        check_type_compatibility,
+        IntegrityResult,
+        write_integrity_flags,
+        _ROW_VALIDATORS,
+    )
+
+    # Load file via pandas — used for structural checks and type compat scan.
+    # CSV files are reloaded via DuckDB after validation passes.
+    try:
+        df = load_file(path)
+    except Exception as exc:
+        message = f"Could not load file: {exc}"
+        print(f"[fail] '{path.name}': {message}")
+        _log_ingest(conn, path.name, None, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    # Strip all pipeline (_-prefixed) columns when requested.
+    # Used by vp flagged retry to remove flag metadata columns from
+    # the correction CSV (e.g. _flag_id, _flag_reason, _flagged_at)
+    # before re-ingesting through the normal type-check and upsert path.
+    if strip_pipeline_cols:
+        df = df[[c for c in df.columns if not c.startswith("_")]]
+
+    # Structural checks
+    issues = _structural_checks(df, source)
+    if issues:
+        message = "; ".join(issues)
+        print(f"[fail] '{path.name}': {message}")
+        _log_ingest(conn, path.name, source["target_table"], "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    table = source["target_table"]
+    primary_key = source.get("primary_key")
+    on_duplicate = on_duplicate_override or source.get(
+        "on_duplicate", "flag" if primary_key else "append"
+    )
+    is_csv = path.suffix.lower() == ".csv"
+
+    integrity_flagged = 0
+    new_cols: list[str] = []
+    flagged_count = 0
+    skipped_count = 0
+
+    # ── Scenario A: first ingest ──────────────────────────────────────────
+    if mode == "replace" or not _table_exists(conn, table):
+        user_cols = [c for c in df.columns if not c.startswith("_")]
+        registry_types = get_registry_types(conn, user_cols)
+
+        if registry_types:
+            type_issues = check_type_compatibility(
+                df, registry_types, conn, primary_key
+            )
+            if type_issues:
+                cols_affected = sorted({i.column for i in type_issues})
+                message = (
+                    f"Type mismatch for column(s): {', '.join(cols_affected)}. "
+                    f"Fix the file values or run 'vp edit source' to review "
+                    f"the registered types."
+                )
+                print(f"[fail] '{path.name}': {message}")
+                _log_ingest(conn, path.name, table, "failed", message=message)
+                return {"status": "failed", "message": message}
+
+            if is_csv:
+                df = _load_csv_with_types(conn, path, registry_types)
+            else:
+                df = apply_declared_types(df, registry_types)
+
+        df["_ingested_at"] = datetime.now(timezone.utc)
+
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
+            print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
+        except Exception as exc:
+            message = f"DuckDB write failed: {exc}"
+            print(f"[fail] '{path.name}': {message}")
+            _log_ingest(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
+
+    # ── Scenario B: subsequent ingest ─────────────────────────────────────
+    else:
+        user_cols = [c for c in df.columns if not c.startswith("_")]
+        registry_types = get_registry_types(conn, user_cols)
+
+        if registry_types:
+            if is_csv:
+                df = _load_csv_with_types(conn, path, registry_types)
+            else:
+                df = apply_declared_types(df, registry_types)
+
+        df["_ingested_at"] = datetime.now(timezone.utc)
+
+        integrity_issues: list[IntegrityResult] = []
+        for validator in _ROW_VALIDATORS:
+            issues = validator(conn, table, df, primary_key)
+            for issue in issues:
+                issue.filename = path.name
+            integrity_issues.extend(issues)
+
+        if integrity_issues:
+            integrity_flagged = write_integrity_flags(conn, table, integrity_issues)
+            if primary_key:
+                bad_pks = {
+                    i.pk_value for i in integrity_issues if i.pk_value is not None
+                }
+                if bad_pks:
+                    df = df[~df[primary_key].astype(str).isin(bad_pks)].copy()
+            print(
+                f"  [integrity] {integrity_flagged} row(s) flagged for type conflicts "
+                f"— see flagged_rows for details"
+            )
+
+        try:
+            new_cols = auto_migrate(conn, table, df)
+
+            if primary_key:
+                df, flagged_count, skipped_count = _handle_duplicates(
+                    conn, table, df, primary_key, on_duplicate
+                )
+            else:
+                if on_duplicate not in ("append", "flag"):
+                    print(
+                        f"[warn] on_duplicate='{on_duplicate}' ignored for "
+                        f"'{table}' — no primary_key defined"
+                    )
+
+            if not df.empty:
+                col_list = ", ".join(f'"{c}"' for c in df.columns)
+                conn.execute(
+                    f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df'
+                )
+
+            print(
+                f"[ok] '{path.name}' → '{table}' "
+                f"({len(df)} inserted, "
+                f"{flagged_count + integrity_flagged} flagged, "
+                f"{skipped_count} skipped)"
+            )
+        except Exception as exc:
+            message = f"DuckDB write failed: {exc}"
+            print(f"[fail] '{path.name}': {message}")
+            _log_ingest(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
+
+    final_status = log_status_override or "ok"
+    _log_ingest(conn, path.name, table, final_status, rows=len(df), new_cols=new_cols)
+    return {
+        "status": "ok",
+        "table": table,
+        "rows": len(df),
+        "new_cols": new_cols,
+        "flagged": flagged_count + integrity_flagged,
+        "skipped": skipped_count,
     }
-    return check_type_compatibility(df, numeric_reference, conn, pk_col)
-
-
-_ROW_VALIDATORS: list[Callable] = [
-    _check_numeric_type_conflicts,
-]
-"""Ordered list of pre-scan validator functions run against every incoming
-DataFrame before INSERT on subsequent ingests (Scenario B).
-
-Each validator signature: (conn, table, df, pk_col) -> list[IntegrityResult].
-Add new validators here as new error classes are identified — the ingest loop
-never needs to change.
-"""

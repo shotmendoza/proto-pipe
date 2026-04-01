@@ -150,7 +150,7 @@ def db_init(pipeline_db, watermark_db, migrate):
     click.echo("[ok] Watermark table ready")
 
     click.echo("\nNext steps:")
-    click.echo("1. Run: vp new-source (define your data sources)")
+    click.echo("1. Run: vp new source (define your data sources)")
     click.echo("2. Run: vp ingest (load files into the pipeline)")
 
 

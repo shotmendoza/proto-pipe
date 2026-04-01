@@ -14,6 +14,7 @@ from pathlib import Path
 
 import click
 import duckdb
+import pandas as pd
 
 from proto_pipe.io.config import config_path_or_override
 
@@ -21,6 +22,27 @@ from proto_pipe.io.config import config_path_or_override
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _glob_flagged_export(table: str, output_dir: str):
+    """Return the most recently *modified* flagged export CSV for a table.
+
+    Globs output_dir for flagged_{table}_*.csv and returns the file with
+    the highest st_mtime. Returns None if no match found.
+
+    Modified time is used (not filename date) so the file the user most
+    recently saved is always picked up by retry, regardless of when the
+    export was originally created.
+
+    Known limitation: opening and saving without changes also advances
+    mtime. This is accepted — retrying with an unchanged file is harmless.
+    """
+    out = Path(output_dir)
+    candidates = sorted(
+        out.glob(f"flagged_{table}_*.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
 
 def _resolve_primary_key(table: str, sources_config: str | None) -> str | None:
     """Look up the primary key for a table from sources_config.yaml."""
@@ -76,7 +98,7 @@ def _get_enriched_flagged_df(
     conn: duckdb.DuckDBPyConnection,
     table: str,
     pk_col: str,
-) -> "pd.DataFrame":
+) -> pd.DataFrame:
     """Join flagged_rows to the source table via md5 identity.
 
     flagged_rows.id = md5(str(pk_value)) — set at flag time in ingest.
@@ -167,7 +189,7 @@ def flagged_cmd(ctx, table, export, limit, pipeline_db):
             from proto_pipe.reports.corrections import dated_export_path
             out_dir = config_path_or_override("output_dir")
             table_label = table or "all"
-            output_path = dated_export_path(out_dir, f"flagged_{table_label}")
+            output_path = dated_export_path(out_dir, table_label)
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(output_path, index=False)
             click.echo(f"[ok] {len(df)} row(s) exported to: {output_path}")
@@ -305,50 +327,92 @@ def flagged_clear(table, check, yes, pipeline_db):
 
 
 @flagged_cmd.command("retry")
-@click.argument("filepath")
-@click.option("--table", required=True, help="Table to apply corrections to.")
+@click.argument("table")
 @click.option("--key", default=None, help="Override primary key column.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
-def flagged_retry(filepath, table, key, pipeline_db, sources_config):
-    """Apply a corrected file back to the source table and clear resolved flags.
+def flagged_retry(table, key, pipeline_db, sources_config):
+    """Apply the most recent flagged export for a table through the ingest cycle.
 
-    Takes the corrected CSV (typically from 'vp flagged --export csv'),
-    updates matching rows in the source table by primary key, and clears
-    any flags that are now resolved.
+    Globs output_dir for the most recently modified flagged_{table}_*.csv,
+    strips flag metadata columns, and runs the file through ingest with
+    on_duplicate=upsert. Corrections are logged as status='correction' in
+    ingest_log for auditability. Resolved flags are cleared from flagged_rows.
+
+    Typical workflow:
+      vp flagged open sales      # export enriched view + open for editing
+      ... edit and save the CSV ...
+      vp flagged retry sales     # apply corrections through ingest
 
     \b
-    Example:
-      vp flagged retry flagged_sales_2026-01-06.csv --table sales
-      vp flagged retry corrected.csv --table sales --key policy_id
+    Examples:
+      vp flagged retry sales
+      vp flagged retry policies --key policy_id
     """
-    from proto_pipe.reports.corrections import import_corrections
+    from proto_pipe.io.config import config_path_or_override, SourceConfig
+    from proto_pipe.io.ingest import ingest_single_file
+
+    out_dir = config_path_or_override("output_dir")
+    path = _glob_flagged_export(table, out_dir)
+
+    if not path:
+        click.echo(
+            f"[error] No flagged export found for '{table}' in {out_dir}.\n"
+            f"  Run: vp flagged open {table}"
+        )
+        return
+
+    # Resolve source definition — needed for ingest cycle
+    src_cfg = config_path_or_override("sources_config", sources_config)
+    config = SourceConfig(src_cfg)
+    source = config.get_by_table(table)
+    if not source:
+        click.echo(
+            f"[error] No source found for table '{table}' in sources_config.yaml"
+        )
+        return
+
+    primary_key = key or source.get("primary_key")
+    if not primary_key:
+        click.echo(
+            f"[error] No primary key for '{table}' — cannot apply targeted corrections.\n"
+            f"  Add primary_key to sources_config.yaml or use --key."
+        )
+        return
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
-    path = Path(filepath)
-
-    if not path.exists():
-        click.echo(f"[error] File not found: {filepath}")
-        return
-
-    primary_key = key or _resolve_primary_key(table, sources_config)
-    if not primary_key:
-        return
+    click.echo(f"  Applying corrections from: {path.name}")
 
     conn = duckdb.connect(p_db)
     try:
-        result = import_corrections(conn, table, str(path), primary_key)
-        click.echo(f"[ok] {result['updated']} row(s) updated in '{table}'")
-        if result["flagged_cleared"]:
-            click.echo(
-                f"[ok] {result['flagged_cleared']} ingest conflict(s) cleared from flagged_rows"
-            )
-        if result["validation_cleared"]:
-            click.echo(
-                f"[ok] {result['validation_cleared']} validation flag(s) cleared from validation_flags"
-            )
-    except (ValueError, FileNotFoundError) as e:
-        click.echo(f"[error] {e}")
+        result = ingest_single_file(
+            conn=conn,
+            path=path,
+            source=source,
+            on_duplicate_override="upsert",
+            log_status_override="correction",
+            strip_pipeline_cols=True,
+        )
+
+        if result["status"] != "ok":
+            click.echo(f"[error] {result.get('message', 'Ingest failed')}")
+            return
+
+        click.echo(f"[ok] {result['rows']} row(s) applied to '{table}'")
+
+        # Clear flags for this table — corrections resolved them
+        cleared = conn.execute(
+            "DELETE FROM flagged_rows WHERE table_name = ? RETURNING id",
+            [table],
+        ).fetchall()
+        if cleared:
+            click.echo(f"[ok] {len(cleared)} flag(s) cleared from flagged_rows")
+        else:
+            click.echo("  No flags to clear.")
+
+        if result.get("new_cols"):
+            click.echo(f"  New columns added: {', '.join(result['new_cols'])}")
+
     finally:
         conn.close()
 
@@ -467,6 +531,65 @@ def check_null_overwrites_cmd(table, pipeline_db, sources_config):
             click.echo(f"[ok] No new conflicts found in '{table}'")
     finally:
         conn.close()
+
+
+@flagged_cmd.command("open")
+@click.argument("table")
+@click.option("--sources-config", default=None, help="Override sources config path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def flagged_open(table, sources_config, pipeline_db):
+    """Export flagged rows for a table and open the file for editing.
+
+    If a flagged export already exists in output_dir, opens the most
+    recently modified one. Otherwise auto-exports first, then opens.
+
+    Exports the enriched view (source data alongside flag context) so you
+    can see and fix the actual bad values directly in the file. After
+    editing and saving, run:
+
+        vp flagged retry <table>
+
+    to apply the corrections back through the full ingest cycle.
+
+    \b
+    Examples:
+      vp flagged open sales
+      vp flagged open policies --pipeline-db /mnt/shared/pipeline.db
+    """
+    from proto_pipe.io.config import config_path_or_override
+    from proto_pipe.reports.corrections import dated_export_path
+
+    out_dir = config_path_or_override("output_dir")
+    path = _glob_flagged_export(table, out_dir)
+
+    if not path:
+        # No existing export — auto-export enriched view so user sees source data
+        p_db = config_path_or_override("pipeline_db", pipeline_db)
+        pk_col = _resolve_primary_key(table, sources_config)
+
+        conn = duckdb.connect(p_db)
+        try:
+            if pk_col:
+                df = _get_enriched_flagged_df(conn, table, pk_col)
+            else:
+                df = _get_flagged_df(conn, table)
+
+            if df.empty:
+                click.echo(f"  No flagged rows for '{table}' — nothing to open.")
+                return
+
+            output_path = dated_export_path(out_dir, table)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(output_path, index=False)
+            click.echo(f"[ok] {len(df)} row(s) exported to: {output_path}")
+            path = Path(output_path)
+        finally:
+            conn.close()
+
+    click.echo(f"  Opening: {path}")
+    click.launch(str(path))
+    click.echo(f"\n  Edit the file, save it, then run:")
+    click.echo(f"vp flagged retry {table}")
 
 
 # ---------------------------------------------------------------------------
