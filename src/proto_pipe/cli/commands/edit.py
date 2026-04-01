@@ -1,4 +1,5 @@
 """vp edit — edit existing pipeline resources."""
+from datetime import timezone, datetime
 
 import click
 import duckdb
@@ -79,21 +80,40 @@ def edit_source(table, force, pipeline_db, sources_config):
     click.echo(f"\n── Edit Source: {existing['name']} ──────────────────────────────")
 
     sample = None
+    registry_hints: dict = {}
+
     with duckdb.connect(p_db) as conn:
+        # Always fetch registry hints for this source — needed even when
+        # the table doesn't exist yet (e.g. after vp table-reset)
+        try:
+            rows = conn.execute(
+                """
+                                SELECT column_name FROM column_type_registry
+                                WHERE source_name = ?
+                                ORDER BY column_name
+                                """,
+                [existing["name"]],
+            ).fetchall()
+            source_cols = [row[0] for row in rows]
+            if source_cols:
+                registry_hints = get_registry_hints(conn, source_cols)
+        except Exception:
+            pass
+
+        # Sample from DB table when available
         if table_exists(conn, target_table):
             try:
                 df = conn.execute(f'SELECT * FROM "{target_table}" LIMIT 20').df()
                 sample = df[[c for c in df.columns if not c.startswith("_")]]
+                # Extend registry hints to include any columns in sample
+                # not already in registry (e.g. newly added columns)
+                if sample is not None:
+                    extra_cols = [c for c in sample.columns if c not in registry_hints]
+                    if extra_cols:
+                        extra_hints = get_registry_hints(conn, extra_cols)
+                        registry_hints.update(extra_hints)
             except Exception:
                 pass
-
-    registry_hints: dict = {}
-    if sample is not None:
-        try:
-            with duckdb.connect(p_db) as conn:
-                registry_hints = get_registry_hints(conn, list(sample.columns))
-        except Exception:
-            pass
 
     suggested = existing.get("patterns", ["*.csv"])[0]
     prompter = SourceConfigPrompter(
@@ -102,8 +122,6 @@ def edit_source(table, force, pipeline_db, sources_config):
         existing_source=existing,
     )
 
-    # other_names excludes the current source name so it doesn't trigger
-    # the "already exists" warning when the user keeps the same name
     other_names = [n for n in config.names() if n != existing["name"]]
 
     if not prompter.run(other_names, suggested):
@@ -153,7 +171,6 @@ def edit_source(table, force, pipeline_db, sources_config):
                 conn, prompter.source["name"], prompter.confirmed_types
             )
 
-    # Handle rename — remove old entry before adding updated one
     if prompter.source["name"] != existing["name"]:
         try:
             config.remove(existing["name"])
@@ -481,5 +498,133 @@ def edit_table(table_name, table, pipeline_db):
         conn.close()
 
 
+@edit_cmd.command("column-type")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def edit_column_type(pipeline_db):
+    """Edit column type declarations across all sources.
+
+    Shows the full column_type_registry as an editable grid, sorted
+    alphabetically by column name. Useful for mass-correcting types
+    shared across multiple sources — e.g. if 'policy_id' was registered
+    as BIGINT but should be VARCHAR across all sources.
+
+    After saving, you will be prompted to drop affected tables so the
+    next vp ingest re-processes them with the corrected types.
+
+    \b
+    Example:
+      vp edit column-type
+    """
+    from proto_pipe.cli.commands.table import get_reviewer
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+
+    with duckdb.connect(p_db) as conn:
+        try:
+            df = conn.execute("""
+                              SELECT column_name, source_name, declared_type, recorded_at
+                              FROM column_type_registry
+                              ORDER BY column_name, source_name
+                              """).df()
+        except Exception as e:
+            click.echo(f"[error] Could not read column_type_registry: {e}")
+            return
+
+    if df.empty:
+        click.echo("No column types registered yet. Run: vp new source")
+        return
+
+    click.echo(f"\n── Edit Column Types ──── {len(df)} entries ────────────────")
+    click.echo("  Edit the declared_type column. Other columns are read-only.\n")
+
+    reviewer = get_reviewer(edit=True)
+    edited_df = reviewer.edit(
+        df, title=f"column_type_registry ({len(df)} entries)", pk_col="column_name"
+    )
+
+    if edited_df is None or edited_df.equals(df):
+        click.echo("  No changes made.")
+        return
+
+    # Identify changed rows (only declared_type is editable)
+    changed = edited_df[edited_df["declared_type"] != df["declared_type"]]
+    if changed.empty:
+        click.echo("  No changes detected.")
+        return
+
+    now = datetime.now(timezone.utc)
+    with duckdb.connect(p_db) as conn:
+        for _, row in changed.iterrows():
+            conn.execute(
+                """
+                         UPDATE column_type_registry
+                         SET declared_type = ?, recorded_at = ?
+                         WHERE column_name = ? AND source_name = ?
+                         """,
+                [row["declared_type"], now, row["column_name"], row["source_name"]],
+            )
+
+    click.echo(f"\n[ok] {len(changed)} column type(s) updated.")
+
+    # Show summary of what changed
+    for _, row in changed.iterrows():
+        orig = df.loc[
+            (df["column_name"] == row["column_name"])
+            & (df["source_name"] == row["source_name"]),
+            "declared_type",
+        ].iloc[0]
+        click.echo(
+            f"  {row['column_name']:<28} {orig} → {row['declared_type']}"
+            f"  (source: {row['source_name']})"
+        )
+
+    # Prompt to drop affected tables for re-ingest
+    affected_tables = (
+        changed["source_name"]
+        .map(lambda src: src)  # source_name maps to target_table via sources_config
+        .unique()
+        .tolist()
+    )
+    click.echo(f"\n  Affected sources: {', '.join(affected_tables)}")
+    drop = questionary.confirm(
+        "Drop affected tables now so vp ingest re-processes them with the new types?",
+        default=False,
+    ).ask()
+
+    if not drop:
+        click.echo(
+            "  Skipped. Run: vp table-reset --report <name>  to drop tables manually."
+        )
+        return
+
+    with duckdb.connect(p_db) as conn:
+        for source_name in affected_tables:
+            # Resolve target_table from sources_config
+            try:
+                src_cfg = config_path_or_override("sources_config", None)
+                from proto_pipe.io.config import SourceConfig
+
+                source = SourceConfig(src_cfg).get(source_name)
+                target_table = source["target_table"] if source else source_name
+            except Exception:
+                target_table = source_name
+
+            try:
+                conn.execute(f'DROP TABLE IF EXISTS "{target_table}"')
+                conn.execute(
+                    "DELETE FROM ingest_log WHERE table_name = ?", [target_table]
+                )
+                click.echo(
+                    f"  [ok] Dropped '{target_table}' — will re-ingest on next vp ingest"
+                )
+            except Exception as e:
+                click.echo(f"  [error] Could not drop '{target_table}': {e}")
+
+
 def edit_commands(cli: click.Group) -> None:
     cli.add_command(edit_cmd)
+    cli.add_command(edit_table)
+    cli.add_command(edit_deliverable)
+    cli.add_command(edit_column_type)
+    cli.add_command(edit_report)
+    cli.add_command(edit_source)

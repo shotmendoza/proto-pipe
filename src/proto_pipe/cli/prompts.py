@@ -56,7 +56,6 @@ class SourceConfigPrompter:
     :param registry_hints:  {column: {source_name: declared_type}} for conflict display.
     :param existing_source: Existing source dict when editing, None when creating.
     """
-
     def __init__(
         self,
         sample_df=None,
@@ -66,11 +65,14 @@ class SourceConfigPrompter:
         self._sample = sample_df
         self._registry_hints = registry_hints or {}
         self._existing = existing_source or {}
-        self._file_cols: list[str] = (
-            [c for c in sample_df.columns if not c.startswith("_")]
-            if sample_df is not None
-            else []
-        )
+        # When no sample is available (table not ingested yet), fall back to
+        # registry hint keys so selectors still work during edit.
+        if sample_df is not None:
+            self._file_cols = [c for c in sample_df.columns if not c.startswith("_")]
+        elif self._registry_hints:
+            self._file_cols = sorted(self._registry_hints.keys())
+        else:
+            self._file_cols = []
         # Output properties — only valid after run() returns True
         self.source: dict = {}
         self.confirmed_types: dict = {}
@@ -252,12 +254,22 @@ class SourceConfigPrompter:
         """Show inferred type summary and let the user confirm or override.
 
         Returns {column_name: declared_type} for all file columns.
-        Returns {} if no sample file was loaded.
+        Returns {} if no columns are available (no sample and no registry entries).
+
+        When sample_df is None, sample values are omitted from the display
+        but column type selection still works via registry data.
         """
-        if self._sample is None or not self._file_cols:
+        if not self._file_cols:
             return {}
 
-        inferred_types = {col: _infer_duckdb_type(self._sample[col]) for col in self._file_cols}
+        # Infer types from sample where available
+        inferred_types: dict[str, str] = {}
+        if self._sample is not None:
+            inferred_types = {
+                col: _infer_duckdb_type(self._sample[col])
+                for col in self._file_cols
+                if col in self._sample.columns
+            }
 
         working_types: dict[str, str] = {}
         for col in self._file_cols:
@@ -265,10 +277,12 @@ class SourceConfigPrompter:
             unique_types = set(hints.values())
             if len(unique_types) == 1:
                 working_types[col] = next(iter(unique_types))
-            else:
+            elif col in inferred_types:
                 working_types[col] = inferred_types[col]
+            else:
+                working_types[col] = "VARCHAR"
 
-        click.echo("\n  Inferred column types:")
+        click.echo("\n  Column types:")
         for col in self._file_cols:
             hints = self._registry_hints.get(col, {})
             unique_types = set(hints.values())
@@ -283,14 +297,21 @@ class SourceConfigPrompter:
                 conflict_parts = ", ".join(f"{t} in '{s}'" for s, t in hints.items())
                 note = f"  ⚠ conflict: {conflict_parts}"
 
-            sample_val = (
-                self._sample[col].dropna().iloc[0]
-                if not self._sample[col].dropna().empty
-                else "—"
-            )
-            click.echo(f"    {col:<28} {dtype:<14} sample: {sample_val}{note}")
+            if self._sample is not None and col in self._sample.columns:
+                non_null = self._sample[col].dropna()
+                sample_str = (
+                    f" sample: {non_null.iloc[0]}"
+                    if not non_null.empty
+                    else " sample: —"
+                )
+            else:
+                sample_str = ""
 
-        looks_right = questionary.confirm("\n  Do these look right?", default=True).ask()
+            click.echo(f"    {col:<28} {dtype:<14}{sample_str}{note}")
+
+        looks_right = questionary.confirm(
+            "\n  Do these look right?", default=True
+        ).ask()
         if looks_right is None:
             return {}
 
@@ -298,7 +319,17 @@ class SourceConfigPrompter:
             to_fix = questionary.checkbox(
                 "Select the columns to change:",
                 choices=[
-                    questionary.Choice(f"{col:<28} {working_types[col]}", value=col)
+                    questionary.Choice(
+                        f"{col:<28} {working_types[col]:<14}"
+                        + (
+                            f" sample: {self._sample[col].dropna().iloc[0]}"
+                            if self._sample is not None
+                            and col in self._sample.columns
+                            and not self._sample[col].dropna().empty
+                            else ""
+                        ),
+                        value=col,
+                    )
                     for col in self._file_cols
                 ],
             ).ask()
@@ -311,8 +342,12 @@ class SourceConfigPrompter:
                 unique_types = set(hints.values())
 
                 if len(unique_types) > 1:
-                    conflict_parts = ", ".join(f"{t} in '{s}'" for s, t in hints.items())
-                    click.echo(f"  ⚠ '{col}' has conflicting registry types: {conflict_parts}")
+                    conflict_parts = ", ".join(
+                        f"{t} in '{s}'" for s, t in hints.items()
+                    )
+                    click.echo(
+                        f"  ⚠ '{col}' has conflicting registry types: {conflict_parts}"
+                    )
 
                 chosen = questionary.select(
                     f"  '{col}' (currently {current}):",
