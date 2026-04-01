@@ -156,6 +156,13 @@ def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
     return [f for f in files if f not in ingested_set]
 
 
+def _filter_unconfigured(files: list[str], sources: list[dict]) -> list[str]:
+    """Return files that don't match any existing source pattern."""
+    from fnmatch import fnmatch
+    patterns = [p for s in sources for p in s.get("patterns", [])]
+    return [f for f in files if not any(fnmatch(f, p) for p in patterns)]
+
+
 def _infer_duckdb_type(series) -> str:
     """Return the DuckDB type string inferred from a pandas Series dtype."""
     import pandas as pd
