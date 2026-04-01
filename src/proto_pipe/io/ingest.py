@@ -39,12 +39,12 @@ import duckdb
 import pandas as pd  # type: ignore
 
 from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
-from proto_pipe.io.migration import _auto_migrate
 from proto_pipe.io.db import (
     get_columns as get_existing_columns,
     get_column_types as get_existing_column_types,
     table_exists,
 )
+from proto_pipe.io.migration import _auto_migrate
 
 
 # ---------------------------------------------------------------------------

@@ -11,22 +11,21 @@ Tests for:
   - ingest_directory Scenario B: row-level integrity flagging (ingest.py)
   - _filter_uningested (scaffold.py)
 """
+import duckdb
 import pandas as pd
 import pytest
-import duckdb
 
 from proto_pipe.checks.inspector import CheckAudit, CheckContract, validate_check
-from proto_pipe.registry.base import CheckRegistry
+from proto_pipe.cli.scaffold import _filter_uningested
+from proto_pipe.io.db import init_ingest_log, get_column_types
 from proto_pipe.io.ingest import (
     IntegrityResult,
     _check_type_compatibility,
     _check_numeric_type_conflicts,
     _write_integrity_flags,
     ingest_directory,
-    flag_id_for,
 )
-from proto_pipe.io.db import init_ingest_log, get_column_types
-from proto_pipe.cli.scaffold import _filter_uningested
+from proto_pipe.registry.base import CheckRegistry
 
 
 # ---------------------------------------------------------------------------

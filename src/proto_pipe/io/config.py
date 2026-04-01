@@ -6,8 +6,8 @@ this class instead.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from os import PathLike
+from pathlib import Path
 
 
 class SourceConfig:

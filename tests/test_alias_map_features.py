@@ -5,7 +5,6 @@ Tests for:
 - reset_report (test_reset_*)
 - load_macros / vp new-macro (test_macro_*)
 """
-from pathlib import Path
 
 import duckdb
 import pandas as pd
@@ -14,13 +13,13 @@ import pytest
 from proto_pipe.checks.built_in import BUILT_IN_CHECKS
 from proto_pipe.checks.helpers import _DECORATED_CHECKS, custom_check, register_custom_check
 from proto_pipe.checks.inspector import CheckContract
+from proto_pipe.io.db import init_ingest_log, table_exists
 from proto_pipe.io.ingest import (
     init_db,
     ingest_directory,
     load_macros,
     reset_report,
 )
-from proto_pipe.io.db import init_ingest_log, table_exists
 from proto_pipe.io.registry import (
     _build_alias_param_map,
     _expand_check_with_alias_map,
@@ -337,7 +336,6 @@ def test_expand_scalar_params_broadcast():
     assert len(names) == 2
     df_pass = pd.DataFrame({"Col A": [50.0]})
     df_fail = pd.DataFrame({"Col A": [5.0]})
-    from proto_pipe.checks.result import CheckResult
     result_pass = reg.run(names[0], {"df": df_pass})
     result_fail = reg.run(names[0], {"df": df_fail})
     assert result_pass.passed is True

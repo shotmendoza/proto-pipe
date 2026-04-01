@@ -12,7 +12,6 @@ from __future__ import annotations
 import click
 import questionary
 
-
 # Common DuckDB types shown in all type selection prompts
 _DUCKDB_TYPES = ["VARCHAR", "DOUBLE", "BIGINT", "BOOLEAN", "DATE", "TIMESTAMPTZ"]
 
@@ -68,7 +67,6 @@ class SourceConfigPrompter:
         registry_hints: dict | None = None,
         existing_source: dict | None = None,
     ) -> None:
-        import pandas as pd
         self._sample = sample_df
         self._registry_hints = registry_hints or {}
         self._existing = existing_source or {}

@@ -12,7 +12,6 @@ Covers:
 - settings: multi_select_params defaults to True
 """
 
-import inspect
 from functools import partial
 
 import pandas as pd

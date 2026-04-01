@@ -10,6 +10,7 @@ Covers:
 import duckdb
 import pandas as pd
 
+from proto_pipe.io.db import table_exists
 from proto_pipe.io.ingest import (
     resolve_source,
     _structural_checks,
@@ -17,7 +18,6 @@ from proto_pipe.io.ingest import (
     ingest_directory,
     init_source_tables,
 )
-from proto_pipe.io.db import table_exists
 
 
 # ---------------------------------------------------------------------------

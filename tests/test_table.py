@@ -10,7 +10,7 @@ Covers:
 """
 
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import duckdb
 import pandas as pd
@@ -23,7 +23,6 @@ from proto_pipe.cli.table import (
     _get_all_tables,
     _get_reviewer,
     table_cmd,
-    PIPELINE_TABLES,
 )
 
 
@@ -170,7 +169,6 @@ class TestTextualReview:
         reviewer = TextualReview()
 
         async def run():
-            from proto_pipe.cli.table import TextualReview
             app = reviewer._make_app(sample_df, "Test", pk_col="order_id", editable=False)
             async with app.run_test() as pilot:
                 await pilot.press("escape")

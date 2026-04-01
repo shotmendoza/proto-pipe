@@ -9,8 +9,8 @@ Covers:
 - Invalid check name raises
 """
 
-import pytest
 import pandas as pd
+import pytest
 
 from proto_pipe.checks.built_in import (
     check_nulls,
