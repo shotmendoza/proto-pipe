@@ -19,6 +19,85 @@ from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry
 
 
+# ---------------------------------------------------------------------------
+# New helpers for check display
+# ---------------------------------------------------------------------------
+
+
+def _get_check_first_sentence(func) -> str:
+    """Extract and return the first sentence from a function's docstring.
+
+    Used as the description shown alongside each check in vp new-report.
+    Returns an empty string if no docstring is present.
+    """
+    doc = inspect.getdoc(func)
+    if not doc:
+        return ""
+    # Split on period-space, period-newline, or bare newline — take first chunk
+    sentence = re.split(r"\.\s|\.\n|\n", doc)[0].strip()
+    if sentence and not sentence.endswith("."):
+        sentence += "."
+    return sentence
+
+
+def _build_check_param_lines(
+    check_name: str,
+    check_registry: CheckRegistry,
+    table_cols: list[str],
+    alias_param_to_cols: dict[str, list[str]],
+) -> list[str]:
+    """Build param display lines for one check, showing column matches inline.
+
+    For column params: shows alias_map cols first, then remaining table cols,
+    capped at 3 with (N+) suffix if more exist.
+    For scalar/list params: shows the param kind only.
+
+    :param check_name:         Registry name of the check.
+    :param check_registry:     CheckRegistry to look up the function.
+    :param table_cols:         Sorted column names for the target table.
+    :param alias_param_to_cols: {param: [col, ...]} from the accumulated alias_map.
+    :return: List of formatted lines, one per param.
+    """
+    from proto_pipe.checks.inspector import CheckParamInspector
+
+    original = _get_original_func(check_name, check_registry)
+    if original is None:
+        return []
+
+    inspector = CheckParamInspector(original)
+    col_params = set(inspector.column_params())
+    sig = inspect.signature(inspector.func)
+
+    lines = []
+    for param_name, param in sig.parameters.items():
+        if param_name == "context":
+            continue
+
+        ann = param.annotation
+
+        if param_name in col_params:
+            alias_cols = alias_param_to_cols.get(param_name, [])
+            other_cols = [c for c in table_cols if c not in alias_cols]
+            all_cols = alias_cols + other_cols
+
+            if not all_cols:
+                lines.append(f"    {param_name:<18} column   (no columns in table)")
+            elif len(all_cols) <= 3:
+                lines.append(f"    {param_name:<18} column   → {', '.join(all_cols)}")
+            else:
+                shown = ", ".join(all_cols[:3])
+                remaining = len(all_cols) - 3
+                lines.append(f"    {param_name:<18} column   → {shown}  ({remaining}+)")
+
+        elif _is_list_annotation(ann) or isinstance(param.default, list):
+            lines.append(f"    {param_name:<18} list")
+
+        else:
+            lines.append(f"    {param_name:<18} scalar")
+
+    return lines
+
+
 def _get_column_registry_hints(
     pipeline_db: str,
     columns: list[str],
@@ -704,6 +783,9 @@ def _fill_params(
     Column params are resolved through alias_map — they are NOT written into the
     check's params dict. Scalar params are written into the check's params dict.
 
+    Always prompts for params — the user can review and change any mapping
+    including ones already present in the alias_map.
+
     Returns (check_entries, alias_map_entries, go_back).
       check_entries — list of {name, params} dicts. Column params omitted.
       alias_map_entries — accumulated list of {param, column} dicts.
@@ -730,20 +812,13 @@ def _fill_params(
     if not checks_with_params:
         return [{"name": c} for c in selected_checks], accumulated_alias, False
 
-    fill = questionary.confirm("Some checks have parameters. Fill them in now?").ask()
-    if fill is None:
-        return [], [], True  # ESC -> go back
-
     check_entries = []
 
     for check_name in selected_checks:
         params = checks_with_params.get(check_name, {})
 
-        if not params or not fill:
-            entry = {"name": check_name}
-            if params:
-                entry["params"] = {k: None for k in params}
-            check_entries.append(entry)
+        if not params:
+            check_entries.append({"name": check_name})
             continue
 
         click.echo(f"\nParameters for '{check_name}':")
@@ -764,7 +839,7 @@ def _fill_params(
             )
 
             if param_name in col_params:
-                # Suggest from alias_map if populated, else fall back to history/table cols
+                # Alias_map cols first (pre-mapped from this session), then table cols
                 alias_cols = alias_param_to_cols.get(param_name, [])
                 if alias_cols:
                     choices = alias_cols + [
@@ -1025,10 +1100,6 @@ def new_report(reports_config, pipeline_db):
     click.echo("\n── New Report ──────────────────────────────")
     click.echo("  Press ESC at any prompt to go back to the previous step.\n")
 
-    # ---------------------------------------------------------------------------
-    # Step machine: TABLE → NAME → CHECKS → PARAMS
-    # None from any questionary call = ESC = go back one step.
-    # ---------------------------------------------------------------------------
     STEP_TABLE = 0
     STEP_NAME = 1
     STEP_CHECKS = 2
@@ -1040,7 +1111,7 @@ def new_report(reports_config, pipeline_db):
 
     conn = duckdb.connect(p_db)
 
-    _init_check_registry_metadata(conn)  # ← add this line
+    _init_check_registry_metadata(conn)
     for check_name in check_registry.available():
         original = _get_original_func(check_name, check_registry)
         if original is not None:
@@ -1066,7 +1137,7 @@ def new_report(reports_config, pipeline_db):
                 ).ask()
                 if table is None:
                     click.echo("Cancelled.")
-                    return  # first step — exit entirely
+                    return
                 state["table"] = table
                 step = STEP_NAME
 
@@ -1099,16 +1170,52 @@ def new_report(reports_config, pipeline_db):
 
             # ── Check selection ────────────────────────────────────────────────
             elif step == STEP_CHECKS:
+                table_cols = sorted(_get_table_columns(p_db, state["table"]))
+
+                # Build alias_map lookup from accumulated state
+                alias_param_to_cols: dict[str, list[str]] = {}
+                for entry in state.get("alias_map", []):
+                    alias_param_to_cols.setdefault(entry["param"], []).append(
+                        entry["column"]
+                    )
+
+                # Print full summary before the checkbox
+                click.echo("\n  Available checks:\n")
+                choices = []
+                for check_name in available_checks:
+                    original = _get_original_func(check_name, check_registry)
+                    first_sentence = (
+                        _get_check_first_sentence(original) if original else ""
+                    )
+                    param_lines = _build_check_param_lines(
+                        check_name, check_registry, table_cols, alias_param_to_cols
+                    )
+
+                    click.echo(f"  {check_name}")
+                    if first_sentence:
+                        click.echo(f"    {first_sentence}")
+                    for line in param_lines:
+                        click.echo(line)
+                    click.echo()
+
+                    choices.append(
+                        questionary.Choice(
+                            title=check_name,
+                            value=check_name,
+                            description=first_sentence,
+                        )
+                    )
+
                 selected = questionary.checkbox(
                     "Select checks to run on this report:",
-                    choices=available_checks,
+                    choices=choices,
                 ).ask()
                 if selected is None:
                     step = STEP_NAME
                     continue
                 if not selected:
                     click.echo("  Please select at least one check.")
-                    continue  # re-ask without moving step
+                    continue
                 state["selected_checks"] = selected
                 step = STEP_PARAMS
 
