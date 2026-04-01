@@ -27,7 +27,7 @@ def _apply_transforms(
 
     Each transform receives {"df": working_df} and must return either:
       - pd.DataFrame — replaces the working DataFrame entirely
-      - pd.Series    — replaces a single column (series.name must match a column)
+      - pd.Series — replaces a single column (series.name must match a column)
 
     On exception, that transform is skipped and the working DataFrame is left
     unchanged for subsequent transforms. A single DuckDB write happens after
