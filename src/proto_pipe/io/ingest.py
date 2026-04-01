@@ -27,8 +27,6 @@ Duplicate row handling (on_duplicate in sources_config.yaml):
 Each ingest run logs results (including failures) to the `ingest_log` table
 so failures are visible without stopping the entire run.
 """
-import hashlib
-import uuid
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -41,10 +39,15 @@ from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
 from proto_pipe.io.db import (
     get_columns as get_existing_columns,
     get_column_types as get_existing_column_types,
-    table_exists,
+    table_exists, flag_id_for,
 )
 from proto_pipe.io.migration import auto_migrate
-from proto_pipe.pipelines.integrity import apply_declared_types, check_type_compatibility, IntegrityResult
+from proto_pipe.pipelines.integrity import (
+    apply_declared_types,
+    check_type_compatibility,
+    IntegrityResult,
+    write_integrity_flags
+)
 
 # ---------------------------------------------------------------------------
 # Structural checks — lightweight, run per file before loading
@@ -75,21 +78,6 @@ def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 # Flag identity
 # ---------------------------------------------------------------------------
-def flag_id_for(
-        pk_value: str | int | float | None,
-) -> str:
-    """Return the deterministic flag id for a given primary key value.
-
-    id = md5(str(pk_value))
-
-    Using md5 means the same expression is computable in DuckDB SQL:
-        md5(CAST(source.pk_col AS VARCHAR))
-
-    If pk_value is null, then will return a UUID4 with a string wrap.
-    """
-    if pk_value is None:
-        return str(uuid.uuid4())
-    return hashlib.md5(str(pk_value).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -389,12 +377,25 @@ def ingest_directory(
 
         # ── Scenario B: subsequent ingest ─────────────────────────────────────
         else:
+            # Apply declared types BEFORE validators so pandas float64 nullability
+            # artefacts (e.g. 17.0 for a BIGINT column with nulls) are resolved
+            # before TRY_CAST runs. Without this, whole-number floats like 17.0
+            # incorrectly fail TRY_CAST AS BIGINT, creating phantom flags that
+            # block watermark advancement and cause infinite re-processing.
+            user_cols = [c for c in df.columns if not c.startswith("_")]
+            registry_types = get_registry_types(conn, user_cols)
+            if registry_types:
+                df = apply_declared_types(df, registry_types)
+
             integrity_issues: list[IntegrityResult] = []
             for validator in _ROW_VALIDATORS:
-                integrity_issues.extend(validator(conn, table, df, primary_key))
+                issues = validator(conn, table, df, primary_key)
+                for issue in issues:
+                    issue.filename = path.name  # tag with source filename
+                integrity_issues.extend(issues)
 
             if integrity_issues:
-                integrity_flagged = _write_integrity_flags(
+                integrity_flagged = write_integrity_flags(
                     conn, table, integrity_issues
                 )
                 if primary_key:
@@ -959,40 +960,3 @@ Each validator signature: (conn, table, df, pk_col) -> list[IntegrityResult].
 Add new validators here as new error classes are identified — the ingest loop
 never needs to change.
 """
-
-def _write_integrity_flags(
-    conn: duckdb.DuckDBPyConnection,
-    table: str,
-    issues: list[IntegrityResult],
-) -> int:
-    """Write IntegrityResult entries to flagged_rows. Returns count written.
-
-    Uses ON CONFLICT DO NOTHING — running the same file twice won't duplicate flags.
-    check_name is set to 'type_conflict' to distinguish from duplicate_conflict entries.
-
-    :param conn:   Open the DuckDB connection.
-    :param table:  Target table name.
-    :param issues: List of IntegrityResult to write.
-    :return: Number of flag entries written.
-    """
-    if not issues:
-        return 0
-
-    flags_df = pd.DataFrame(
-        {
-            "id": [flag_id_for(i.pk_value) for i in issues],
-            "table_name": table,
-            "check_name": "type_conflict",
-            "reason": [f"[{i.column}] {i.reason}"[:500] for i in issues],
-            "flagged_at": datetime.now(timezone.utc),
-        }
-    )
-
-    conn.execute("""
-                 INSERT INTO flagged_rows
-                     (id, table_name, check_name, reason, flagged_at)
-                 SELECT id, table_name, check_name, reason, flagged_at
-                 FROM flags_df
-                     ON CONFLICT (id) DO NOTHING
-                 """)
-    return len(issues)

@@ -20,12 +20,13 @@ import duckdb
 import pandas as pd
 
 from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
-from proto_pipe.io.db import get_column_types, init_flagged_rows
+from proto_pipe.io.db import get_column_types, init_flagged_rows, flag_id_for
 
 
 # ---------------------------------------------------------------------------
 # IntegrityResult
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class IntegrityResult:
@@ -36,17 +37,20 @@ class IntegrityResult:
     excluded from the INSERT — clean rows proceed normally.
 
     Attributes:
-        pk_value:   Primary key value identifying the row. Falls back to
-                    None (uuid4 flag identity) if no primary key is defined.
+        pk_value:   Primary key value identifying the row.
         column:     Column where the incompatibility was detected.
         reason:     Plain-English description of what went wrong.
         suggestion: Optional hint for how the user can resolve the issue.
+        filename:   Source filename that produced this issue. Set by the
+                    ingest loop after validators run so the flag reason
+                    tells the user exactly which file to investigate.
     """
 
     pk_value: str | None
     column: str
     reason: str
     suggestion: str | None = None
+    filename: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +92,7 @@ Add new validators here — the ingest loop never needs to change.
 # Writing flags
 # ---------------------------------------------------------------------------
 
+
 def write_integrity_flags(
     conn: duckdb.DuckDBPyConnection,
     table: str,
@@ -95,36 +100,35 @@ def write_integrity_flags(
 ) -> int:
     """Write IntegrityResult entries to flagged_rows. Returns count written.
 
-    Uses ON CONFLICT DO NOTHING — idempotent on re-run.
-    check_name is 'type_conflict' to distinguish from 'duplicate_conflict'.
+    Uses ON CONFLICT DO NOTHING — running the same file twice won't duplicate flags.
+    check_name is set to 'type_conflict' to distinguish from duplicate_conflict entries.
+    Filename is appended to the reason when present so the user knows which file to fix.
     """
     if not issues:
         return 0
 
-    import hashlib
+    def _reason(i: IntegrityResult) -> str:
+        base = f"[{i.column}] {i.reason}"
+        if i.filename:
+            base += f" (file: {i.filename})"
+        return base[:500]
 
-    def _flag_id(pk_value: str | None) -> str:
-        if pk_value is None:
-            import uuid
-            return str(uuid.uuid4())
-        return hashlib.md5(str(pk_value).encode()).hexdigest()
-
-    init_flagged_rows(conn)
-
-    flags_df = pd.DataFrame({
-        "id": [_flag_id(i.pk_value) for i in issues],
-        "table_name": table,
-        "check_name": "type_conflict",
-        "reason": [f"[{i.column}] {i.reason}"[:500] for i in issues],
-        "flagged_at": datetime.now(timezone.utc),
-    })
+    flags_df = pd.DataFrame(
+        {
+            "id": [flag_id_for(i.pk_value) for i in issues],
+            "table_name": table,
+            "check_name": "type_conflict",
+            "reason": [_reason(i) for i in issues],
+            "flagged_at": datetime.now(timezone.utc),
+        }
+    )
 
     conn.execute("""
-        INSERT INTO flagged_rows (id, table_name, check_name, reason, flagged_at)
-        SELECT id, table_name, check_name, reason, flagged_at
-        FROM flags_df
-        ON CONFLICT (id) DO NOTHING
-    """)
+                 INSERT INTO flagged_rows (id, table_name, check_name, reason, flagged_at)
+                 SELECT id, table_name, check_name, reason, flagged_at
+                 FROM flags_df
+                     ON CONFLICT (id) DO NOTHING
+                 """)
     return len(issues)
 
 

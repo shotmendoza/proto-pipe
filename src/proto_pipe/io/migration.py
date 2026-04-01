@@ -20,10 +20,9 @@ from proto_pipe.io.db import (
 from proto_pipe.pipelines.integrity import (
     IntegrityResult,
     check_type_compatibility,
+    apply_declared_types,
     write_integrity_flags,
-    apply_declared_types
 )
-
 
 # ---------------------------------------------------------------------------
 # _auto_migrate (moved from ingest.py)

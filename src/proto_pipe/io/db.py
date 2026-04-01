@@ -6,6 +6,7 @@ these functions rather than executing SQL directly.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -261,3 +262,20 @@ def get_ingested_filenames(conn: duckdb.DuckDBPyConnection) -> set[str]:
         return {row[0] for row in rows}
     except Exception:
         return set()
+
+
+def flag_id_for(
+        pk_value: str | int | float | None,
+) -> str:
+    """Return the deterministic flag id for a given primary key value.
+
+    id = md5(str(pk_value))
+
+    Using md5 means the same expression is computable in DuckDB SQL:
+        md5(CAST(source.pk_col AS VARCHAR))
+
+    If pk_value is null, then will return a UUID4 with a string wrap.
+    """
+    if pk_value is None:
+        return str(uuid.uuid4())
+    return hashlib.md5(str(pk_value).encode()).hexdigest()

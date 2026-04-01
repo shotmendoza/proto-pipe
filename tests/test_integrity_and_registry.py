@@ -19,10 +19,13 @@ from proto_pipe.cli.scaffold import _filter_uningested
 from proto_pipe.io.db import init_ingest_log, get_column_types
 from proto_pipe.io.ingest import (
     _check_numeric_type_conflicts,
-    _write_integrity_flags,
     ingest_directory,
 )
-from proto_pipe.pipelines.integrity import check_type_compatibility, IntegrityResult
+from proto_pipe.pipelines.integrity import (
+    check_type_compatibility,
+    IntegrityResult,
+    write_integrity_flags,
+)
 from proto_pipe.checks.registry import CheckRegistry, CheckContract, CheckAudit, validate_check
 
 
@@ -370,7 +373,7 @@ class TestWriteIntegrityFlags:
             IntegrityResult(pk_value="P-001", column="renewal", reason="bad value"),
             IntegrityResult(pk_value="P-002", column="renewal", reason="also bad"),
         ]
-        count = _write_integrity_flags(conn, "policies", issues)
+        count = write_integrity_flags(conn, "policies", issues)
         assert count == 2
         rows = conn.execute("SELECT * FROM flagged_rows").df()
         assert len(rows) == 2
@@ -382,8 +385,8 @@ class TestWriteIntegrityFlags:
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
         issues = [IntegrityResult(pk_value="P-001", column="renewal", reason="bad")]
-        _write_integrity_flags(conn, "policies", issues)
-        _write_integrity_flags(conn, "policies", issues)
+        write_integrity_flags(conn, "policies", issues)
+        write_integrity_flags(conn, "policies", issues)
         count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
         assert count == 1
         conn.close()
@@ -391,7 +394,7 @@ class TestWriteIntegrityFlags:
     def test_returns_zero_for_empty_issues(self, tmp_path):
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
-        count = _write_integrity_flags(conn, "policies", [])
+        count = write_integrity_flags(conn, "policies", [])
         assert count == 0
         conn.close()
 
@@ -399,7 +402,7 @@ class TestWriteIntegrityFlags:
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
         issues = [IntegrityResult(pk_value="X", column="my_col", reason="bad value")]
-        _write_integrity_flags(conn, "t", issues)
+        write_integrity_flags(conn, "t", issues)
         row = conn.execute("SELECT reason FROM flagged_rows").fetchone()
         assert "my_col" in row[0]
         conn.close()
@@ -408,7 +411,7 @@ class TestWriteIntegrityFlags:
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
         issues = [IntegrityResult(pk_value=None, column="col", reason="bad")]
-        count = _write_integrity_flags(conn, "t", issues)
+        count = write_integrity_flags(conn, "t", issues)
         assert count == 1
         conn.close()
 

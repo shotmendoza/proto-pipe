@@ -36,11 +36,11 @@ import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.io.db import init_ingest_log
+from proto_pipe.io.db import init_ingest_log, flag_id_for
 from proto_pipe.io.ingest import (
     ingest_directory, _handle_duplicates, check_null_overwrites,
     CHUNK_SIZE,
-    flag_id_for, _write_flag,
+    _write_flag,
 )
 from proto_pipe.reports.corrections import export_flagged, import_corrections, dated_export_path
 
