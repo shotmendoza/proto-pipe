@@ -1,10 +1,10 @@
 """Flagged and validated commands.
 
-vp flagged            — view raw flagged_rows (ingest conflicts)
-vp flagged edit       — enriched editable view joined to source table
-vp flagged clear      — clear flags without applying corrections
-vp flagged retry      — apply corrected file, clear resolved flags
-vp validated          — view validation_flags (check failures)
+vp flagged — view raw flagged_rows (ingest conflicts)
+vp flagged edit — enriched editable view joined to source table
+vp flagged clear — clear flags without applying corrections
+vp flagged retry — apply corrected file, clear resolved flags
+vp validated — view validation_flags (check failures)
 
 Kept as top-level:
   vp check-null-overwrites

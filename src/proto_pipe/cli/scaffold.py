@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from graphlib import TopologicalSorter, CycleError
-from importlib.util import spec_from_file_location, module_from_spec
 from pathlib import Path
 from typing import Iterable
 
@@ -13,8 +12,10 @@ import click
 import duckdb
 import questionary
 
+from proto_pipe.cli.prompts import SourceConfigPrompter
 from proto_pipe.io.config import config_path_or_override
 from proto_pipe.constants import PIPELINE_TABLES
+from proto_pipe.io.db import get_registry_hints, write_registry_types
 from proto_pipe.io.registry import load_config, write_config
 from proto_pipe.registry.base import CheckRegistry
 
@@ -430,7 +431,7 @@ def new_source(sources_config, incoming_dir):
       vp new-source
     """
     from fnmatch import fnmatch
-    from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.config import config_path_or_override, SourceConfig
     from proto_pipe.io.ingest import load_file
     from proto_pipe.io.settings import load_settings
 
@@ -769,125 +770,6 @@ def _fill_params(
 
 
 # ---------------------------------------------------------------------------
-# New command: vp check-func
-# ---------------------------------------------------------------------------
-
-
-@click.command("check-func")
-@click.option(
-    "--custom-checks", default=None, help="Override custom_checks_module path."
-)
-def check_func(custom_checks):
-    """Inspect all check functions and report any that failed validation.
-
-    Loads built-in and custom checks fresh into a temporary registry and
-    prints a structured report: which passed, which failed, and exactly why.
-
-    Checks marked ✗ are silently skipped during vp new-report. Run this
-    command after adding or changing custom checks to confirm they registered.
-
-    \b
-    Example:
-      vp check-func
-      vp check-func --custom-checks path/to/my_checks.py
-    """
-    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-    from proto_pipe.checks.helpers import _DECORATED_CHECKS
-    from proto_pipe.io.settings import load_settings
-    from proto_pipe.registry.base import CheckRegistry as _TempRegistry
-
-    settings = load_settings()
-    module_path = custom_checks or settings.get("custom_checks_module")
-
-    # Snapshot built-in names before register_custom_check can add to BUILT_IN_CHECKS
-    builtin_names: set[str] = set(BUILT_IN_CHECKS.keys())
-
-    # Fresh temporary registry — never touches the global instance
-    tmp = _TempRegistry()
-
-    for name, func in BUILT_IN_CHECKS.items():
-        tmp.register(name, func, kind="check")
-
-    # Load custom checks
-    custom_names: set[str] = set()
-    custom_load_error: str | None = None
-
-    if module_path:
-        path = Path(module_path)
-        if not path.exists():
-            custom_load_error = (
-                f"File not found: '{module_path}'. "
-                f"Check the custom_checks_module path in pipeline.yaml."
-            )
-        else:
-            _DECORATED_CHECKS.clear()
-            spec = spec_from_file_location("_custom_checks_diag", path)
-            module = module_from_spec(spec)
-            try:
-                spec.loader.exec_module(module)
-            except Exception as exc:
-                custom_load_error = (
-                    f"Failed to import '{module_path}': {exc}\n"
-                    f"       Fix: resolve the import error in your custom checks file."
-                )
-
-            if not custom_load_error:
-                if not _DECORATED_CHECKS:
-                    custom_load_error = (
-                        f"Loaded '{module_path}' but found no @custom_check decorated functions. "
-                        f"Add @custom_check to each function you want registered."
-                    )
-                else:
-                    custom_names = set(_DECORATED_CHECKS.keys())
-                    for name, (func, kind) in _DECORATED_CHECKS.items():
-                        tmp.register(name, func, kind=kind)
-
-    # ── Display ───────────────────────────────────────────────────────────────
-    ok = set(tmp.available())
-    bad = tmp.failed()  # {name: reason}
-
-    click.echo("\n── Check Functions ─────────────────────────\n")
-
-    for label, names in [("Built-in", builtin_names), ("Custom", custom_names)]:
-        if label == "Custom" and not module_path:
-            continue
-
-        if label == "Custom" and custom_load_error:
-            click.echo(f"Custom checks ({module_path}):")
-            click.echo(f"  ✗  Module error: {custom_load_error}")
-            click.echo()
-            continue
-
-        group_ok = sorted(n for n in names if n in ok)
-        group_bad = {n: r for n, r in bad.items() if n in names}
-        total = len(group_ok) + len(group_bad)
-
-        click.echo(f"{label} checks ({total}):")
-        for name in group_ok:
-            kind = tmp.get_kind(name)
-            click.echo(f"  ✓  {name}  [{kind}]")
-        for name, reason in sorted(group_bad.items()):
-            click.echo(f"  ✗  {name}")
-            click.echo(f"       {reason}")
-        click.echo()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    total_ok = len(ok)
-    total_bad = len(bad) + (1 if custom_load_error else 0)
-
-    parts = [f"{total_ok} passed"]
-    if total_bad:
-        parts.append(f"{total_bad} failed")
-    click.echo(f"Summary: {', '.join(parts)}")
-
-    if total_bad:
-        click.echo(
-            "\n  Checks marked ✗ are silently skipped during 'vp new-report'."
-            "\n  Fix the issues above and run 'vp check-func' again to confirm."
-        )
-
-
-# ---------------------------------------------------------------------------
 # vp new-report
 # ---------------------------------------------------------------------------
 @click.command("new-report")
@@ -902,7 +784,7 @@ def new_report(reports_config, pipeline_db):
     """
     from proto_pipe.registry.base import CheckRegistry
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-    from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.config import config_path_or_override
     from proto_pipe.io.registry import load_custom_checks_module
     from proto_pipe.io.settings import load_settings
     from proto_pipe.checks.inspector import CheckParamInspector
@@ -1114,7 +996,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
     Example:
       vp new-deliverable
     """
-    from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.config import config_path_or_override
     from proto_pipe.io.settings import load_settings
 
     del_cfg = config_path_or_override("deliverables_config", deliverables_config)
@@ -1590,7 +1472,7 @@ def new_sql(name, reports_config, sources_config, sql_dir):
       vp new-sql carrier_a_sales
       vp new-sql # interactive — prompts for name and tables
     """
-    from proto_pipe.cli.helpers import config_path_or_override
+    from proto_pipe.io.config import config_path_or_override
     from proto_pipe.io.settings import load_settings
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
@@ -1660,11 +1542,5 @@ def new_sql(name, reports_config, sources_config, sql_dir):
 
 
 def scaffold_commands(cli):
-    cli.add_command(new_source)
-    cli.add_command(new_report)
-    cli.add_command(new_deliverable)
-    cli.add_command(new_view)
+    """Register scaffold commands that haven't moved to action groups yet."""
     cli.add_command(table_reset)
-    cli.add_command(new_macro)
-    cli.add_command(new_sql)
-    cli.add_command(check_func)
