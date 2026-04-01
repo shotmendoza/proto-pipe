@@ -29,7 +29,6 @@ so failures are visible without stopping the entire run.
 """
 import hashlib
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -45,34 +44,7 @@ from proto_pipe.io.db import (
     table_exists,
 )
 from proto_pipe.io.migration import _auto_migrate
-
-
-# ---------------------------------------------------------------------------
-# New: column_type_registry
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class IntegrityResult:
-    """The result of a pre-scan integrity check on a single row and column.
-
-    Produced by validators in _ROW_VALIDATORS before any INSERT is attempted.
-    Rows that produce IntegrityResult entries are written to flagged_rows and
-    excluded from the INSERT — clean rows proceed normally.
-
-    Attributes:
-        pk_value:   The primary key value identifying the row. Falls back to
-                    None (and uuid4 flag identity) if no primary key is defined.
-        column:     The column where the incompatibility was detected.
-        reason:     Plain-English description of what went wrong.
-        suggestion: Optional hint for how the user can resolve the issue.
-    """
-
-    pk_value: str | None
-    column: str
-    reason: str
-    suggestion: str | None = None
-
+from proto_pipe.pipelines.integrity import apply_declared_types, check_type_compatibility, IntegrityResult
 
 # ---------------------------------------------------------------------------
 # Structural checks — lightweight, run per file before loading
@@ -382,7 +354,7 @@ def ingest_directory(
             registry_types = get_registry_types(conn, user_cols)
 
             if registry_types:
-                type_issues = _check_type_compatibility(
+                type_issues = check_type_compatibility(
                     df, registry_types, conn, primary_key
                 )
                 if type_issues:
@@ -402,7 +374,7 @@ def ingest_directory(
                     _log_ingest(conn, path.name, table, "failed", message=message)
                     summary[path.name] = {"status": "failed", "message": message}
                     continue
-                df = _apply_declared_types(df, registry_types)
+                df = apply_declared_types(df, registry_types)
 
             try:
                 conn.execute(f'DROP TABLE IF EXISTS "{table}"')
@@ -946,80 +918,6 @@ def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
 #############################
 # PRE-SCAN FUNCTIONS
 #############################
-def _check_type_compatibility(
-    df: pd.DataFrame,
-    reference_types: dict[str, str],
-    conn: duckdb.DuckDBPyConnection,
-    pk_col: str | None,
-) -> list[IntegrityResult]:
-    """Check DataFrame values against declared or existing column types using TRY_CAST.
-
-    Used in both Scenario A (first ingest, reference_types from sources_config
-    column_types) and Scenario B (subsequent ingest, reference_types from
-    _get_existing_column_types). Same logic, different source of truth.
-
-    Uses DuckDB's TRY_CAST which returns NULL instead of raising when a cast
-    fails — this catches exactly what a real INSERT would reject.
-
-    Pipeline columns (prefixed with _) are always skipped.
-
-    :param df:              The incoming DataFrame to scan.
-    :param reference_types: {column: declared_type} — what each column should be.
-    :param conn:            Open DuckDB connection. Used to query df via TRY_CAST.
-    :param pk_col:          Primary key column name for row identification, or None.
-    :return: List of IntegrityResult — one per failing row per column.
-    """
-    results: list[IntegrityResult] = []
-
-    for col, declared_type in reference_types.items():
-        if col not in df.columns:
-            continue
-        if col.startswith("_"):
-            continue
-
-        pk_select = f'"{pk_col}"' if pk_col and pk_col in df.columns else "NULL"
-
-        try:
-            failing = conn.execute(f"""
-                SELECT {pk_select} AS pk_value,
-                       CAST("{col}" AS VARCHAR) AS raw_value
-                FROM df
-                WHERE TRY_CAST("{col}" AS {declared_type}) IS NULL
-                AND "{col}" IS NOT NULL
-            """).df()
-        except Exception as exc:
-            # Declared type is itself invalid — flag as config error
-            results.append(
-                IntegrityResult(
-                    pk_value=None,
-                    column=col,
-                    reason=f"Invalid declared type '{declared_type}': {exc}",
-                    suggestion=(
-                        f"Fix the column_types entry for '{col}' in sources_config.yaml. "
-                        f"Valid types include: VARCHAR, DOUBLE, BIGINT, BOOLEAN, TIMESTAMPTZ."
-                    ),
-                )
-            )
-            continue
-
-        for _, row in failing.iterrows():
-            pk_raw = row["pk_value"]
-            pk_value = None if (pk_raw is None or pd.isna(pk_raw)) else str(pk_raw)
-            results.append(
-                IntegrityResult(
-                    pk_value=pk_value,
-                    column=col,
-                    reason=(
-                        f"Value '{row['raw_value']}' cannot be cast to {declared_type}."
-                    ),
-                    suggestion=(
-                        f"Fix the value in the source file, or run 'vp new-source' "
-                        f"to update the declared type for '{col}'."
-                    ),
-                )
-            )
-
-    return results
 
 
 def _check_numeric_type_conflicts(
@@ -1048,7 +946,7 @@ def _check_numeric_type_conflicts(
         and not col.startswith("_")
         and db_type in NUMERIC_DUCKDB_TYPES
     }
-    return _check_type_compatibility(df, numeric_reference, conn, pk_col)
+    return check_type_compatibility(df, numeric_reference, conn, pk_col)
 
 
 _ROW_VALIDATORS: list[Callable] = [
@@ -1061,39 +959,6 @@ Each validator signature: (conn, table, df, pk_col) -> list[IntegrityResult].
 Add new validators here as new error classes are identified — the ingest loop
 never needs to change.
 """
-
-
-def _apply_declared_types(
-    df: pd.DataFrame,
-    column_types: dict[str, str],
-) -> pd.DataFrame:
-    """Cast DataFrame columns to their declared types after a successful pre-scan.
-
-    Only called in Scenario A after _check_type_compatibility confirms all
-    values are castable. Ensures the table is created with the correct DuckDB
-    types rather than whatever pandas inferred.
-
-    :param df:           The incoming DataFrame.
-    :param column_types: {column: declared_type} from sources_config.
-    :return: DataFrame with columns cast to declared types.
-    """
-    df = df.copy()
-    for col, declared_type in column_types.items():
-        if col not in df.columns:
-            continue
-        dt = declared_type.upper()
-        try:
-            if dt in ("DOUBLE", "FLOAT", "REAL"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            elif dt in ("BIGINT", "INTEGER", "INT", "SMALLINT", "TINYINT", "HUGEINT"):
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-            elif dt == "BOOLEAN":
-                df[col] = df[col].astype(bool)
-            # VARCHAR, TIMESTAMPTZ, others — leave as-is; DuckDB handles them
-        except Exception:
-            pass  # pre-scan already confirmed castability; ignore edge cases
-    return df
-
 
 def _write_integrity_flags(
     conn: duckdb.DuckDBPyConnection,

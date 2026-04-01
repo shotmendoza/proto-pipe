@@ -52,73 +52,6 @@ class IntegrityResult:
 # ---------------------------------------------------------------------------
 # Pre-scan
 # ---------------------------------------------------------------------------
-
-def check_type_compatibility(
-    df: pd.DataFrame,
-    reference_types: dict[str, str],
-    conn: duckdb.DuckDBPyConnection,
-    pk_col: str | None,
-) -> list[IntegrityResult]:
-    """Check DataFrame values against declared or existing column types using TRY_CAST.
-
-    Used in Scenario A (first ingest, reference_types from registry),
-    Scenario B (subsequent ingest, reference_types from existing table),
-    and migration pre-scan (reference_types are the new declared types).
-
-    Pipeline columns (prefixed with _) are always skipped.
-
-    :param df:              DataFrame to scan.
-    :param reference_types: {column: declared_type} to check against.
-    :param conn:            Open DuckDB connection.
-    :param pk_col:          Primary key column for row identification, or None.
-    :return: List of IntegrityResult — one per failing row per column.
-    """
-    results: list[IntegrityResult] = []
-
-    for col, declared_type in reference_types.items():
-        if col not in df.columns:
-            continue
-        if col.startswith("_"):
-            continue
-
-        pk_select = f'"{pk_col}"' if pk_col and pk_col in df.columns else "NULL"
-
-        try:
-            failing = conn.execute(f"""
-                SELECT {pk_select} AS pk_value,
-                       CAST("{col}" AS VARCHAR) AS raw_value
-                FROM df
-                WHERE TRY_CAST("{col}" AS {declared_type}) IS NULL
-                AND "{col}" IS NOT NULL
-            """).df()
-        except Exception as exc:
-            results.append(IntegrityResult(
-                pk_value=None,
-                column=col,
-                reason=f"Invalid declared type '{declared_type}': {exc}",
-                suggestion=(
-                    f"Fix the column_types entry for '{col}'. "
-                    f"Valid types: VARCHAR, DOUBLE, BIGINT, BOOLEAN, DATE, TIMESTAMPTZ."
-                ),
-            ))
-            continue
-
-        for _, row in failing.iterrows():
-            pk_raw = row["pk_value"]
-            pk_value = None if (pk_raw is None or pd.isna(pk_raw)) else str(pk_raw)
-            results.append(IntegrityResult(
-                pk_value=pk_value,
-                column=col,
-                reason=f"Value '{row['raw_value']}' cannot be cast to {declared_type}.",
-                suggestion=(
-                    f"Fix the value in the source file, or run 'vp source edit' "
-                    f"to update the declared type for '{col}'."
-                ),
-            ))
-
-    return results
-
-
 def _check_numeric_type_conflicts(
     conn: duckdb.DuckDBPyConnection,
     table: str,
@@ -205,16 +138,28 @@ def apply_declared_types(
 ) -> pd.DataFrame:
     """Cast DataFrame columns to their declared types after a successful pre-scan.
 
-    Called in Scenario A and migration after _check_type_compatibility confirms
-    all values are castable. Ensures the table is created with the correct
-    DuckDB types rather than whatever pandas inferred.
+    For DATE/TIMESTAMPTZ columns with a format suffix (e.g. "DATE|%m-%d-%y"),
+    uses pd.to_datetime with the declared format so DuckDB receives proper
+    date values rather than unparseable strings.
+
+    :param df:           The incoming DataFrame.
+    :param column_types: {column_name: declared_type} — may include format suffix.
+    :return: DataFrame with columns cast to declared types.
     """
+
     df = df.copy()
     for col, declared_type in column_types.items():
         if col not in df.columns:
             continue
-        # Strip date format suffix if present (DATE|%m-%d-%y)
-        dt = declared_type.split("|")[0].upper()
+
+        # Parse optional format suffix
+        if "|" in declared_type:
+            dt, fmt = declared_type.split("|", 1)
+            dt = dt.upper()
+        else:
+            dt = declared_type.upper()
+            fmt = None
+
         try:
             if dt in ("DOUBLE", "FLOAT", "REAL"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -222,7 +167,106 @@ def apply_declared_types(
                 df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
             elif dt == "BOOLEAN":
                 df[col] = df[col].astype(bool)
-            # VARCHAR, DATE, TIMESTAMPTZ — leave as-is; DuckDB handles them
+            elif dt in ("DATE", "TIMESTAMPTZ") and fmt:
+                # Parse using declared format so DuckDB gets proper date objects
+                parsed = pd.to_datetime(df[col], format=fmt, errors="coerce")
+                if dt == "DATE":
+                    # Strip time component — DuckDB DATE column doesn't want it
+                    df[col] = parsed.dt.date
+                else:
+                    # TIMESTAMPTZ — keep as datetime, DuckDB handles timezone
+                    df[col] = parsed
+            # VARCHAR, DATE/TIMESTAMPTZ without format — leave as-is
         except Exception:
             pass
+
     return df
+
+
+def check_type_compatibility(
+    df: pd.DataFrame,
+    reference_types: dict[str, str],
+    conn: duckdb.DuckDBPyConnection,
+    pk_col: str | None,
+) -> list[IntegrityResult]:
+    """Check DataFrame values against declared or existing column types.
+
+    Handles TYPE|format entries for DATE and TIMESTAMPTZ columns by using
+    TRY_STRPTIME instead of TRY_CAST for those columns.
+
+    :param df:              DataFrame to scan.
+    :param reference_types: {column: declared_type} — may include format suffix
+                            e.g. "DATE|%m-%d-%y" or plain "VARCHAR".
+    :param conn:            Open the DuckDB connection.
+    :param pk_col:          Primary key column for row identification, or None.
+    :return: List of IntegrityResult — one per failing row per column.
+    """
+
+    results: list[IntegrityResult] = []
+
+    for col, declared_type in reference_types.items():
+        if col not in df.columns:
+            continue
+        if col.startswith("_"):
+            continue
+
+        # Parse optional format suffix: "DATE|%m-%d-%y" → ("DATE", "%m-%d-%y")
+        if "|" in declared_type:
+            base_type, fmt = declared_type.split("|", 1)
+            base_type = base_type.upper()
+        else:
+            base_type, fmt = declared_type.upper(), None
+
+        pk_select = f'"{pk_col}"' if pk_col and pk_col in df.columns else "NULL"
+
+        try:
+            if fmt and base_type in ("DATE", "TIMESTAMPTZ"):
+                # Use TRY_STRPTIME for date columns with a declared format string.
+                # TRY_CAST cannot handle non-ISO date strings; TRY_STRPTIME applies
+                # the exact format the user declared.
+                failing = conn.execute(f"""
+                    SELECT {pk_select} AS pk_value,
+                           CAST("{col}" AS VARCHAR) AS raw_value
+                    FROM df
+                    WHERE TRY_STRPTIME(CAST("{col}" AS VARCHAR), '{fmt}') IS NULL
+                    AND "{col}" IS NOT NULL
+                """).df()
+            else:
+                failing = conn.execute(f"""
+                    SELECT {pk_select} AS pk_value,
+                           CAST("{col}" AS VARCHAR) AS raw_value
+                    FROM df
+                    WHERE TRY_CAST("{col}" AS {base_type}) IS NULL
+                    AND "{col}" IS NOT NULL
+                """).df()
+        except Exception as exc:
+            results.append(
+                IntegrityResult(
+                    pk_value=None,
+                    column=col,
+                    reason=f"Invalid declared type '{declared_type}': {exc}",
+                    suggestion=(
+                        f"Fix the column_types entry for '{col}'. "
+                        f"Valid types: VARCHAR, DOUBLE, BIGINT, BOOLEAN, DATE, TIMESTAMPTZ."
+                    ),
+                )
+            )
+            continue
+
+        for _, row in failing.iterrows():
+            pk_raw = row["pk_value"]
+            pk_value = None if (pk_raw is None or pd.isna(pk_raw)) else str(pk_raw)
+            fmt_note = f" using format '{fmt}'" if fmt else ""
+            results.append(
+                IntegrityResult(
+                    pk_value=pk_value,
+                    column=col,
+                    reason=f"Value '{row['raw_value']}' cannot be cast to {base_type}{fmt_note}.",
+                    suggestion=(
+                        f"Fix the value in the source file, or run 'vp source edit' "
+                        f"to update the declared type for '{col}'."
+                    ),
+                )
+            )
+
+    return results

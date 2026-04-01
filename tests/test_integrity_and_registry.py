@@ -19,12 +19,11 @@ from proto_pipe.checks.inspector import CheckAudit, CheckContract, validate_chec
 from proto_pipe.cli.scaffold import _filter_uningested
 from proto_pipe.io.db import init_ingest_log, get_column_types
 from proto_pipe.io.ingest import (
-    IntegrityResult,
-    _check_type_compatibility,
     _check_numeric_type_conflicts,
     _write_integrity_flags,
     ingest_directory,
 )
+from proto_pipe.pipelines.integrity import check_type_compatibility, IntegrityResult
 from proto_pipe.registry.base import CheckRegistry
 
 
@@ -228,7 +227,7 @@ class TestCheckTypeCompatibility:
         conn = _make_conn(tmp_path)
         df = pd.DataFrame({"amount": [1.0, 2.5, 3.0], "id": ["A", "B", "C"]})
         reference = {"amount": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col="id")
+        issues = check_type_compatibility(df, reference, conn, pk_col="id")
         assert issues == []
         conn.close()
 
@@ -239,7 +238,7 @@ class TestCheckTypeCompatibility:
             "amount": ["100.0", "C-54321"],
         })
         reference = {"amount": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col="id")
+        issues = check_type_compatibility(df, reference, conn, pk_col="id")
         assert len(issues) == 1
         assert issues[0].column == "amount"
         assert issues[0].pk_value == "ORD-002"
@@ -251,14 +250,14 @@ class TestCheckTypeCompatibility:
             "renewal":   ["100.0", "bad_val", "200.0"],
         })
         reference = {"renewal": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col="policy_id")
+        issues = check_type_compatibility(df, reference, conn, pk_col="policy_id")
         assert issues[0].pk_value == "P-002"
 
     def test_pk_value_is_none_when_no_pk_col(self, tmp_path):
         conn = _make_conn(tmp_path)
         df = pd.DataFrame({"amount": ["100.0", "bad"]})
         reference = {"amount": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col=None)
+        issues = check_type_compatibility(df, reference, conn, pk_col=None)
         assert len(issues) == 1
         assert issues[0].pk_value is None
 
@@ -266,7 +265,7 @@ class TestCheckTypeCompatibility:
         conn = _make_conn(tmp_path)
         df = pd.DataFrame({"_ingested_at": ["not_a_timestamp", "also_bad"]})
         reference = {"_ingested_at": "TIMESTAMPTZ"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col=None)
+        issues = check_type_compatibility(df, reference, conn, pk_col=None)
         # Pipeline columns prefixed with _ must be skipped
         assert issues == []
         conn.close()
@@ -278,7 +277,7 @@ class TestCheckTypeCompatibility:
             "amount": [1.0, None, 3.0],
         })
         reference = {"amount": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col="id")
+        issues = check_type_compatibility(df, reference, conn, pk_col="id")
         assert issues == []
         conn.close()
 
@@ -286,7 +285,7 @@ class TestCheckTypeCompatibility:
         conn = _make_conn(tmp_path)
         df = pd.DataFrame({"id": ["A"], "amount": ["bad"]})
         reference = {"amount": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col="id")
+        issues = check_type_compatibility(df, reference, conn, pk_col="id")
         assert all(isinstance(i, IntegrityResult) for i in issues)
         conn.close()
 
@@ -294,7 +293,7 @@ class TestCheckTypeCompatibility:
         conn = _make_conn(tmp_path)
         df = pd.DataFrame({"id": ["A"], "amount": ["bad"]})
         reference = {"amount": "DOUBLE"}
-        issues = _check_type_compatibility(df, reference, conn, pk_col="id")
+        issues = check_type_compatibility(df, reference, conn, pk_col="id")
         assert issues[0].suggestion is not None
         assert len(issues[0].suggestion) > 0
         conn.close()
