@@ -624,11 +624,20 @@ class ReportConfigPrompter:
                 click.echo(line)
             click.echo()
 
+            if first_sentence:
+                short = (
+                    first_sentence[:60] + "…"
+                    if len(first_sentence) > 60
+                    else first_sentence
+                )
+                title = f"{check_name:<32} {short}"
+            else:
+                title = check_name
+
             choices.append(
                 questionary.Choice(
-                    title=check_name,
+                    title=title,
                     value=check_name,
-                    description=first_sentence,
                     checked=check_name in preselected,
                 )
             )

@@ -31,6 +31,34 @@ import pandas as pd
 # shape, and will be able to handle the user running the different
 # functions.
 # ----------------------------------------------------------------
+# TODO: anything that is inspecting, should be inside CheckInspect
+def _is_str_annotation(ann) -> bool:
+    """True for str type or 'str' string annotation.
+
+    Handles both evaluated annotations (ann is str) and string annotations
+    produced by `from __future__ import annotations` (ann == "str").
+    """
+    return ann is str or ann == "str"
+
+
+def _is_series_annotation(ann) -> bool:
+    """True if annotation refers to pd.Series (column selector, not DataFrame).
+
+    pd.Series params are column selectors — the runner extracts the named
+    column as a Series and passes it directly to the function. They behave
+    identically to str params in the prompt flow (alias_map + column picker)
+    but the function receives the actual Series rather than the column name.
+
+    Handles both evaluated annotations (pd.Series, pd.Series[bool]) and
+    string annotations produced by `from __future__ import annotations`.
+    Explicitly excludes DataFrame annotations.
+    """
+    if ann is inspect.Parameter.empty:
+        return False
+    ann_str = str(ann) if not isinstance(ann, str) else ann
+    return "Series" in ann_str and "DataFrame" not in ann_str
+
+
 def _is_dataframe_annotation(ann) -> bool:
     """True if annotation refers to pd.DataFrame."""
     if ann is inspect.Parameter.empty:
@@ -467,25 +495,45 @@ class CheckParamInspector:
         return hashlib.md5(self._source.encode()).hexdigest()
 
     def column_params(self) -> list[str]:
-        """Return param names that are str type — these are column selectors.
+        """Return param names that are column selectors.
 
-        DataFrame params are excluded — they are auto-filled with the report table.
+        A param is a column selector when its annotation is:
+          - str / "str" → column name passed as string
+          - pd.Series / "pd.Series" → column data passed as a Series
+          - unannotated → treated as a column selector by convention
+
+        DataFrame params are excluded — they are auto-filled with the full table.
+        String annotations produced by `from __future__ import annotations` are
+        handled correctly by _is_str_annotation and _is_series_annotation.
         """
         return [
             name
             for name, param in self._sig.parameters.items()
             if name != "context"
-            and param.annotation in (str, inspect.Parameter.empty)
+            and (
+                _is_str_annotation(param.annotation)
+                or param.annotation is inspect.Parameter.empty
+                or _is_series_annotation(param.annotation)
+            )
             and not _is_dataframe_annotation(param.annotation)
         ]
 
     def scalar_params(self) -> list[str]:
-        """Return param names that are non-str, non-DataFrame types — scalar values."""
+        """Return param names that are scalar values (non-column, non-DataFrame).
+
+        Scalars are params with explicit non-str, non-Series, non-DataFrame
+        annotations — e.g. min_val: float, threshold: int. These are broadcast
+        across all runs of the check (alias_map does not apply to them).
+
+        Unannotated params are treated as column selectors, not scalars.
+        """
         return [
             name
             for name, param in self._sig.parameters.items()
             if name != "context"
-            and param.annotation not in (str, inspect.Parameter.empty)
+            and param.annotation is not inspect.Parameter.empty
+            and not _is_str_annotation(param.annotation)
+            and not _is_series_annotation(param.annotation)
             and not _is_dataframe_annotation(param.annotation)
         ]
 
