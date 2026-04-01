@@ -20,7 +20,7 @@ pip install proto-pipe
 # 1. Scaffold config files into your project
 vp init
 
-# 2. Edit pipeline.yaml to confirm your paths, then initialise DuckDB
+# 2. Edit pipeline.yaml to confirm your paths, then initialize DuckDB
 vp db-init
 
 # 3. Define your data sources interactively

@@ -36,7 +36,7 @@ all driven by YAML with no code changes required for new sources or reports.
 | Step | Task                     | Command              |
 |------|--------------------------|----------------------|
 | 1    | Scaffold config files    | `vp init`            |
-| 2    | Initialise database      | `vp db-init`         |
+| 2    | initialize database      | `vp db-init`         |
 | 3    | Define a data source     | `vp new source`      |
 | 4    | Define validation checks | `vp new report`      |
 | 5    | Define output            | `vp new deliverable` |

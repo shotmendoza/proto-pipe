@@ -17,6 +17,7 @@ import duckdb
 import pandas as pd
 
 from proto_pipe.io.config import config_path_or_override
+from proto_pipe.io.db import coerce_for_display
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ def _get_flagged_df(
         query += " WHERE table_name = ?"
         params.append(table)
     query += " ORDER BY flagged_at DESC"
-    return conn.execute(query, params).df()
+    return coerce_for_display(conn.execute(query, params).df())
 
 
 def _get_enriched_flagged_df(
@@ -117,7 +118,7 @@ def _get_enriched_flagged_df(
 
     col_select = ", ".join([f's."{c}"' for c in source_cols])
 
-    return conn.execute(f"""
+    return coerce_for_display(conn.execute(f"""
         SELECT
             f.id          AS _flag_id,
             f.check_name  AS _check_name,
@@ -129,7 +130,7 @@ def _get_enriched_flagged_df(
             ON md5(CAST(s."{pk_col}" AS VARCHAR)) = f.id
         WHERE f.table_name = ?
         ORDER BY f.flagged_at DESC
-    """, [table]).df()
+    """, [table]).df())
 
 
 # ---------------------------------------------------------------------------

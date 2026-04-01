@@ -287,7 +287,7 @@ def ingest_directory(
             unmatched.append(path.name)
             continue
 
-        if _already_ingested(conn, path.name):
+        if mode != "replace" and _already_ingested(conn, path.name):
             print(f"[skipped] '{path.name}' — already ingested")
             summary[path.name] = {"status": "skipped", "message": "already ingested"}
             continue

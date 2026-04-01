@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 
 import duckdb
 
+from proto_pipe.constants import NULLABLE_EXTENSION_DTYPES
+
 
 # ---------------------------------------------------------------------------
 # Generic table inspection
@@ -279,3 +281,28 @@ def flag_id_for(
     if pk_value is None:
         return str(uuid.uuid4())
     return hashlib.md5(str(pk_value).encode()).hexdigest()
+
+
+def coerce_for_display(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Convert pandas nullable extension types to object dtype.
+
+    DuckDB returns integer and boolean columns as pandas nullable extension
+    types (Int8, Int16, Int32, Int64, UInt*, boolean). These raise
+    TypeError when fillna() is called with a non-integer value, which
+    breaks any display or edit layer that calls fillna("") or similar.
+
+    Converting to object dtype preserves values and NA semantics while
+    making the DataFrame safe for any downstream pandas operation.
+
+    Only call this for display/edit contexts — not before writing back
+    to DuckDB, where apply_declared_types + registry types should be
+    used instead.
+
+    :param df: DataFrame returned from a DuckDB .df() call.
+    :return:   Copy of df with nullable extension columns cast to object.
+    """
+    result = df.copy()
+    for col in result.columns:
+        if isinstance(result[col].dtype, NULLABLE_EXTENSION_DTYPES):
+            result[col] = result[col].astype(object)
+    return result

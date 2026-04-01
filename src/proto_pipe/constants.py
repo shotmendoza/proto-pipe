@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
+
 # Tables created and managed by the pipeline itself.
 # Excluded from user-facing table lists (e.g. vp new-report, vp table).
 PIPELINE_TABLES: frozenset[str] = frozenset({
@@ -51,3 +53,16 @@ _DEFAULTS = {
 }
 VALID_PATH_KEYS = list(_DEFAULTS["paths"].keys())
 DEFAULT_SETTINGS_PATH = Path("pipeline.yaml")
+
+NULLABLE_EXTENSION_DTYPES = (
+    pd.Int8Dtype,
+    pd.Int16Dtype,
+    pd.Int32Dtype,
+    pd.Int64Dtype,
+    pd.UInt8Dtype,
+    pd.UInt16Dtype,
+    pd.UInt32Dtype,
+    pd.UInt64Dtype,
+    pd.BooleanDtype,
+)
+

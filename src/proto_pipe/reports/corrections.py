@@ -148,6 +148,16 @@ def import_corrections(
 
     df = load_file(path)
 
+    # Apply declared types from column_type_registry so the write-back
+    # uses confirmed types, not pandas inference from the CSV round-trip.
+    from proto_pipe.io.db import get_registry_types
+    from proto_pipe.pipelines.integrity import apply_declared_types
+
+    user_cols = [c for c in df.columns if not c.startswith("_")]
+    registry_types = get_registry_types(conn, user_cols)
+    if registry_types:
+        df = apply_declared_types(df, registry_types)
+
     if primary_key not in df.columns:
         raise ValueError(
             f"Primary key column '{primary_key}' not found in corrections file. "
