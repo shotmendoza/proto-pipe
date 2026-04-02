@@ -11,8 +11,6 @@ import questionary
 
 from proto_pipe.cli.scaffold import (
     _scan_incoming,
-    _filter_uningested,
-    _suggest_pattern,
     _get_original_func,
     _get_unconfigured_tables,
     _build_rich_sql_scaffold,
@@ -55,7 +53,6 @@ def new_source(sources_config, incoming_dir):
       vp new source
     """
     from proto_pipe.io.config import config_path_or_override, SourceConfig
-    from proto_pipe.io.ingest import load_file
     from proto_pipe.cli.prompts import SourceConfigPrompter
     from proto_pipe.io.db import get_registry_hints, write_registry_types
 
@@ -71,41 +68,52 @@ def new_source(sources_config, incoming_dir):
     all_files = _scan_incoming(inc_dir)
     files = _filter_unconfigured(all_files, config.all())
 
-    sample = None
-    suggested = "*.csv"
-
-    if files:
-        file_groups = _group_files_by_pattern(files)
-        selected_file, suggested = SourceConfigPrompter.prompt_file_group(file_groups)
-
-        if suggested is None:
-            click.echo("Cancelled.")
-            return
-
-        if selected_file:
-            if len(file_groups.get(suggested, [])) > 1:
-                click.echo(
-                    f"\n  {len(file_groups[suggested])} files match '{suggested}'"
-                    f" — they will all be ingested into the same table.\n"
-                )
-            try:
-                sample = load_file(Path(inc_dir) / selected_file)
-            except Exception:
-                pass
-    else:
-        if all_files:
+    if not files:
+        if not all_files:
             click.echo(
-                f"\n  All {len(all_files)} file(s) in '{inc_dir}' are already covered"
-                f" by an existing source pattern.\n"
-                f"  You can still define a source manually below,"
-                f" or edit {src_cfg} directly."
+                f"\n[error] No files found in '{inc_dir}'."
+                f"\n  Add a matching file to '{inc_dir}' first, then run: vp new source"
             )
         else:
             click.echo(
-                f"\nNo files found in '{inc_dir}'.\n"
-                f"You can still define a source manually, or add files first.\n"
-                f"You can also edit {src_cfg} directly."
+                f"\n[error] All {len(all_files)} file(s) in '{inc_dir}' are already"
+                f" covered by an existing source.\n"
+                f"  Run \'vp edit source\' to update an existing source,"
+                f" or add a new file first."
             )
+        return
+
+    file_groups = _group_files_by_pattern(files)
+    selected_file, suggested = SourceConfigPrompter.prompt_file_group(file_groups)
+
+    if suggested is None:
+        click.echo("Cancelled.")
+        return
+
+    # Load ALL files matching the suggested pattern via DuckDB with
+    # union_by_name=True so the combined schema covers every column
+    # that may appear across the file group — not just one file.
+    group_files = file_groups.get(suggested, [])
+    sample = None
+
+    if group_files:
+        if len(group_files) > 1:
+            click.echo(
+                f"\n  {len(group_files)} files match '{suggested}'"
+                f" — reading all to derive the combined schema.\n"
+            )
+        try:
+            file_paths = [str(Path(inc_dir) / f) for f in group_files]
+            with duckdb.connect(pipeline_db) as _conn:
+                path_list = ", ".join(f"'{p}'" for p in file_paths)
+                sample = _conn.execute(
+                    f"SELECT * FROM read_csv([{path_list}],"
+                    f" union_by_name=true) LIMIT 1000"
+                ).df()
+                from proto_pipe.io.db import coerce_for_display
+                sample = coerce_for_display(sample)
+        except Exception as e:
+            click.echo(f"  [warn] Could not read files for schema preview: {e}")
 
     registry_hints: dict = {}
     if sample is not None:
