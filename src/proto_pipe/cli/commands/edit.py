@@ -532,18 +532,18 @@ def edit_column_type(pipeline_db, diff):
     with duckdb.connect(p_db) as conn:
         try:
             df = conn.execute("""
-                              SELECT column_name, source_name, declared_type, recorded_at
-                              FROM column_type_registry
-                              ORDER BY column_name, source_name
-                              """).df()
+                SELECT column_name, source_name, declared_type, recorded_at
+                FROM column_type_registry
+                ORDER BY column_name, source_name
+            """).df()
 
             if diff:
                 conflicting = conn.execute("""
-                                           SELECT column_name
-                                           FROM column_type_registry
-                                           GROUP BY column_name
-                                           HAVING count(DISTINCT declared_type) > 1
-                                           """).df()["column_name"].tolist()
+                    SELECT column_name
+                    FROM column_type_registry
+                    GROUP BY column_name
+                    HAVING count(DISTINCT declared_type) > 1
+                """).df()["column_name"].tolist()
 
         except Exception as e:
             click.echo(f"[error] Could not read column_type_registry: {e}")
@@ -568,11 +568,14 @@ def edit_column_type(pipeline_db, diff):
         click.echo(f"\n── Edit Column Types ──── {len(df)} entries ────────────────")
         click.echo("  Edit the declared_type column. Other columns are read-only.\n")
 
+    from proto_pipe.constants import DUCKDB_TYPES
+
     reviewer = get_reviewer(edit=True)
     edited_df = reviewer.edit(
         df,
         title=f"column_type_registry ({len(df)} entries)",
         pk_col=("column_name", "source_name"),
+        suggestions={"declared_type": DUCKDB_TYPES},
     )
 
     if edited_df is None or edited_df.equals(df):

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import click
 import duckdb
+import pandas as pd
 
 from proto_pipe.io.config import config_path_or_override, load_config, load_settings
 from proto_pipe.constants import PIPELINE_TABLES
@@ -49,21 +50,38 @@ class ReviewInterface:
     Implement this to swap out the TUI backend without changing CLI commands.
     """
 
-    def show(self, df, title: str, pk_col: str | None = None):
+    def show(self, df, title: str, pk_col: str | tuple | None = None):
         raise NotImplementedError
 
-    def edit(self, df, title: str, pk_col: str | None = None):
-        """Show editable table. Returns DataFrame with user edits applied."""
+    def edit(
+        self,
+        df: pd.DataFrame,
+        title: str,
+        pk_col: str | tuple | None = None,
+        suggestions: dict[str, list[str]] | None = None,
+    ) -> pd.DataFrame:
+        """Show editable table. Returns DataFrame with user edits applied.
+
+        :param suggestions: Optional {column_name: [valid_values]} mapping.
+            When provided, the TUI shows an autocomplete dropdown for that
+            column while editing. Falls back to plain input if not set.
+        """
         raise NotImplementedError
 
 
 class RichReview(ReviewInterface):
     """Read-only rich table display."""
 
-    def show(self, df, title: str, pk_col: str | None = None):
+    def show(self, df, title: str, pk_col: str | tuple | None = None):
         _display_rich_table(df, title)
 
-    def edit(self, df, title: str, pk_col: str | None = None):
+    def edit(
+        self,
+        df: pd.DataFrame,
+        title: str,
+        pk_col: str | tuple | None = None,
+        suggestions: dict[str, list[str]] | None = None,
+    ) -> pd.DataFrame:
         from rich.console import Console
 
         Console().print(
@@ -77,17 +95,26 @@ class RichReview(ReviewInterface):
 class TextualReview(ReviewInterface):
     """Interactive TUI table editor backed by textual."""
 
-    def _make_app(self, df, title: str, pk_col: str | tuple | None, editable: bool):
+    def _make_app(
+        self,
+        df,
+        title: str,
+        pk_col: str | tuple | None,
+        editable: bool,
+        suggestions: dict[str, list[str]] | None = None,
+    ):
         """Build and return the Textual app without running it — used for testing."""
         from textual.app import App, ComposeResult
         from textual.widgets import DataTable, Footer, Header
         from textual.binding import Binding
 
+        _suggestions = suggestions or {}
         changes: dict[tuple, str] = {}
 
         class TableApp(App):
             BINDINGS = [
                 Binding("ctrl+s", "save", "Save", show=True),
+                Binding("ctrl+c", "copy_cell", "Copy", show=True),
                 Binding("escape", "quit_no_save", "Quit", show=True),
             ]
 
@@ -118,25 +145,39 @@ class TextualReview(ReviewInterface):
 
                 self.title = title
                 self.sub_title = (
-                    "Ctrl+S to save  |  Esc to quit  |  ← → scroll"
+                    "Ctrl+S save  |  Ctrl+C copy  |  Esc quit  |  ← → scroll"
                     if editable
-                    else "Esc to quit  |  ← → scroll"
+                    else "Ctrl+C copy  |  Esc quit  |  ← → scroll"
                 )
 
             def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
                 if not editable:
                     return
                 from textual.widgets import Input
+                from textual.suggester import SuggestFromList
                 from textual.screen import ModalScreen
 
                 row_idx = event.coordinate.row
                 col_idx = event.coordinate.column
                 col_name = str(df.columns[col_idx])
                 current_val = str(df.iloc[row_idx, col_idx] or "")
+                col_suggestions = _suggestions.get(col_name)
 
                 class EditCell(ModalScreen):
                     def compose(self) -> ComposeResult:
-                        yield Input(value=current_val, placeholder=f"Edit {col_name}")
+                        if col_suggestions:
+                            yield Input(
+                                value=current_val,
+                                placeholder=f"Edit {col_name}",
+                                suggester=SuggestFromList(
+                                    col_suggestions, case_sensitive=False
+                                ),
+                            )
+                        else:
+                            yield Input(
+                                value=current_val,
+                                placeholder=f"Edit {col_name}",
+                            )
 
                     def on_input_submitted(self, sub_event: Input.Submitted) -> None:
                         self.dismiss(sub_event.value)
@@ -149,6 +190,22 @@ class TextualReview(ReviewInterface):
 
                 self.push_screen(EditCell(), handle_edit)
 
+            def action_copy_cell(self) -> None:
+                """Copy the current cell value to the system clipboard."""
+                table = self.query_one(DataTable)
+                coord = table.cursor_coordinate
+                if coord is None:
+                    return
+                col_name = str(df.columns[coord.column])
+                # Prefer pending edit value, fall back to original
+                val = changes.get((coord.row, col_name))
+                if val is None:
+                    val = str(df.iloc[coord.row, coord.column] or "")
+                self.app.copy_to_clipboard(val)
+                self.notify(
+                    f"Copied: {val[:40]}{'...' if len(val) > 40 else ''}"
+                )
+
             def action_save(self) -> None:
                 self.exit(result=changes)
 
@@ -160,8 +217,15 @@ class TextualReview(ReviewInterface):
         app.pk_col = pk_col
         return app
 
-    def _run(self, df, title: str, pk_col: str | tuple | None, editable: bool):
-        app = self._make_app(df, title, pk_col, editable)
+    def _run(
+        self,
+        df,
+        title: str,
+        pk_col: str | tuple | None,
+        editable: bool,
+        suggestions: dict[str, list[str]] | None = None,
+    ):
+        app = self._make_app(df, title, pk_col, editable, suggestions)
         result = app.run()
         return result
 
@@ -169,9 +233,15 @@ class TextualReview(ReviewInterface):
         self._run(df, title, pk_col, editable=False)
         return df
 
-    def edit(self, df, title: str, pk_col: str | None = None):
+    def edit(
+        self,
+        df,
+        title: str,
+        pk_col: str | tuple | None = None,
+        suggestions: dict[str, list[str]] | None = None,
+    ):
         edited_df = df.copy()
-        changes = self._run(df, title, pk_col, editable=True)
+        changes = self._run(df, title, pk_col, editable=True, suggestions=suggestions)
         if changes:
             for (row_idx, col_name), value in changes.items():
                 edited_df.at[row_idx, col_name] = value

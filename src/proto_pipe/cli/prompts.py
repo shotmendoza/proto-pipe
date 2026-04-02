@@ -338,6 +338,11 @@ class SourceConfigPrompter:
 
             for col in to_fix:
                 current = working_types[col]
+                # Strip format suffix (e.g. DATE|%m/%d/%y -> DATE) before
+                # using as default — questionary.select default must match
+                # one of the choice values exactly, and choices only contain
+                # base types. The full value is shown in the prompt label.
+                current_base = current.split("|")[0] if "|" in current else current
                 hints = self._registry_hints.get(col, {})
                 unique_types = set(hints.values())
 
@@ -353,11 +358,11 @@ class SourceConfigPrompter:
                     f"  '{col}' (currently {current}):",
                     choices=[
                         questionary.Choice(
-                            f"{t}{' (current)' if t == current else ''}", value=t
+                            f"{t}{' (current)' if t == current_base else ''}", value=t
                         )
                         for t in DUCKDB_TYPES
                     ],
-                    default=current,
+                    default=current_base,
                 ).ask()
                 if chosen is None:
                     return {}
