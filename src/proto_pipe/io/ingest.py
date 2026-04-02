@@ -28,6 +28,7 @@ Each ingest run logs results (including failures) to the `ingest_log` table
 so failures are visible without stopping the entire run.
 """
 import csv
+import warnings
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -149,25 +150,65 @@ def _structural_checks(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _pattern_specificity(pattern: str) -> int:
+    """Return the number of literal (non-wildcard) characters in a pattern.
+
+    Used to rank competing matches — a pattern with more literal characters
+    is more specific and should take priority over a broader wildcard pattern.
+
+    Example:
+        "foo you*.csv"  → 11  (wins over)
+        "foo*.csv"      →  7
+    """
+    return sum(1 for c in pattern if c not in ("*", "?", "[", "]"))
+
+
 def resolve_source(
         filename: str,
-        sources: list[dict]
+        sources: list[dict],
 ) -> dict | None:
-    """Return the first source whose patterns match the filename.
+    """Return the source whose pattern most specifically matches the filename.
 
-    This function iterates through a list of source dictionaries and checks if the
-    provided filename matches any patterns specified in the sources. If a match is
-    found, it returns the matching source dictionary. If no matches are found,
-    it returns None. Pattern matching is performed using the `fnmatch` module.
+    Collects all matching sources and picks the one whose best-matching
+    pattern has the highest specificity score (most literal characters).
+    This means "foo you*.csv" always beats "foo*.csv" for a file like
+    "foo you bar.csv", regardless of config order.
+
+    When two sources match with equal specificity, config order is used as
+    a tiebreaker and a warning is printed so the user knows to make their
+    patterns more specific.
 
     :param filename: The name of the file to resolve against the source patterns.
-    :param sources: A list of dictionaries. Each dictionary should include a key "patterns", which contains a list of filename patterns.
-    :return: The first matching source dictionary if a match is found, otherwise None.
+    :param sources:  List of source dicts from sources_config.yaml.
+    :return: Best-matching source dict, or None if no match found.
     """
+    # Collect (source, best_specificity) for every source that matches
+    matches: list[tuple[dict, int]] = []
     for source in sources:
-        if any(fnmatch(filename, pattern) for pattern in source["patterns"]):
-            return source
-    return None
+        best = max(
+            (_pattern_specificity(p) for p in source["patterns"] if fnmatch(filename, p)),
+            default=None,
+        )
+        if best is not None:
+            matches.append((source, best))
+
+    if not matches:
+        return None
+
+    best_score = max(score for _, score in matches)
+    winners = [s for s, score in matches if score == best_score]
+
+    if len(winners) > 1:
+        names = ", ".join(
+            f"'{w['name']}'" for w in winners
+        )
+        print(
+            f"[warn] '{filename}' matches multiple sources with equal specificity: "
+            f"{names}. Using '{winners[0]['name']}' — make patterns more specific "
+            f"to resolve this ambiguity."
+        )
+
+    return winners[0]
 
 
 def load_file(path: Path) -> pd.DataFrame:
@@ -184,8 +225,6 @@ def load_file(path: Path) -> pd.DataFrame:
     :rtype: pd.DataFrame
     :raises ValueError: If the file type is unsupported (neither .csv, .xlsx, nor .xls).
     """
-    import warnings
-
     suffix = path.suffix.lower()
 
     if suffix == ".csv":
@@ -803,8 +842,8 @@ def _load_csv_with_types(
     :param registry_types: {column: declared_type} — may include format suffix.
     :return: DataFrame with columns typed per declared types.
     """
-    with open(path, newline="") as f:
-        csv_columns = set(next(csv.reader(f)))
+    with open(path, newline="") as _f:
+        csv_columns = set(next(csv.reader(_f)))
 
     dtype: dict[str, str] = {}
     date_format_cols: dict[str, str] = {}
@@ -812,7 +851,6 @@ def _load_csv_with_types(
     for col, declared_type in registry_types.items():
         if col not in csv_columns:
             continue
-
         if "|" in declared_type:
             # Date with format suffix — load as VARCHAR, convert after
             date_format_cols[col] = declared_type

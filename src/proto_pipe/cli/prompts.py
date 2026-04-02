@@ -43,6 +43,36 @@ def _try_strptime(value: str, fmt: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_sample_label(sample, col: str) -> str:
+    """Return a sanitised " sample: <value>" label for questionary choice display.
+
+    Questionary uses Rich internally, so brackets like [INFO] in a value
+    would be interpreted as markup tags and either hidden or cause render
+    errors. We escape brackets, strip newlines, and truncate to keep
+    choice rows readable on any terminal width.
+
+    Returns empty string when no sample is available for the column.
+    """
+    if sample is None or col not in sample.columns:
+        return ""
+    non_null = sample[col].dropna()
+    if non_null.empty:
+        return ""
+    raw = str(non_null.iloc[0])
+    # Strip newlines and control characters
+    raw = " ".join(raw.splitlines()).strip()
+    # Escape Rich markup brackets so questionary renders them literally
+    raw = raw.replace("[", "\[").replace("]", "\]")
+    # Truncate to keep the line readable
+    if len(raw) > 30:
+        raw = raw[:27] + "..."
+    return f" sample: {raw}"
+
+
+# ---------------------------------------------------------------------------
 # SourceConfigPrompter
 # ---------------------------------------------------------------------------
 
@@ -297,15 +327,7 @@ class SourceConfigPrompter:
                 conflict_parts = ", ".join(f"{t} in '{s}'" for s, t in hints.items())
                 note = f"  ⚠ conflict: {conflict_parts}"
 
-            if self._sample is not None and col in self._sample.columns:
-                non_null = self._sample[col].dropna()
-                sample_str = (
-                    f" sample: {non_null.iloc[0]}"
-                    if not non_null.empty
-                    else " sample: —"
-                )
-            else:
-                sample_str = ""
+            sample_str = _safe_sample_label(self._sample, col) or " sample: —"
 
             click.echo(f"    {col:<28} {dtype:<14}{sample_str}{note}")
 
@@ -321,13 +343,7 @@ class SourceConfigPrompter:
                 choices=[
                     questionary.Choice(
                         f"{col:<28} {working_types[col]:<14}"
-                        + (
-                            f" sample: {self._sample[col].dropna().iloc[0]}"
-                            if self._sample is not None
-                            and col in self._sample.columns
-                            and not self._sample[col].dropna().empty
-                            else ""
-                        ),
+                        + _safe_sample_label(self._sample, col),
                         value=col,
                     )
                     for col in self._file_cols
@@ -338,11 +354,6 @@ class SourceConfigPrompter:
 
             for col in to_fix:
                 current = working_types[col]
-                # Strip format suffix (e.g. DATE|%m/%d/%y -> DATE) before
-                # using as default — questionary.select default must match
-                # one of the choice values exactly, and choices only contain
-                # base types. The full value is shown in the prompt label.
-                current_base = current.split("|")[0] if "|" in current else current
                 hints = self._registry_hints.get(col, {})
                 unique_types = set(hints.values())
 
@@ -358,11 +369,11 @@ class SourceConfigPrompter:
                     f"  '{col}' (currently {current}):",
                     choices=[
                         questionary.Choice(
-                            f"{t}{' (current)' if t == current_base else ''}", value=t
+                            f"{t}{' (current)' if t == current else ''}", value=t
                         )
                         for t in DUCKDB_TYPES
                     ],
-                    default=current_base,
+                    default=current,
                 ).ask()
                 if chosen is None:
                     return {}
