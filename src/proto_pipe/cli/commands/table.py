@@ -77,7 +77,7 @@ class RichReview(ReviewInterface):
 class TextualReview(ReviewInterface):
     """Interactive TUI table editor backed by textual."""
 
-    def _make_app(self, df, title: str, pk_col: str | None, editable: bool):
+    def _make_app(self, df, title: str, pk_col: str | tuple | None, editable: bool):
         """Build and return the Textual app without running it — used for testing."""
         from textual.app import App, ComposeResult
         from textual.widgets import DataTable, Footer, Header
@@ -102,7 +102,10 @@ class TextualReview(ReviewInterface):
                 table.zebra_stripes = True
 
                 for col in df.columns:
-                    if col == pk_col:
+                    is_pk = col == pk_col or (
+                        isinstance(pk_col, tuple) and col in pk_col
+                    )
+                    if is_pk:
                         table.add_column(
                             f"[bold yellow]{col}[/bold yellow]", key=col, width=None
                         )
@@ -157,12 +160,12 @@ class TextualReview(ReviewInterface):
         app.pk_col = pk_col
         return app
 
-    def _run(self, df, title: str, pk_col: str | None, editable: bool):
+    def _run(self, df, title: str, pk_col: str | tuple | None, editable: bool):
         app = self._make_app(df, title, pk_col, editable)
         result = app.run()
         return result
 
-    def show(self, df, title: str, pk_col: str | None = None):
+    def show(self, df, title: str, pk_col: str | tuple | None = None):
         self._run(df, title, pk_col, editable=False)
         return df
 

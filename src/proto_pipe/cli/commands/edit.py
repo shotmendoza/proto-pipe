@@ -500,7 +500,13 @@ def edit_table(table_name, table, pipeline_db):
 
 @edit_cmd.command("column-type")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-def edit_column_type(pipeline_db):
+@click.option(
+    "--diff",
+    is_flag=True,
+    default=False,
+    help="Show only columns where sources disagree on the declared type.",
+)
+def edit_column_type(pipeline_db, diff):
     """Edit column type declarations across all sources.
 
     Shows the full column_type_registry as an editable grid, sorted
@@ -508,12 +514,16 @@ def edit_column_type(pipeline_db):
     shared across multiple sources — e.g. if 'policy_id' was registered
     as BIGINT but should be VARCHAR across all sources.
 
+    Use --diff to show only columns where sources disagree, making it
+    easy to find and bulk-resolve conflicting type declarations.
+
     After saving, you will be prompted to drop affected tables so the
     next vp ingest re-processes them with the corrected types.
 
     \b
-    Example:
+    Examples:
       vp edit column-type
+      vp edit column-type --diff
     """
     from proto_pipe.cli.commands.table import get_reviewer
 
@@ -526,6 +536,15 @@ def edit_column_type(pipeline_db):
                               FROM column_type_registry
                               ORDER BY column_name, source_name
                               """).df()
+
+            if diff:
+                conflicting = conn.execute("""
+                                           SELECT column_name
+                                           FROM column_type_registry
+                                           GROUP BY column_name
+                                           HAVING count(DISTINCT declared_type) > 1
+                                           """).df()["column_name"].tolist()
+
         except Exception as e:
             click.echo(f"[error] Could not read column_type_registry: {e}")
             return
@@ -534,20 +553,40 @@ def edit_column_type(pipeline_db):
         click.echo("No column types registered yet. Run: vp new source")
         return
 
-    click.echo(f"\n── Edit Column Types ──── {len(df)} entries ────────────────")
-    click.echo("  Edit the declared_type column. Other columns are read-only.\n")
+    if diff:
+        if not conflicting:
+            click.echo("  No column type conflicts found — all sources agree.")
+            return
+        df = df[df["column_name"].isin(conflicting)].copy()
+        click.echo(
+            f"\n── Column Type Conflicts ──── {len(conflicting)} column(s), "
+            f"{len(df)} entries ────────────────"
+        )
+        click.echo("  These columns have different declared types across sources.")
+        click.echo("  Edit declared_type to resolve. Other columns are read-only.\n")
+    else:
+        click.echo(f"\n── Edit Column Types ──── {len(df)} entries ────────────────")
+        click.echo("  Edit the declared_type column. Other columns are read-only.\n")
 
     reviewer = get_reviewer(edit=True)
     edited_df = reviewer.edit(
-        df, title=f"column_type_registry ({len(df)} entries)", pk_col="column_name"
+        df,
+        title=f"column_type_registry ({len(df)} entries)",
+        pk_col=("column_name", "source_name"),
     )
 
     if edited_df is None or edited_df.equals(df):
         click.echo("  No changes made.")
         return
 
-    # Identify changed rows (only declared_type is editable)
-    changed = edited_df[edited_df["declared_type"] != df["declared_type"]]
+    # Identify changed rows — match on composite key (column_name, source_name)
+    # since the same column name can appear across multiple sources.
+    merged = edited_df.merge(
+        df[["column_name", "source_name", "declared_type"]],
+        on=["column_name", "source_name"],
+        suffixes=("_new", "_orig"),
+    )
+    changed = merged[merged["declared_type_new"] != merged["declared_type_orig"]]
     if changed.empty:
         click.echo("  No changes detected.")
         return
@@ -557,24 +596,19 @@ def edit_column_type(pipeline_db):
         for _, row in changed.iterrows():
             conn.execute(
                 """
-                         UPDATE column_type_registry
-                         SET declared_type = ?, recorded_at = ?
-                         WHERE column_name = ? AND source_name = ?
-                         """,
-                [row["declared_type"], now, row["column_name"], row["source_name"]],
+                UPDATE column_type_registry
+                SET declared_type = ?, recorded_at = ?
+                WHERE column_name = ? AND source_name = ?
+                """,
+                [row["declared_type_new"], now, row["column_name"], row["source_name"]],
             )
 
     click.echo(f"\n[ok] {len(changed)} column type(s) updated.")
 
     # Show summary of what changed
     for _, row in changed.iterrows():
-        orig = df.loc[
-            (df["column_name"] == row["column_name"])
-            & (df["source_name"] == row["source_name"]),
-            "declared_type",
-        ].iloc[0]
         click.echo(
-            f"  {row['column_name']:<28} {orig} → {row['declared_type']}"
+            f"  {row['column_name']:<28} {row['declared_type_orig']} → {row['declared_type_new']}"
             f"  (source: {row['source_name']})"
         )
 
