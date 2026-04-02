@@ -31,8 +31,8 @@ def delete_cmd():
 def delete_source(table, yes, pipeline_db, sources_config):
     """Remove one or more sources and all their associated data.
 
-    Drops the DB table, removes the config entry, clears ingest_log
-    and flagged_rows entries for each table. column_type_registry
+    Drops the DB table, removes the config entry, clears ingest_state,
+    source_block, and source_pass entries. column_type_registry
     entries are kept since other sources may share those columns.
 
     \b
@@ -80,7 +80,7 @@ def delete_source(table, yes, pipeline_db, sources_config):
         try:
             click.confirm(
                 f"\nDelete {len(selected)} source(s)? "
-                f"This will drop their DB tables, clear ingest_log and flagged_rows. "
+                f"This will drop their DB tables, clear ingest_state, source_block, and source_pass. "
                 f"This cannot be undone.",
                 abort=True,
             )
@@ -102,20 +102,25 @@ def delete_source(table, yes, pipeline_db, sources_config):
                     click.echo(f"  [skip] Table '{target_table}' not found in DB")
 
                 deleted_log = conn.execute(
-                    "DELETE FROM ingest_log WHERE table_name = ? RETURNING id",
+                    "DELETE FROM ingest_state WHERE table_name = ? RETURNING id",
                     [target_table],
                 ).fetchall()
                 if deleted_log:
-                    click.echo(f"  [ok] Cleared {len(deleted_log)} ingest_log entry/entries")
+                    click.echo(f"  [ok] Cleared {len(deleted_log)} ingest_state entry/entries")
 
                 deleted_flags = conn.execute(
-                    "DELETE FROM flagged_rows WHERE table_name = ? RETURNING id",
+                    "DELETE FROM source_block WHERE table_name = ? RETURNING id",
                     [target_table],
                 ).fetchall()
                 if deleted_flags:
                     click.echo(
-                        f"  [ok] Cleared {len(deleted_flags)} flagged_rows entry/entries"
+                        f"  [ok] Cleared {len(deleted_flags)} source_block entry/entries"
                     )
+
+                from proto_pipe.io.db import clear_source_pass_for_table
+                cleared_pass = clear_source_pass_for_table(conn, target_table)
+                if cleared_pass:
+                    click.echo(f"  [ok] Cleared {cleared_pass} source_pass entry/entries")
 
                 config.remove(name)
                 click.echo(f"  [ok] Removed '{name}' from sources_config.yaml")
@@ -167,12 +172,40 @@ def delete_report(report, yes, reports_config):
         click.echo(f"[error] No report named '{report}' found.")
         return
 
+    target_table = existing.get("target_table", report)
+
     try:
         if not yes:
             click.confirm(
-                f"Delete report '{report}'? This cannot be undone.",
+                f"Delete report '{report}'? This will drop the report table '{target_table}', "
+                f"clear validation_block and validation_pass. Cannot be undone.",
                 abort=True,
             )
+
+        p_db = config_path_or_override("pipeline_db")
+        conn = duckdb.connect(p_db)
+        try:
+            from proto_pipe.io.db import table_exists, clear_validation_pass_for_report
+
+            if table_exists(conn, target_table):
+                conn.execute(f'DROP TABLE "{target_table}"')
+                click.echo(f"  [ok] Dropped report table '{target_table}'")
+            else:
+                click.echo(f"  [skip] Report table '{target_table}' not found in DB")
+
+            cleared_block = conn.execute(
+                "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
+                [report],
+            ).fetchall()
+            if cleared_block:
+                click.echo(f"  [ok] Cleared {len(cleared_block)} validation_block entry/entries")
+
+            cleared_pass = clear_validation_pass_for_report(conn, report)
+            if cleared_pass:
+                click.echo(f"  [ok] Cleared {cleared_pass} validation_pass entry/entries")
+
+        finally:
+            conn.close()
 
         config.remove(report)
         click.echo(f"[ok] Report '{report}' removed from reports_config.yaml")

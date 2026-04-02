@@ -7,8 +7,6 @@ import click
 
 from proto_pipe.io.config import config_settings, config_path_or_override, set_path
 from proto_pipe.constants import VALID_PATH_KEYS, DEFAULT_SETTINGS_PATH
-from proto_pipe.reports.validation_flags import init_validation_flags_table
-
 _TEMPLATES_DIR = files("proto_pipe") / "templates"
 
 
@@ -86,64 +84,47 @@ def docs():
 @click.option("--watermark-db", default=None, help="Override watermark DB path.")
 @click.option("--migrate", is_flag=True, default=False, help="Apply schema migrations to existing tables.")
 def db_init(pipeline_db, watermark_db, migrate):
-    """Create DuckDB files and bootstrap tables from sources_config.yaml.
+    """Create DuckDB files and bootstrap pipeline tables.
 
-    Safe to re-run — existing tables are never dropped. Pass --migrate
-    to apply any pending schema changes to existing tables.
+    Safe to re-run — all table creation uses CREATE IF NOT EXISTS.
+    Pass --migrate to rename/update tables from an older schema version.
+
+    Bootstraps: ingest_state, source_pass, source_block, validation_pass,
+    validation_block, check_registry_metadata, column_type_registry.
 
     \b
     Example:
       vp db-init
       vp db-init --migrate
     """
-
     import duckdb
 
     from proto_pipe.io.ingest import init_db
     from proto_pipe.pipelines.watermark import WatermarkStore
-    from proto_pipe.reports.query import init_report_runs_table
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     w_db = config_path_or_override("watermark_db", watermark_db)
 
     click.echo(f"\nInitializing pipeline DB: {p_db}")
-    init_db(p_db)
 
-    # [Create Infrastructure Tables] Create the report run and flagged tables
-    conn = duckdb.connect(p_db)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS flagged_rows (
-            id           VARCHAR PRIMARY KEY,
-            table_name   VARCHAR NOT NULL,
-            check_name   VARCHAR,
-            reason       VARCHAR,
-            flagged_at   TIMESTAMPTZ NOT NULL
-        )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS check_params_history (
-        id          VARCHAR PRIMARY KEY,
-        check_name  VARCHAR NOT NULL,
-        report_name VARCHAR NOT NULL,
-        table_name  VARCHAR NOT NULL,
-        param_name  VARCHAR NOT NULL,
-        param_value VARCHAR,
-        recorded_at TIMESTAMPTZ NOT NULL
-    )
-""")
-    init_validation_flags_table(conn)
-    init_report_runs_table(conn)
+    # init_db calls init_all_pipeline_tables — bootstraps all pipeline tables
+    init_db(p_db)
+    click.echo("[ok] Pipeline tables ready")
 
     if migrate:
-        from proto_pipe.reports.validation_flags import migrate_validation_flags
+        from proto_pipe.io.migration import migrate_pipeline_schema
+        conn = duckdb.connect(p_db)
+        try:
+            applied = migrate_pipeline_schema(conn)
+            if applied:
+                click.echo("\n[ok] Schema migrations applied:")
+                for m in applied:
+                    click.echo(f"  • {m}")
+            else:
+                click.echo("[ok] No schema migrations needed — already up to date")
+        finally:
+            conn.close()
 
-        migrate_validation_flags(conn)
-        click.echo("[ok] Schema migrations applied")
-
-    click.echo("[ok] Infrastructure tables ready (Report Runs + Flagged Tables)")
-    conn.close()
-
-    # [Create Watermark Table] Create the watermark table for most recents
     click.echo(f"\nInitializing watermark DB: {w_db}")
     Path(w_db).parent.mkdir(parents=True, exist_ok=True)
     WatermarkStore(w_db)
@@ -216,3 +197,4 @@ def setup_commands(cli: click.Group):
     cli.add_command(db_init)
     cli.add_command(config)
     cli.add_command(docs)
+    

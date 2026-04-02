@@ -1,31 +1,30 @@
 """Corrections module.
+
 Handles the flagged-row correction workflow:
 
-  1. export_flagged — write flagged rows for a table to a CSV so the user
-                       can review and fix them outside the pipeline.
-  2. import_corrections — read the corrected CSV back in, UPDATE the matching
+  1. export_flagged — write blocked rows for a table to CSV so the user
+                      can review and fix them outside the pipeline.
+  2. import_corrections — read the corrected CSV back in, UPDATE matching
                           rows in the table by primary key, and clear the
-                          resolved entries from flagged_rows.
+                          resolved entries from source_block.
 
-The primary key is defined per source in sources_config.yaml under `primary_key`.
-It can be overridden at the CLI with --key.
+Note: export_flagged / import_corrections are the low-level implementation.
+The CLI layer (vp flagged open / vp flagged retry) calls build_source_flag_export
+from flagging.py for the enriched view. This module handles direct file I/O
+and the correction write-back, shared by both CLI paths.
 
 Row identity:
-  flagged_rows.id = md5(str(pk_value)), set at flag time in ingest.py.
-
-  At export time, the source table is joined to flagged_rows via:
-      md5(CAST(source.pk_col AS VARCHAR)) = flagged_rows.id
-
-  This is drift-free (derived from the data value, not row position),
-  requires no extra columns in source tables, and DuckDB computes it
-  in one vectorised pass before joining to the small flagged_rows result.
+  source_block.pk_value stores the raw primary key as VARCHAR.
+  Join: CAST(source.pk_col AS VARCHAR) = source_block.pk_value
+  (No md5 at query time — pk_value is stored directly.)
 """
+from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
-import pandas as pd  # type: ignore
+import pandas as pd
 
 from proto_pipe.io.ingest import load_file
 
@@ -40,24 +39,13 @@ def export_flagged(
     output_path: str,
     primary_key: str,
 ) -> int:
-    """ Join flagged_rows metadata with the actual table rows and write to CSV.
+    """Join source_block metadata with actual table rows and write to CSV.
 
-    Joins on primary_key instead of row_index when primary_key is
-    provided. This avoids drift — if rows are inserted or deleted between
-    the time the flag is written and the time the export runs, a row_index
-    join would produce the wrong row. Joining on the primary key is stable.
-
-    Falls back to row_index join when primary_key is not provided.
-
-    The output filename includes today's date:
-        flagged_<table>_YYYY-MM-DD.csv
-
-    The file includes all source columns plus:
-        _flag_id — internal ID, keep this when re-importing
-        _flag_reason — why the row was flagged, for reference only
+    Uses pk_value column for the join — no md5 computation at query time.
+    The output includes all source columns plus _flag_* guide columns.
 
     Returns the number of rows exported.
-    Raises ValueError if no flagged rows exist for the table.
+    Raises ValueError if no blocked rows exist for the table.
     """
     if not primary_key:
         raise ValueError(
@@ -65,50 +53,46 @@ def export_flagged(
             "Set primary_key in sources_config.yaml and pass it here."
         )
 
-    # Pull flagged metadata for this table
     flag_count = conn.execute(
-        "SELECT count(*) FROM flagged_rows WHERE table_name = ?",
+        "SELECT count(*) FROM source_block WHERE table_name = ?",
         [table_name],
     ).fetchone()[0]
 
     if flag_count == 0:
-        raise ValueError(f"No flagged rows found for table '{table_name}'")
+        raise ValueError(f"No blocked rows found for table '{table_name}'")
 
-    # Single JOIN — md5 of the primary key column matches flagged_rows.id
-    source_df = conn.execute(
-        f"""
+    source_df = conn.execute(f"""
         SELECT
-            f.id AS _flag_id,
-            f.reason AS _flag_reason,
+            f.id          AS _flag_id,
+            f.reason      AS _flag_reason,
+            f.bad_columns AS _flag_columns,
+            f.check_name  AS _flag_check,
             s.*
         FROM "{table_name}" s
-        JOIN flagged_rows f
-          ON md5(CAST(s."{primary_key}" AS VARCHAR)) = f.id
+        JOIN source_block f
+          ON CAST(s."{primary_key}" AS VARCHAR) = f.pk_value
         WHERE f.table_name = ?
         ORDER BY f.flagged_at
     """, [table_name]).df()
 
     if source_df.empty:
         raise ValueError(
-            f"No source rows matched flagged ids for table '{table_name}'. "
+            f"No source rows matched blocked ids for table '{table_name}'. "
             f"Ensure primary_key='{primary_key}' matches sources_config.yaml."
         )
 
-    # Annotation columns first so they're visible without scrolling
-    other_cols = [c for c in source_df.columns if c not in ("_flag_id", "_flag_reason")]
-    source_df = source_df[["_flag_id", "_flag_reason"] + other_cols]
+    flag_cols = ["_flag_id", "_flag_reason", "_flag_columns", "_flag_check"]
+    other_cols = [c for c in source_df.columns if c not in flag_cols]
+    source_df = source_df[flag_cols + other_cols]
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     source_df.to_csv(output_path, index=False)
-
     return len(source_df)
 
 
-def dated_export_path(
-        output_dir: str,
-        table_name: str
-) -> str:
+def dated_export_path(output_dir: str, table_name: str) -> str:
     """Build the default export filename including today's date.
+
     Format: flagged_<table>_YYYY-MM-DD.csv
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -126,21 +110,18 @@ def import_corrections(
     primary_key: str,
 ) -> dict:
     """Read a corrected CSV and UPDATE matching rows in the table by primary key.
-    Clears resolved entries from flagged_rows.
 
-    The corrections file is expected to be the output of export_flagged —
-    it may contain _flag_id and _flag_reason columns, which are stripped
-    before the UPDATE so they don't contaminate the source table.
+    Clears resolved entries from source_block and validation_block.
 
-    Args:
-        conn: Open DuckDB connection to pipeline.db.
-        table_name: The table to update.
-        corrections_path: Path to the corrected CSV file.
-        primary_key: Column name to match rows on (e.g. "order_id").
+    The corrections file is expected to be the output of export_flagged or
+    build_source_flag_export — it may contain _flag_* columns which are stripped
+    before the UPDATE.
 
-    Returns dict with keys: updated (int), flagged_cleared (int).
-    Raises FileNotFoundError if the correction file doesn't exist.
-    Raises ValueError if the primary key column is missing from the file.
+    :param conn:              Open DuckDB connection to pipeline.db.
+    :param table_name:        The table to update.
+    :param corrections_path:  Path to the corrected CSV file.
+    :param primary_key:       Column name to match rows on (e.g. "van_id").
+    :return: dict with keys: updated, flagged_cleared, validation_cleared, not_found.
     """
     path = Path(corrections_path)
     if not path.exists():
@@ -148,10 +129,10 @@ def import_corrections(
 
     df = load_file(path)
 
-    # Apply declared types from column_type_registry so the write-back
-    # uses confirmed types, not pandas inference from the CSV round-trip.
+    # Apply declared types from column_type_registry so write-back uses
+    # confirmed types, not pandas inference from the CSV round-trip.
     from proto_pipe.io.db import get_registry_types
-    from proto_pipe.pipelines.integrity import apply_declared_types
+    from proto_pipe.io.migration import apply_declared_types
 
     user_cols = [c for c in df.columns if not c.startswith("_")]
     registry_types = get_registry_types(conn, user_cols)
@@ -167,11 +148,11 @@ def import_corrections(
     # Collect _flag_ids before stripping annotation columns
     flag_ids = df["_flag_id"].dropna().tolist() if "_flag_id" in df.columns else []
 
-    # Strip annotation columns — they must not be written to the source table
-    data_cols = [c for c in df.columns if c not in ("_flag_id", "_flag_reason")]
+    # Strip all _-prefixed columns — never written to the source table
+    data_cols = [c for c in df.columns if not c.startswith("_")]
     df = df[data_cols]
 
-    # Get the columns that exist in the target table
+    # Get columns that exist in the target table
     table_cols = set(
         conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
@@ -179,7 +160,6 @@ def import_corrections(
         ).df()["column_name"].tolist()
     )
 
-    # Only update columns that exist in both the file and the table
     update_cols = [c for c in df.columns if c in table_cols and c != primary_key]
 
     if not update_cols:
@@ -188,7 +168,7 @@ def import_corrections(
             f"table columns: {sorted(table_cols)}"
         )
 
-    # Warn about keys in the corrections file that don't exist in the table
+    # Warn about keys in corrections file that don't exist in the table
     existing_keys = set(
         conn.execute(f'SELECT DISTINCT "{primary_key}" FROM "{table_name}"')
         .df()[primary_key]
@@ -204,17 +184,16 @@ def import_corrections(
             + (" ..." if not_found > 5 else "")
         )
 
-    # Batched UPDATE via staging table instead of row-by-row Python loop.
-    # Register the corrections DataFrame as a temporary view, then issue a single
-    # UPDATE ... FROM ... JOIN which DuckDB executes in one pass.
+    # Batched UPDATE via staging temp table
     conn.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS _corrections_staging AS SELECT * FROM df LIMIT 0"
+        "CREATE TEMP TABLE IF NOT EXISTS _corrections_staging "
+        "AS SELECT * FROM df LIMIT 0"
     )
     conn.execute("DELETE FROM _corrections_staging")
     conn.execute("INSERT INTO _corrections_staging SELECT * FROM df")
 
     set_clause = ", ".join(
-        [f'"{col}" = _corrections_staging."{col}"' for col in update_cols]
+        f'"{col}" = _corrections_staging."{col}"' for col in update_cols
     )
     conn.execute(f"""
         UPDATE "{table_name}"
@@ -226,38 +205,34 @@ def import_corrections(
 
     updated = len(df) - not_found
 
-    # Clear resolved entries from both flag tables.
-    # _flag_id values from export_flagged point at flagged_rows (ingest conflicts).
-    # _flag_id values from export_validation_report point at validation_flags.
-    # We try both — each DELETE is a no-op if the id doesn't exist in that table.
+    # Clear resolved entries from source_block and validation_block
     flagged_cleared = 0
     validation_cleared = 0
+
     if flag_ids:
         placeholders = ", ".join(["?"] * len(flag_ids))
 
         flagged_cleared = conn.execute(
-            f"SELECT count(*) FROM flagged_rows WHERE id IN ({placeholders})",
+            f"SELECT count(*) FROM source_block WHERE id IN ({placeholders})",
             flag_ids,
         ).fetchone()[0]
         if flagged_cleared:
             conn.execute(
-                f"DELETE FROM flagged_rows WHERE id IN ({placeholders})",
+                f"DELETE FROM source_block WHERE id IN ({placeholders})",
                 flag_ids,
             )
 
         try:
             validation_cleared = conn.execute(
-                f"SELECT count(*) FROM validation_flags WHERE id IN ({placeholders})",
+                f"SELECT count(*) FROM validation_block WHERE id IN ({placeholders})",
                 flag_ids,
             ).fetchone()[0]
             if validation_cleared:
                 conn.execute(
-                    f"DELETE FROM validation_flags WHERE id IN ({placeholders})",
+                    f"DELETE FROM validation_block WHERE id IN ({placeholders})",
                     flag_ids,
                 )
-        except Exception as exc:
-            # validation_flags table may not exist in older pipeline DBs —
-            # skip silently rather than failing the whole correction.
+        except Exception:
             validation_cleared = 0
 
     return {

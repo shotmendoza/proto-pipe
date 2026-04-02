@@ -8,7 +8,7 @@ pipeline.yaml via the `custom_checks_module` key. Any function in that
 module decorated with @custom_check will be registered automatically
 when the pipeline starts.
 
-kind="check" — returns pd.Series[bool], failures written to validation_flags
+kind="check" — returns pd.Series[bool], failures written to validation_block
 kind="transform" — returns pd.Series or pd.DataFrame, result written back to the
                    report table in DuckDB after all checks have run
 """
@@ -46,7 +46,7 @@ def custom_check(
 
         kind: "check" (default) or "transform".
               "check" — function returns pd.Series[bool]; True = row passes.
-                            Failures are written to validation_flags.
+                            Failures are written to validation_block.
               "transform" — function returns pd.Series or pd.DataFrame.
                             The result is written back to the report table in DuckDB
                             after all checks have run. Runs in config order.

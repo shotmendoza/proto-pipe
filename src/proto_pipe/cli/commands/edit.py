@@ -649,7 +649,7 @@ def edit_column_type(pipeline_db, diff):
             try:
                 conn.execute(f'DROP TABLE IF EXISTS "{target_table}"')
                 conn.execute(
-                    "DELETE FROM ingest_log WHERE table_name = ?", [target_table]
+                    "DELETE FROM ingest_state WHERE table_name = ?", [target_table]
                 )
                 click.echo(
                     f"  [ok] Dropped '{target_table}' — will re-ingest on next vp ingest"

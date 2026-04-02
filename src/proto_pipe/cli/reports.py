@@ -139,7 +139,7 @@ def run_all(
 
     Stops before pull-report if flagged rows exist, unless --ignore-flagged is set.
     Auto-fixed rows are applied during validate. Complex cases are written to
-    the flagged_rows table for manual review.
+    the source_block table for manual review.
 
     \b
     Example:
@@ -180,15 +180,10 @@ def run_all(
     # Pass pipeline_db so the runner writes per-row validation flags
     run_all_reports(report_registry, check_registry, watermark_store, pipeline_db=p_db)
 
-    # Check for flagged rows before producing deliverable
+    # Step 3a — Ingest conflicts (source_block) — hard block deliverables
     conn = duckdb.connect(p_db)
-    flagged_count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-
-    # TODO: This can be split into its own function, just like 3B
-    # Step 3a — Ingest conflicts (flagged_rows) — hard block
-    from proto_pipe.reports.validation_flags import count_validation_flags
     ingest_conflict_count = conn.execute(
-        "SELECT count(*) FROM flagged_rows"
+        "SELECT count(*) FROM source_block"
     ).fetchone()[0]
 
     if ingest_conflict_count > 0 and not ignore_flagged:
@@ -199,20 +194,20 @@ def run_all(
         click.echo(
             "These are rows that arrived with conflicting values for existing records."
         )
-        click.echo(
-            "Run: vp flagged — to see a breakdown by table"
-        )
-        click.echo("Run: vp flagged --export csv — to export for correction")
+        click.echo("Run: vp flagged — to see a breakdown by table")
+        click.echo("Run: vp flagged open <table> — to export for correction")
         click.echo("Re-run with --ignore-flagged to produce the deliverable anyway.")
         return
 
-    # Step 3b — Validation flags — warn only, deliverable still produced
-    val_flag_count = count_validation_flags(conn)
+    # Step 3b — Validation failures (validation_block) — warn only, deliverable still produced
+    val_flag_count = conn.execute(
+        "SELECT count(*) FROM validation_block"
+    ).fetchone()[0]
     if val_flag_count > 0:
         click.echo(
-            f"\n⚠  {val_flag_count} validation flag(s) found. Deliverable will still be produced."
+            f"\n⚠  {val_flag_count} validation failure(s) found. Deliverable will still be produced."
         )
-        click.echo("Run: vp export-validation to review flagged records.")
+        click.echo("Run: vp validated — to review by report")
 
     # Step 4 — Refresh views
     click.echo("\n── Refresh Views ───────────────────────────")
@@ -315,3 +310,4 @@ def reports_commands(cli):
     cli.add_command(pull_report)
     cli.add_command(run_all)
     cli.add_command(refresh_views_cmd)
+    

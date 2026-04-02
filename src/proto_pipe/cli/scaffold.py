@@ -146,7 +146,7 @@ def _get_column_registry_hints(
 
 
 def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
-    """Remove files already successfully logged in ingest_log."""
+    """Remove files already successfully logged in ingest_state."""
     try:
         from proto_pipe.io.db import get_ingested_filenames
         with duckdb.connect(pipeline_db) as conn:
@@ -230,23 +230,31 @@ def _record_param_history(
     table_name: str,
     params: dict,
 ) -> None:
-    """Store used param values in check_params_history."""
+    """Store used param values in check_params_history.
+
+    Wrapped in try/except — check_params_history is a legacy table not present
+    in fresh databases. Failures are silently ignored so scaffold commands
+    continue to work on DBs that haven't been migrated.
+    """
     for param_name, value in params.items():
         if value is None:
             continue
-        conn.execute("""
-            INSERT INTO check_params_history
-                (id, check_name, report_name, table_name, param_name, param_value, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, [
-            str(uuid.uuid4()),
-            check_name,
-            report_name,
-            table_name,
-            param_name,
-            str(value),
-            datetime.now(timezone.utc),
-        ])
+        try:
+            conn.execute("""
+                INSERT INTO check_params_history
+                    (id, check_name, report_name, table_name, param_name, param_value, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [
+                str(uuid.uuid4()),
+                check_name,
+                report_name,
+                table_name,
+                param_name,
+                str(value),
+                datetime.now(timezone.utc),
+            ])
+        except Exception:
+            pass
 
 
 def _detect_view_dependencies(sql: str, known_views: list[str]) -> list[str]:
@@ -652,7 +660,7 @@ def table_reset(report_name, reports_config, pipeline_db):
     """Drop a report table and clear its ingest history so it re-ingests cleanly.
 
     This is a destructive operation. The table is dropped from DuckDB and all
-    ingest_log entries for it are removed. The next `vp ingest` run recreates
+    ingest_state entries for it are removed. The next `vp ingest` run recreates
     the table from source files from scratch, including re-applying transforms.
 
     \b

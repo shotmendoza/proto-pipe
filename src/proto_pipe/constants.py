@@ -8,13 +8,24 @@ import pandas as pd
 # Tables created and managed by the pipeline itself.
 # Excluded from user-facing table lists (e.g. vp new-report, vp table).
 PIPELINE_TABLES: frozenset[str] = frozenset({
+    # State tables — record-level tracking
+    "source_pass",
+    "validation_pass",
+    # Block tables — problem records
+    "source_block",
+    "validation_block",
+    # Ingest history
+    "ingest_state",
+    # Registry tables
+    "check_registry_metadata",
+    "column_type_registry",
+    # Legacy names — kept during migration window so vp db-init --migrate
+    # can detect and rename them. Remove once all DBs are migrated.
     "flagged_rows",
     "ingest_log",
     "report_runs",
     "validation_flags",
     "check_params_history",
-    "check_registry_metadata",
-    "column_type_registry",
 })
 
 NUMERIC_DUCKDB_TYPES = frozenset({
@@ -65,4 +76,3 @@ NULLABLE_EXTENSION_DTYPES = (
     pd.UInt64Dtype,
     pd.BooleanDtype,
 )
-

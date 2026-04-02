@@ -59,10 +59,14 @@ def get_all_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
 # Table bootstrap
 # ---------------------------------------------------------------------------
 
-def init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the ingest_log table if it doesn't exist. Safe to call multiple times."""
+def init_ingest_state(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the ingest_state table if it doesn't exist. Safe to call multiple times.
+
+    Tracks per-file ingest history. Was: ingest_log.
+    status values: ok | failed | skipped | correction
+    """
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS ingest_log (
+        CREATE TABLE IF NOT EXISTS ingest_state (
             id          VARCHAR PRIMARY KEY,
             filename    VARCHAR NOT NULL,
             table_name  VARCHAR,
@@ -75,13 +79,92 @@ def init_ingest_log(conn: duckdb.DuckDBPyConnection) -> None:
     """)
 
 
-def init_flagged_rows(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the flagged_rows table if it doesn't exist. Safe to call multiple times."""
+def init_source_block(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the source_block table if it doesn't exist. Safe to call multiple times.
+
+    Stores ingest-time row conflicts (type mismatch, duplicate with changed
+    values). Hard-blocks deliverables until resolved. Was: flagged_rows.
+
+    check_name values: type_conflict | duplicate_conflict
+    bad_columns: pipe-delimited column names e.g. "amount|region"
+    """
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS flagged_rows (
+        CREATE TABLE IF NOT EXISTS source_block (
+            id                  VARCHAR PRIMARY KEY,
+            table_name          VARCHAR NOT NULL,
+            check_name          VARCHAR NOT NULL,
+            pk_value            VARCHAR,
+            source_file         VARCHAR,
+            source_file_missing BOOLEAN DEFAULT FALSE,
+            bad_columns         VARCHAR,
+            reason              VARCHAR,
+            flagged_at          TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+
+def init_source_pass(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the source_pass table if it doesn't exist. Safe to call multiple times.
+
+    Tracks per-record accepted ingest state. _handle_duplicates compares
+    incoming row hashes against this table — not the source table directly.
+    Updated only on successful ingest or correction. Never updated for
+    blocked rows.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS source_pass (
+            pk_value    VARCHAR NOT NULL,
+            table_name  VARCHAR NOT NULL,
+            row_hash    VARCHAR NOT NULL,
+            source_file VARCHAR NOT NULL,
+            ingested_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pk_value, table_name)
+        )
+    """)
+
+
+def init_validation_pass(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the validation_pass table if it doesn't exist. Safe to call multiple times.
+
+    Tracks per-record accepted validation state per report. Enables
+    incremental validation — only new/changed records or records affected
+    by check set changes are re-validated.
+
+    status values: passed | failed | skipped | corrected
+    check_set_hash: md5 of all check names + function source hashes
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS validation_pass (
+            pk_value       VARCHAR NOT NULL,
+            table_name     VARCHAR NOT NULL,
+            report_name    VARCHAR NOT NULL,
+            row_hash       VARCHAR NOT NULL,
+            check_set_hash VARCHAR NOT NULL,
+            status         VARCHAR NOT NULL,
+            validated_at   TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (pk_value, table_name, report_name)
+        )
+    """)
+
+
+def init_validation_block(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the validation_block table if it doesn't exist. Safe to call multiple times.
+
+    Stores check/transform failures from vp validate. Warns but does not
+    block deliverables. Mirrors source_block structure but joins to the
+    report table (not source files) for the correction view.
+
+    check_name: the registered check/transform name that produced the failure
+    bad_columns: pipe-delimited column names e.g. "amount|region"
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS validation_block (
             id          VARCHAR PRIMARY KEY,
             table_name  VARCHAR NOT NULL,
+            report_name VARCHAR NOT NULL,
             check_name  VARCHAR NOT NULL,
+            pk_value    VARCHAR,
+            bad_columns VARCHAR,
             reason      VARCHAR,
             flagged_at  TIMESTAMPTZ NOT NULL
         )
@@ -121,10 +204,13 @@ def init_all_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
 
     Safe to call multiple times — all init functions use CREATE IF NOT EXISTS.
     """
-    init_ingest_log(conn)
+    init_ingest_state(conn)
+    init_source_pass(conn)
+    init_source_block(conn)
+    init_validation_pass(conn)
+    init_validation_block(conn)
     init_check_registry_metadata(conn)
     init_column_type_registry(conn)
-    init_flagged_rows(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -217,10 +303,10 @@ def delete_registry_types_for_source(
 
 
 # ---------------------------------------------------------------------------
-# ingest_log operations
+# ingest_state operations (was: ingest_log)
 # ---------------------------------------------------------------------------
 
-def log_ingest(
+def log_ingest_state(
     conn: duckdb.DuckDBPyConnection,
     filename: str,
     table_name: str | None,
@@ -229,9 +315,12 @@ def log_ingest(
     new_cols: list[str] | None = None,
     message: str | None = None,
 ) -> None:
-    """Insert one ingest attempt record into ingest_log."""
+    """Insert one ingest attempt record into ingest_state.
+
+    status values: ok | failed | skipped | correction
+    """
     conn.execute("""
-        INSERT INTO ingest_log
+        INSERT INTO ingest_state
             (id, filename, table_name, status, rows, new_cols, message, ingested_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, [
@@ -247,19 +336,19 @@ def log_ingest(
 
 
 def already_ingested(conn: duckdb.DuckDBPyConnection, filename: str) -> bool:
-    """Return True if filename has a successful ingest_log entry."""
+    """Return True if filename has a successful ingest_state entry."""
     result = conn.execute("""
-        SELECT count(*) FROM ingest_log
+        SELECT count(*) FROM ingest_state
         WHERE filename = ? AND status = 'ok'
     """, [filename]).fetchone()
     return result is not None and result[0] > 0
 
 
 def get_ingested_filenames(conn: duckdb.DuckDBPyConnection) -> set[str]:
-    """Return all filenames with status='ok' in ingest_log."""
+    """Return all filenames with status='ok' in ingest_state."""
     try:
         rows = conn.execute(
-            "SELECT filename FROM ingest_log WHERE status = 'ok'"
+            "SELECT filename FROM ingest_state WHERE status = 'ok'"
         ).fetchall()
         return {row[0] for row in rows}
     except Exception:
@@ -281,6 +370,173 @@ def flag_id_for(
     if pk_value is None:
         return str(uuid.uuid4())
     return hashlib.md5(str(pk_value).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# source_pass operations
+# ---------------------------------------------------------------------------
+
+def get_source_pass_hashes(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    pk_values: list[str],
+) -> dict[str, str]:
+    """Return {pk_value: row_hash} for the given pk_values from source_pass.
+
+    Used by _handle_duplicates to compare incoming row hashes without
+    querying the source table directly. Missing PKs are new records.
+    """
+    if not pk_values:
+        return {}
+    placeholders = ", ".join(["?"] * len(pk_values))
+    rows = conn.execute(f"""
+        SELECT pk_value, row_hash
+        FROM source_pass
+        WHERE table_name = ?
+        AND pk_value IN ({placeholders})
+    """, [table_name] + pk_values).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def bulk_upsert_source_pass(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    records: list[dict],
+) -> None:
+    """Bulk upsert multiple records into source_pass.
+
+    Each record: {pk_value, row_hash, source_file}
+    Called after a successful chunk insert in _handle_duplicates.
+    Only called for clean accepted rows — never for blocked rows.
+    """
+    if not records:
+        return
+    import pandas as pd
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame([
+        {
+            "pk_value": r["pk_value"],
+            "table_name": table_name,
+            "row_hash": r["row_hash"],
+            "source_file": r["source_file"],
+            "ingested_at": now,
+        }
+        for r in records
+    ])
+    conn.execute("""
+        INSERT INTO source_pass (pk_value, table_name, row_hash, source_file, ingested_at)
+        SELECT pk_value, table_name, row_hash, source_file, ingested_at FROM df
+        ON CONFLICT (pk_value, table_name)
+        DO UPDATE SET
+            row_hash    = excluded.row_hash,
+            source_file = excluded.source_file,
+            ingested_at = excluded.ingested_at
+    """)
+
+
+def clear_source_pass_for_table(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+) -> int:
+    """Delete all source_pass entries for a table. Returns count deleted.
+
+    Called by vp delete source to clean up all record-level state.
+    """
+    result = conn.execute(
+        "DELETE FROM source_pass WHERE table_name = ? RETURNING pk_value",
+        [table_name],
+    ).fetchall()
+    return len(result)
+
+
+# ---------------------------------------------------------------------------
+# validation_pass operations
+# ---------------------------------------------------------------------------
+
+
+def upsert_validation_pass(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    report_name: str,
+    pk_value: str,
+    row_hash: str,
+    check_set_hash: str,
+    status: str,
+) -> None:
+    """Upsert one record into validation_pass after vp validate runs.
+
+    status values: passed | failed | skipped | corrected
+    On conflict, updates all fields.
+    """
+    conn.execute("""
+        INSERT INTO validation_pass
+            (pk_value, table_name, report_name, row_hash, check_set_hash, status, validated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (pk_value, table_name, report_name)
+        DO UPDATE SET
+            row_hash       = excluded.row_hash,
+            check_set_hash = excluded.check_set_hash,
+            status         = excluded.status,
+            validated_at   = excluded.validated_at
+    """, [pk_value, table_name, report_name, row_hash, check_set_hash, status,
+          datetime.now(timezone.utc)])
+
+
+def get_validation_pass_hashes(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    report_name: str,
+    check_set_hash: str,
+) -> dict[str, str]:
+    """Return {pk_value: row_hash} for records validated with the current check set.
+
+    Used by vp validate to identify pending records:
+    - Not in result → never validated → pending
+    - In result but source row_hash differs → source changed → pending
+    - In result, hashes match → skip
+    """
+    rows = conn.execute("""
+        SELECT pk_value, row_hash
+        FROM validation_pass
+        WHERE table_name = ?
+        AND report_name = ?
+        AND check_set_hash = ?
+    """, [table_name, report_name, check_set_hash]).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def get_current_check_set_hash(
+    conn: duckdb.DuckDBPyConnection,
+    report_name: str,
+) -> str | None:
+    """Return the most recent check_set_hash used for a report.
+
+    Returns None if the report has never been validated.
+    Used to detect when the check set has changed between runs.
+    """
+    result = conn.execute("""
+        SELECT check_set_hash
+        FROM validation_pass
+        WHERE report_name = ?
+        ORDER BY validated_at DESC
+        LIMIT 1
+    """, [report_name]).fetchone()
+    return result[0] if result else None
+
+
+def clear_validation_pass_for_report(
+    conn: duckdb.DuckDBPyConnection,
+    report_name: str,
+) -> int:
+    """Delete all validation_pass entries for a report. Returns count deleted.
+
+    Called by vp delete report to clean up all record-level state.
+    """
+    result = conn.execute(
+        "DELETE FROM validation_pass WHERE report_name = ? RETURNING pk_value",
+        [report_name],
+    ).fetchall()
+    return len(result)
 
 
 def coerce_for_display(df: "pd.DataFrame") -> "pd.DataFrame":

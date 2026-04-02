@@ -3,29 +3,29 @@
 Scans a directory for CSV and Excel files, matches each file to a source
 definition by pattern, and loads the data into DuckDB tables.
 
-Table lifecycle:
-- `db-init` — creates the DuckDB file and bootstraps empty tables from sources_config.yaml
-- First ingest of a new source — creates the table lazily from the file's schema
-- Subsequent ingests — appends rows, auto-migrating new columns if the schema grew
+Data layer invariants (see CLAUDE.md):
+- ALL data loading goes through DuckDB. Pandas is never used in the data path.
+- CSV files loaded via DuckDB read_csv() with dtype from column_type_registry.
+- Excel files loaded via DuckDB read_xlsx() (spatial extension).
+- load_file() is retained only for the correction workflow (strip_pipeline_cols path).
+- Unknown columns (not in column_type_registry) fail the file.
+- Bad row values (TRY_CAST fails) are written to source_block and removed from the
+  insert set. Clean rows proceed.
+- Duplicate handling compares against source_pass, not the source table directly.
 
-File deduplication:
-- Files already logged as 'ok' in ingest_log are skipped automatically.
-- Files that previously failed are retried on every run until they succeed.
+Table lifecycle:
+- vp new source  — confirms column types, writes column_type_registry
+- vp db-init     — creates pipeline tables including source_pass and source_block
+- First ingest   — CREATE TABLE AS SELECT, writes source_pass for all rows
+- Subsequent     — auto_migrate new columns, _handle_duplicates via source_pass
 
 Duplicate row handling (on_duplicate in sources_config.yaml):
-- flag
-    — (default when primary_key defined) compute md5 row hash; if hash
-        differs from existing row, flag the conflict in flagged_rows with
-        the changed column names in the reason, and skip the incoming row
-- append
-    — insert all rows regardless of duplicates
-- upsert
-    — delete existing rows by primary key, then insert incoming rows
-- skip
-    — silently discard rows whose primary key already exists
+- flag   — compare hash against source_pass; changed rows → source_block (default)
+- append — insert all rows, no conflict checking, no source_pass update
+- upsert — overwrite existing; update source_pass only when hash changed
+- skip   — ignore rows already in source_pass
 
-Each ingest run logs results (including failures) to the `ingest_log` table
-so failures are visible without stopping the entire run.
+Each ingest run logs results to ingest_state (was: ingest_log).
 """
 import csv
 import warnings
@@ -41,35 +41,37 @@ from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
 from proto_pipe.io.db import (
     get_columns as get_existing_columns,
     get_column_types as get_existing_column_types,
-    table_exists, flag_id_for,
+    table_exists,
+    flag_id_for,
+    get_registry_types,
+    log_ingest_state,
+    get_source_pass_hashes,
+    bulk_upsert_source_pass,
 )
 from proto_pipe.io.migration import auto_migrate
-from proto_pipe.pipelines.integrity import (
-    apply_declared_types,
-    check_type_compatibility,
-    IntegrityResult,
-    write_integrity_flags
+from proto_pipe.pipelines.flagging import (
+    FlagRecord,
+    write_source_flags,
+    compute_row_hash,
+    compute_row_hash_sql,
 )
 
 
 # ---------------------------------------------------------------------------
-# Structural checks — lightweight, run per file before loading
+# Constants
 # ---------------------------------------------------------------------------
+
 _SUPPORTED_FILE_SUFFIXES = {".csv", ".xlsx", ".xls"}
-"""GLOBAL: Supported file suffixes for ingestion"""
-
-_MAX_DIFF_COLS = 5  # cap reason string to avoid wall-of-text in flagged_rows
-"""GLOBAL: Maximum number of columns to include in the flaggin reason"""
-
-# Number of primary keys processed per SQL IN (...) clause.
+_MAX_DIFF_COLS = 5
 CHUNK_SIZE = 1000
-"""GLOBAL: Maximum number of rows to process in a single SQL IN (...) clause"""
 
+
+# ---------------------------------------------------------------------------
+# Metadata bootstrap
+# ---------------------------------------------------------------------------
 
 def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
-    """Write metadata for all built-in checks. Safe to call multiple times —
-    write_to_db is idempotent and only updates when the function source changes.
-    """
+    """Write metadata for all built-in checks. Safe to call multiple times."""
     from proto_pipe.checks.built_in import BUILT_IN_CHECKS
     from proto_pipe.checks.registry import CheckParamInspector
 
@@ -79,110 +81,39 @@ def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Flag identity
+# File support
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# Structural checks
-# ---------------------------------------------------------------------------
 def _is_supported_file(path: Path) -> bool:
-    """Checks if the given file has a supported file extension.
-
-    This function evaluates whether the file specified by the given path has a
-    suffix that matches any of the supported file suffixes.
-
-    :param path: The file path to be checked.
-    :type path: Path
-    :return: True if the file's suffix is in the list of supported suffixes,
-        False otherwise.
-    :rtype: bool
-    """
+    """Return True if the file has a supported extension."""
     return path.suffix.lower() in _SUPPORTED_FILE_SUFFIXES
 
 
-def _structural_checks(
-        df: pd.DataFrame,
-        source: dict
-) -> list[str]:
-    """Perform structural integrity checks on the provided DataFrame based on the source metadata.
-
-    This check evaluates and runs before the existing database tables are touched.
-
-    This function evaluates the DataFrame to ensure it is not empty and verifies the
-    existence of a required timestamp column if specified in the given source dictionary.
-
-    :param df: The input DataFrame subject to validation.
-    :type df: pandas.DataFrame
-    :param source: A dictionary containing metadata configuration, where the key
-        "timestamp_col" defines the expected name of the timestamp column.
-    :type source: dict
-
-    :return: A list of string messages describing any structural issues found
-        in the DataFrame. The list will be empty if no issues are detected.
-    :rtype: list[str]
-    """
-    issues: list[str] = []
-
-    if df.empty:
-        issues.append("File is empty")
-
-    timestamp_col = source.get("timestamp_col")
-    if timestamp_col and timestamp_col not in df.columns:
-        issues.append(f"Missing required timestamp column '{timestamp_col}'")
-
-    primary_key = source.get("primary_key")
-    if primary_key and primary_key in df.columns:
-        null_count = int(df[primary_key].isna().sum())
-        if null_count:
-            issues.append(
-                f"{null_count} row(s) have NULL value in primary key "
-                f"column '{primary_key}' — file rejected"
-            )
-    return issues
-
-
 # ---------------------------------------------------------------------------
-# ingest_log table
+# Pattern matching
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _pattern_specificity(pattern: str) -> int:
     """Return the number of literal (non-wildcard) characters in a pattern.
 
-    Used to rank competing matches — a pattern with more literal characters
-    is more specific and should take priority over a broader wildcard pattern.
-
-    Example:
-        "foo you*.csv"  → 11  (wins over)
-        "foo*.csv"      →  7
+    Used to rank competing matches — more literal characters = more specific.
+    Example: "foo you*.csv" → 11 beats "foo*.csv" → 7.
     """
     return sum(1 for c in pattern if c not in ("*", "?", "[", "]"))
 
 
 def resolve_source(
-        filename: str,
-        sources: list[dict],
+    filename: str,
+    sources: list[dict],
 ) -> dict | None:
     """Return the source whose pattern most specifically matches the filename.
 
-    Collects all matching sources and picks the one whose best-matching
-    pattern has the highest specificity score (most literal characters).
-    This means "foo you*.csv" always beats "foo*.csv" for a file like
-    "foo you bar.csv", regardless of config order.
+    Picks the source whose best-matching pattern has the highest specificity
+    score (most literal characters). "foo you*.csv" always beats "foo*.csv"
+    for "foo you bar.csv", regardless of config order.
 
-    When two sources match with equal specificity, config order is used as
-    a tiebreaker and a warning is printed so the user knows to make their
-    patterns more specific.
-
-    :param filename: The name of the file to resolve against the source patterns.
-    :param sources:  List of source dicts from sources_config.yaml.
-    :return: Best-matching source dict, or None if no match found.
+    Ties fall back to config order with a warning.
     """
-    # Collect (source, best_specificity) for every source that matches
     matches: list[tuple[dict, int]] = []
     for source in sources:
         best = max(
@@ -199,9 +130,7 @@ def resolve_source(
     winners = [s for s, score in matches if score == best_score]
 
     if len(winners) > 1:
-        names = ", ".join(
-            f"'{w['name']}'" for w in winners
-        )
+        names = ", ".join(f"'{w['name']}'" for w in winners)
         print(
             f"[warn] '{filename}' matches multiple sources with equal specificity: "
             f"{names}. Using '{winners[0]['name']}' — make patterns more specific "
@@ -211,19 +140,20 @@ def resolve_source(
     return winners[0]
 
 
+# ---------------------------------------------------------------------------
+# load_file — correction path only
+# ---------------------------------------------------------------------------
+
 def load_file(path: Path) -> pd.DataFrame:
     """Load a CSV or Excel file into a DataFrame.
 
-    This function supports loading files in CSV or Excel formats. Depending on
-    the file extension, the appropriate pandas function will be used to load
-    the file. If the file extension is not supported, the function raises
-    a ValueError.
+    Used ONLY for the correction workflow (strip_pipeline_cols path) where
+    pipeline metadata columns need to be stripped before re-ingest.
+    Not used in the primary data loading path — all ingestion goes through DuckDB.
 
-    :param path: The path to the file to be loaded.
-    :type path: Path
-    :return: A pandas DataFrame containing the file data.
-    :rtype: pd.DataFrame
-    :raises ValueError: If the file type is unsupported (neither .csv, .xlsx, nor .xls).
+    :param path: Path to the file.
+    :return: DataFrame. Types are re-inferred by DuckDB during subsequent processing.
+    :raises ValueError: If the file type is unsupported.
     """
     suffix = path.suffix.lower()
 
@@ -242,15 +172,8 @@ def load_file(path: Path) -> pd.DataFrame:
 # DB initialisation
 # ---------------------------------------------------------------------------
 
-
 def init_db(db_path: str) -> None:
-    """Initializes the database by creating the necessary directory structure
-    and establishing a connection to the database file.
-
-    :param db_path: The path to the database file to be initialized.
-    :type db_path: str
-    :return: None
-    """
+    """Initialise the pipeline database and bootstrap all pipeline tables."""
     from proto_pipe.io.db import init_all_pipeline_tables
 
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -259,9 +182,8 @@ def init_db(db_path: str) -> None:
         _populate_builtin_metadata(conn)
 
 
-def init_source_tables(db_path: str, sources: list[dict]):
-    """Creates placeholder tables for the user-defined tables,
-    given source definitions from the config."""
+def init_source_tables(db_path: str, sources: list[dict]) -> None:
+    """Create placeholder tables for user-defined sources."""
     with duckdb.connect(db_path) as conn:
         for source in sources:
             table = source["target_table"]
@@ -273,9 +195,8 @@ def init_source_tables(db_path: str, sources: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# Ingest
+# Ingest directory
 # ---------------------------------------------------------------------------
-
 
 def ingest_directory(
     directory: str,
@@ -286,24 +207,9 @@ def ingest_directory(
     check_registry=None,
     report_registry=None,
 ) -> dict:
-    """Scan a directory, match files to source definitions, and load into DuckDB.
-
-    Two-scenario ingest:
-      Scenario A (first ingest / replace mode):
-        - Queries column_type_registry for user-confirmed types.
-        - If registry entries exist, pre-scans with TRY_CAST. Mismatch fails the file.
-        - CSV: reloaded via DuckDB read_csv with declared types.
-        - Excel: apply_declared_types.
-        - If no registry entries, falls back to inference.
-
-      Scenario B (subsequent ingest, table exists):
-        - CSV: loaded via DuckDB read_csv with declared types before validators run.
-        - Excel: apply_declared_types.
-        - _ROW_VALIDATORS pre-scan; failing rows go to flagged_rows.
-        - Clean rows through duplicate handling and INSERT.
-    """
+    """Scan a directory, match files to source definitions, load into DuckDB."""
     from proto_pipe.io.db import (
-        init_ingest_log as _init_ingest_log,
+        init_ingest_state as _init_ingest_state,
         already_ingested as _already_ingested,
     )
 
@@ -317,7 +223,7 @@ def ingest_directory(
         raise ValueError(f"incoming_dir '{directory}' exists but is not a directory.")
 
     conn = duckdb.connect(db_path)
-    _init_ingest_log(conn)
+    _init_ingest_state(conn)
 
     summary: dict[str, dict] = {}
     unmatched: list[str] = []
@@ -356,10 +262,8 @@ def ingest_directory(
 
     if unmatched:
         print(f"[warn] No source match for: {', '.join(unmatched)}")
-        from proto_pipe.io.db import log_ingest as _log_ingest
-
         for filename in unmatched:
-            _log_ingest(
+            log_ingest_state(
                 conn, filename, None, "skipped", message="No matching source pattern"
             )
 
@@ -367,31 +271,19 @@ def ingest_directory(
     return summary
 
 
-def _run_inline_checks(
-        conn,
-        table,
-        source,
-        check_registry,
-        report_registry,
-        filename
-):
-    """Executes inline checks for a given table and source by leveraging the check
-    and report registries to find matching reports and checks to run for the table.
+# ---------------------------------------------------------------------------
+# Inline checks (post-ingest)
+# ---------------------------------------------------------------------------
 
-    :param conn: The database connection object used to execute queries.
-    :type conn: Any
-    :param table: The name of the table to query and perform checks on.
-    :type table: str
-    :param source: The source identifier associated with the table.
-    :type source: Any
-    :param check_registry: The registry containing defined check logic to execute.
-    :type check_registry: Any
-    :param report_registry: The registry containing reports that define resolved checks.
-    :type report_registry: Any
-    :param filename: Unused parameter; might be reserved for future functionality.
-    :type filename: Any
-    :return: None
-    """
+def _run_inline_checks(
+    conn,
+    table,
+    source,
+    check_registry,
+    report_registry,
+    filename,
+) -> None:
+    """Run registered checks against a table immediately after ingest."""
     matching = [
         r for r in report_registry.all()
         if r.get("source", {}).get("table") == table
@@ -412,95 +304,8 @@ def _run_inline_checks(
 
 
 # ---------------------------------------------------------------------------
-# NEW — file deduplication
+# _handle_duplicates — compares against source_pass, not source table
 # ---------------------------------------------------------------------------
-
-
-def _row_hash_expr(cols: list[str], alias: str | None = None) -> str:
-    """Build a DuckDB SQL expression that computes an md5 hash over all given
-    columns, coercing each to VARCHAR. Uses '|' as a separator so that
-    different column values can't accidentally produce the same string.
-
-    When `alias` is provided, will prefix each column with the table alias.
-
-    The alias is used when computing hashes in a JOIN so the correct table's column
-    is referenced — e.g. alias='e' gives CAST(e."price" AS VARCHAR)
-    not CAST("e."price"" AS VARCHAR).
-    """
-    if alias:
-        parts = " || '|' || ".join(
-            [f"COALESCE(CAST({alias}.\"{c}\" AS VARCHAR), '')" for c in cols]
-        )
-    else:
-        parts = " || '|' || ".join(
-            [f"COALESCE(CAST(\"{c}\" AS VARCHAR), '')" for c in cols]
-        )
-    return f"md5({parts})"
-
-
-def _write_flag(
-    conn: duckdb.DuckDBPyConnection,
-    table_name: str,
-    diffs: list[str],
-    pk_value: str | int | float | None = None,
-) -> None:
-    """Insert one conflict entry into flagged_rows.
-
-    id = md5(str(pk_value)) when pk_value is provided — deterministic,
-    computable in DuckDB SQL at export time, no extra columns needed.
-
-    Falls back to uuid4 when pk_value is None (validation check flags).
-    ON CONFLICT (id) DO NOTHING makes this idempotent.
-
-    diffs is a list of "col: old -> new" strings, capped at _MAX_DIFF_COLS.
-    Example: ["price: -50.0 -> 75.0", "region: EMEA -> APAC"]
-    """
-    shown = diffs[:_MAX_DIFF_COLS]
-    leftover = len(diffs) - len(shown)
-    reason = " | ".join(shown) + (f" +{leftover} more" if leftover else "")
-    flag_id = flag_id_for(pk_value=pk_value)
-
-    conn.execute("""
-        INSERT INTO flagged_rows
-            (id, table_name, check_name, reason, flagged_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (id) DO NOTHING
-    """, [
-        flag_id,
-        table_name,
-        "duplicate_conflict",
-        reason,
-        datetime.now(timezone.utc),
-    ])
-
-
-def _changed_columns(
-    existing_row: pd.Series,
-    incoming_row: pd.Series,
-    cols: list[str],
-) -> list[str]:
-    """Return a list of "col: old -> new" diff strings for columns whose
-    values differ between the existing and incoming row.
-    """
-    diffs = []
-    for col in cols:
-        old_val = existing_row.get(col)
-        new_val = incoming_row.get(col)
-        try:
-            old_null = pd.isna(old_val)
-            new_null = pd.isna(new_val)
-        except (TypeError, ValueError):
-            old_null = old_val is None
-            new_null = new_val is None
-        if old_null and new_null:
-            continue
-        if old_null != new_null or old_val != new_val:
-            old_str = "NULL" if old_null else str(old_val)
-            new_str = "NULL" if new_null else str(new_val)
-            diffs.append(f"{col}: {old_str} -> {new_str}")
-            continue
-    return diffs
-
 
 def _handle_duplicates(
     conn: duckdb.DuckDBPyConnection,
@@ -508,22 +313,21 @@ def _handle_duplicates(
     df: pd.DataFrame,
     primary_key: str,
     on_duplicate: Literal["append", "upsert", "skip", "flag"] = "flag",
+    source_file: str = "",
 ) -> tuple[pd.DataFrame, int, int]:
-    """Process incoming rows against existing rows by primary key.
+    """Process incoming rows against source_pass by primary key.
 
-    For flag mode, a single SQL query per chunk categorises every incoming
-    row as 'new', 'identical', or 'conflict' and computes the per-column
-    diff reason string entirely inside DuckDB. Conflicts are then written
-    to flagged_rows in one batched INSERT.
+    Compares incoming row hashes against source_pass (not the source table)
+    to avoid phantom type-mismatch conflicts. Writes conflicts to source_block.
+    Updates source_pass for accepted rows.
 
-    Processes keys in chunks of CHUNK_SIZE to avoid large IN (...) clauses.
-    Returns (rows_to_insert, flagged_count, skipped_count).
+    Returns (rows_to_insert, blocked_count, skipped_count).
 
-    on_duplicate:
-        - append: insert everything, no conflict checking
-        - upsert: replace matching rows
-        - skip: ignore matching rows. Keeps old rows
-        - flag: compare row contents; identical rows are ignored, changed rows are recorded as conflicts
+    on_duplicate modes:
+        append — insert everything, no checking, no source_pass update
+        upsert — overwrite existing; update source_pass when hash changed
+        skip   — ignore rows already in source_pass
+        flag   — identical hash → skip; changed hash → source_block; new → insert
     """
     if on_duplicate == "append":
         return df, 0, 0
@@ -536,312 +340,211 @@ def _handle_duplicates(
         return df, 0, 0
 
     non_null_df = df[df[primary_key].notna()].copy()
-
     if non_null_df.empty:
         return df, 0, 0
 
     comparable_cols = [
-        column for column in non_null_df.columns
-        if column != primary_key and
-           column in get_existing_columns(conn, table) and not
-        str(column).startswith("_")
+        c for c in non_null_df.columns
+        if c != primary_key
+        and c in get_existing_columns(conn, table)
+        and not c.startswith("_")
     ]
 
     rows_to_insert: list[tuple] = []
-    total_flagged = 0
+    pass_records: list[dict] = []
+    total_blocked = 0
     total_skipped = 0
 
     for chunk_start in range(0, len(non_null_df), CHUNK_SIZE):
         chunk = non_null_df.iloc[chunk_start: chunk_start + CHUNK_SIZE]
-        chunk_keys = chunk[primary_key].tolist()
-        placeholders = ", ".join(["?"] * len(chunk_keys))
+        chunk_pk_strs = [str(pk) for pk in chunk[primary_key].tolist()]
 
-        existing_df = conn.execute(
-            f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
-            chunk_keys,
-        ).df()
+        # Compare against source_pass — not the source table
+        existing_hashes = get_source_pass_hashes(conn, table, chunk_pk_strs)
 
-        if existing_df.empty:
-            rows_to_insert.extend(chunk.itertuples(index=False, name=None))
-            continue
-
+        # ── upsert ────────────────────────────────────────────────────────
         if on_duplicate == "upsert":
+            placeholders = ", ".join(["?"] * len(chunk[primary_key].tolist()))
             conn.execute(
                 f'DELETE FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
-                chunk_keys,
+                chunk[primary_key].tolist(),
             )
             rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+            # Update source_pass only when hash changed
+            for _, row in chunk.iterrows():
+                pk_str = str(row[primary_key])
+                row_hash = compute_row_hash(row.to_dict(), comparable_cols)
+                if existing_hashes.get(pk_str) != row_hash:
+                    pass_records.append({
+                        "pk_value": pk_str,
+                        "row_hash": row_hash,
+                        "source_file": source_file,
+                    })
             continue
 
+        # ── skip ──────────────────────────────────────────────────────────
         if on_duplicate == "skip":
-            existing_keys = set(existing_df[primary_key].tolist())
-            keep = chunk[~chunk[primary_key].isin(existing_keys)]
-            skipped = len(chunk) - len(keep)
+            new_rows = chunk[~chunk[primary_key].astype(str).isin(existing_hashes.keys())]
+            skipped = len(chunk) - len(new_rows)
             if skipped:
-                print(f"[skip] {skipped} row(s) already exist — skipped")
-            rows_to_insert.extend(keep.itertuples(index=False, name=None))
+                print(f"[skip] {skipped} row(s) already in source_pass — skipped")
+            rows_to_insert.extend(new_rows.itertuples(index=False, name=None))
             total_skipped += skipped
+            for _, row in new_rows.iterrows():
+                pk_str = str(row[primary_key])
+                pass_records.append({
+                    "pk_value": pk_str,
+                    "row_hash": compute_row_hash(row.to_dict(), comparable_cols),
+                    "source_file": source_file,
+                })
             continue
 
+        # ── flag ──────────────────────────────────────────────────────────
         if on_duplicate == "flag":
             if not comparable_cols:
                 rows_to_insert.extend(chunk.itertuples(index=False, name=None))
                 continue
 
-            dup_existing = len(existing_df) - existing_df[primary_key].nunique()
-            if dup_existing:
-                print(
-                    f"[warn] {dup_existing} duplicate primary key(s) in existing "
-                    f"table — using first occurrence for conflict comparison"
+            conflict_pks: list[str] = []
+            for _, row in chunk.iterrows():
+                pk_str = str(row[primary_key])
+                row_hash = compute_row_hash(row.to_dict(), comparable_cols)
+
+                if pk_str not in existing_hashes:
+                    # New row — insert and track in source_pass
+                    rows_to_insert.append(tuple(row))
+                    pass_records.append({
+                        "pk_value": pk_str,
+                        "row_hash": row_hash,
+                        "source_file": source_file,
+                    })
+                elif existing_hashes[pk_str] == row_hash:
+                    # Identical — skip silently
+                    pass
+                else:
+                    # Changed — block and flag
+                    conflict_pks.append(pk_str)
+
+            if conflict_pks:
+                # Compute diff strings for conflicting rows via DuckDB
+                # (queries source table for current values — only for display purposes)
+                col_diff_exprs = [
+                    f"CASE"
+                    f"  WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__')"
+                    f"    != COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__')"
+                    f"  THEN '{c}: '"
+                    f"    || COALESCE(CAST(e.\"{c}\" AS VARCHAR), 'NULL')"
+                    f"    || ' -> '"
+                    f"    || COALESCE(CAST(c.\"{c}\" AS VARCHAR), 'NULL')"
+                    f"  END"
+                    for c in comparable_cols
+                ]
+                reason_expr = (
+                    "array_to_string(list_filter(["
+                    + ", ".join(col_diff_exprs)
+                    + "], x -> x IS NOT NULL), ' | ')"
                 )
 
-            # Build one CASE WHEN expression per column.
-            # Produces NULL when unchanged, 'col: old -> new' when it differs.
-            # __NULL__ sentinel distinguishes SQL NULL from the string 'NULL'.
-            col_diff_exprs = [
-                f"CASE"
-                f"  WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__')"
-                f"    != COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__')"
-                f"  THEN '{c}: '"
-                f"    || COALESCE(CAST(e.\"{c}\" AS VARCHAR), 'NULL')"
-                f"    || ' -> '"
-                f"    || COALESCE(CAST(c.\"{c}\" AS VARCHAR), 'NULL')"
-                f"  END"
-                for c in comparable_cols
-            ]
+                conflict_chunk = chunk[chunk[primary_key].astype(str).isin(conflict_pks)]
+                placeholders = ", ".join(["?"] * len(conflict_pks))
 
-            # list_filter removes NULLs (unchanged cols),
-            # array_to_string joins the remaining diffs with ' | '
-            reason_expr = (
-                "array_to_string(list_filter(["
-                + ", ".join(col_diff_exprs)
-                + "], x -> x IS NOT NULL), ' | ')"
-            )
+                diff_sql = f"""
+                    SELECT
+                        CAST(c."{primary_key}" AS VARCHAR) AS pk_str,
+                        {reason_expr} AS reason,
+                        array_to_string(list_filter([
+                            {", ".join(
+                                f"CASE WHEN COALESCE(CAST(e.'{c}' AS VARCHAR), '__NULL__') "
+                                f"!= COALESCE(CAST(c.'{c}' AS VARCHAR), '__NULL__') "
+                                f"THEN '{c}' END"
+                                for c in comparable_cols
+                            )}
+                        ], x -> x IS NOT NULL), '|') AS bad_cols
+                    FROM conflict_chunk c
+                    LEFT JOIN (
+                        SELECT DISTINCT ON ("{primary_key}") *
+                        FROM "{table}"
+                        WHERE CAST("{primary_key}" AS VARCHAR) IN ({placeholders})
+                    ) e ON CAST(c."{primary_key}" AS VARCHAR)
+                          = CAST(e."{primary_key}" AS VARCHAR)
+                    WHERE CAST(c."{primary_key}" AS VARCHAR) IN ({placeholders})
+                """
+                try:
+                    diffs_df = conn.execute(diff_sql, conflict_pks + conflict_pks).df()
+                except Exception:
+                    # Fallback: plain reason without diff details
+                    diffs_df = pd.DataFrame({
+                        "pk_str": conflict_pks,
+                        "reason": ["values changed"] * len(conflict_pks),
+                        "bad_cols": [None] * len(conflict_pks),
+                    })
 
-            e_hash = _row_hash_expr(cols=comparable_cols, alias="e")
-            c_hash = _row_hash_expr(cols=comparable_cols, alias="c")
-
-            # Single query categorizes all rows in the chunk.
-            # DISTINCT ON in the subquery handles duplicate existing keys.
-            # chunk_keys passed twice: once for the subquery, once for outer WHERE.
-            classify_sql = f"""
-                SELECT
-                    c."{primary_key}",
-                    CASE
-                        WHEN e."{primary_key}" IS NULL THEN 'new'
-                        WHEN {e_hash} = {c_hash} THEN 'identical'
-                        ELSE 'conflict'
-                    END AS status,
-                    {reason_expr} AS reason
-                FROM chunk c
-                LEFT JOIN (
-                    SELECT DISTINCT ON ("{primary_key}") *
-                    FROM "{table}"
-                    WHERE "{primary_key}" IN ({placeholders})
-                ) e ON CAST(c."{primary_key}" AS VARCHAR)
-                      = CAST(e."{primary_key}" AS VARCHAR)
-                WHERE c."{primary_key}" IN ({placeholders})
-            """
-            classified = conn.execute(classify_sql, chunk_keys + chunk_keys).df()
-
-            # New rows — insert directly, no conflict
-            new_keys = set(
-                classified.loc[classified["status"] == "new", primary_key].tolist()
-            )
-            if new_keys:
-                new_rows = chunk[chunk[primary_key].isin(new_keys)]
-                rows_to_insert.extend(new_rows.itertuples(index=False, name=None))
-
-            # Conflicts — build flags DataFrame and INSERT in one statement.
-            # One round-trip to DuckDB regardless of how many conflicts exist.
-            conflicts = classified[classified["status"] == "conflict"].copy()
-            if not conflicts.empty:
-                flags_df = pd.DataFrame({
-                    "id": conflicts[primary_key].apply(flag_id_for),
-                    "table_name": table,
-                    "check_name": "duplicate_conflict",
-                    "reason": conflicts["reason"].fillna("").str[:500],
-                    "flagged_at": datetime.now(timezone.utc),
-                })
-                conn.execute("""
-                    INSERT INTO flagged_rows
-                        (id, table_name, check_name, reason, flagged_at)
-                    SELECT id, table_name, check_name, reason, flagged_at
-                    FROM flags_df
-                    ON CONFLICT (id) DO NOTHING
-                """)
-                total_flagged += len(conflicts)
-                for key_val, reason_str in zip(
-                    conflicts[primary_key], conflicts["reason"].fillna("")
-                ):
-                    diffs = [d.strip() for d in str(reason_str).split(" | ") if d.strip()]
+                flag_records = []
+                for _, diff_row in diffs_df.iterrows():
+                    pk_str = str(diff_row["pk_str"])
+                    reason = str(diff_row.get("reason", ""))[:500]
+                    bad_cols = str(diff_row.get("bad_cols", "")) or None
+                    flag_records.append(FlagRecord(
+                        id=flag_id_for(pk_str),
+                        table_name=table,
+                        check_name="duplicate_conflict",
+                        pk_value=pk_str,
+                        source_file=source_file,
+                        bad_columns=bad_cols,
+                        reason=reason,
+                    ))
                     print(
-                        f"  [flag] key={key_val} — "
-                        f"{' | '.join(diffs[:3])}{'...' if len(diffs) > 3 else ''}"
+                        f"  [blocked] key={pk_str} — "
+                        f"{reason[:80]}{'...' if len(reason) > 80 else ''}"
                     )
+
+                write_source_flags(conn, flag_records)
+                total_blocked += len(flag_records)
+
             continue
 
+        # Unknown mode
         print(f"[warn] Unknown on_duplicate '{on_duplicate}' — appending chunk")
         rows_to_insert.extend(chunk.itertuples(index=False, name=None))
 
-    # FIXED: previously this block was indented inside the chunk loop,
-    # causing early return after the first chunk for unknown on_duplicate modes.
-    if total_flagged:
-        print(
-            f"[flag] {total_flagged} conflict(s) flagged — original rows kept"
-        )
+    if total_blocked:
+        print(f"[blocked] {total_blocked} conflict(s) → source_block (original rows kept)")
 
-    result = (
+    # Bulk update source_pass for all accepted rows
+    if pass_records:
+        bulk_upsert_source_pass(conn, table, pass_records)
+
+    result_df = (
         pd.DataFrame(rows_to_insert, columns=df.columns)
         if rows_to_insert
         else pd.DataFrame(columns=df.columns)
     )
-    return result, total_flagged, total_skipped
+    return result_df, total_blocked, total_skipped
 
 
-def check_null_overwrites(
-    conn: duckdb.DuckDBPyConnection,
-    table: str,
-    primary_key: str,
-) -> int:
-    """Manual re-check: scan the table for primary keys that appear more than
-    once with different row content, and flag any new conflicts not already
-    recorded in flagged_rows.
-
-    Idempotent — md5(pk_value) + ON CONFLICT DO NOTHING means running twice
-    is safe; already-open flags are silently skipped rather than duplicated.
-    The old LIKE-based duplicate check is removed — UUID idempotency replaces it.
-
-    Returns the number of new conflicts flagged.
-    """
-    duplicate_keys = conn.execute(f"""
-        SELECT "{primary_key}"
-        FROM "{table}"
-        GROUP BY "{primary_key}"
-        HAVING count(*) > 1
-    """).df()
-
-    if duplicate_keys.empty:
-        return 0
-
-    all_cols = conn.execute(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-        [table],
-    ).df()["column_name"].tolist()
-    non_key_cols = [c for c in all_cols if c != primary_key]
-
-    keys = duplicate_keys[primary_key].tolist()
-    flagged = 0
-
-    for chunk_start in range(0, len(keys), CHUNK_SIZE):
-        chunk_keys = keys[chunk_start: chunk_start + CHUNK_SIZE]
-        placeholders = ", ".join(["?"] * len(chunk_keys))
-        rows = conn.execute(
-            f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
-            chunk_keys,
-        ).df()
-
-        for key_val, group in rows.groupby(primary_key):
-            if len(group) < 2:
-                continue
-            first = group.iloc[0]
-            for _, later in group.iloc[1:].iterrows():
-                changed = _changed_columns(first, later, non_key_cols)
-                if not changed:
-                    continue
-                _write_flag(conn, table, changed, pk_value=str(key_val))
-                flagged += 1
-    return flagged
-
-
-def reset_report(table_name: str, db_path: str) -> None:
-    """Drop a report table and clear its ingest_log entries so files are re-ingested.
-
-    This is the implementation backing `vp table-reset`. After calling this,
-    the next `vp ingest` run will recreate the table from source files as if
-    it had never been ingested, including re-applying any transforms.
-
-    :param table_name: The DuckDB table name to reset (from sources_config target_table).
-    :param db_path:    Path to the pipeline DuckDB file.
-    """
-    conn = duckdb.connect(db_path)
-    try:
-        if table_exists(conn, table_name):
-            conn.execute(f'DROP TABLE "{table_name}"')
-            print(f"  [reset] Dropped table '{table_name}'")
-        else:
-            print(f"  [reset] Table '{table_name}' does not exist — nothing to drop")
-
-        # Clear ingest_log so source files are picked up again on next ingest
-        deleted = conn.execute(
-            "DELETE FROM ingest_log WHERE table_name = ? RETURNING filename",
-            [table_name],
-        ).fetchall()
-        if deleted:
-            filenames = [row[0] for row in deleted]
-            print(f"  [reset] Cleared {len(filenames)} ingest_log entry/entries: {', '.join(filenames)}")
-    finally:
-        conn.close()
-
-
-def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
-    """Register all SQL macros found in macros_dir with the DuckDB connection.
-
-    Scans all *.sql files in macros_dir and executes them. Files should contain
-    CREATE OR REPLACE MACRO statements so re-running is idempotent.
-
-    Missing macros_dir produces a warning, not an error — the pipeline continues
-    without macros. Individual file errors are also warned and skipped so one
-    broken macro file doesn't block the whole pipeline.
-
-    :param conn:       An open DuckDB connection to register macros against.
-    :param macros_dir: Path to the directory containing .sql macro files.
-    """
-    p = Path(macros_dir)
-    if not p.exists():
-        print(f"  [warn] macros_dir '{macros_dir}' not found — skipping macro loading")
-        return
-
-    sql_files = sorted(p.glob("*.sql"))
-    if not sql_files:
-        return
-
-    for sql_file in sql_files:
-        try:
-            sql = sql_file.read_text().strip()
-            if sql:
-                conn.execute(sql)
-                print(f"  [macro] Loaded '{sql_file.name}'")
-        except Exception as e:
-            print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")
-
-
-#############################
-# PRE-SCAN FUNCTIONS
-#############################
-
+# ---------------------------------------------------------------------------
+# _load_csv_with_types — DuckDB-native typed CSV loading
+# ---------------------------------------------------------------------------
 
 def _load_csv_with_types(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
     registry_types: dict[str, str],
 ) -> pd.DataFrame:
-    """Load a CSV file via DuckDB with declared column types applied natively.
+    """Load a CSV via DuckDB with declared column types applied natively.
 
-    Uses DuckDB's read_csv with a dtype mapping so type enforcement happens
-    inside DuckDB rather than in pandas. This eliminates float64 artefacts
-    (e.g. 12500.0 for a BIGINT column) that cause phantom duplicate-conflict
-    flags when comparing against DuckDB-stored integer values.
-
-    Columns with a date format suffix (e.g. DATE|%m-%d-%y) are loaded as
-    VARCHAR first, then converted via apply_declared_types — DuckDB's read_csv
-    dtype parameter does not support strptime format strings.
+    Sniffs CSV headers first so only columns that exist in the file are
+    passed to DuckDB's dtype parameter (passing absent columns raises
+    BinderException). Columns with a date format suffix are loaded as
+    VARCHAR first, then converted via apply_declared_types.
 
     :param conn:           Open DuckDB connection.
     :param path:           Path to the CSV file.
     :param registry_types: {column: declared_type} — may include format suffix.
-    :return: DataFrame with columns typed per declared types.
+    :return: DataFrame typed per declared types.
     """
+    from proto_pipe.io.migration import apply_declared_types
+
     with open(path, newline="") as _f:
         csv_columns = set(next(csv.reader(_f)))
 
@@ -852,7 +555,6 @@ def _load_csv_with_types(
         if col not in csv_columns:
             continue
         if "|" in declared_type:
-            # Date with format suffix — load as VARCHAR, convert after
             date_format_cols[col] = declared_type
             dtype[col] = "VARCHAR"
         else:
@@ -866,6 +568,153 @@ def _load_csv_with_types(
     return df
 
 
+# ---------------------------------------------------------------------------
+# _load_excel_with_types — DuckDB spatial extension
+# ---------------------------------------------------------------------------
+
+def _load_excel_with_types(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    registry_types: dict[str, str],
+) -> pd.DataFrame:
+    """Load an Excel file via DuckDB spatial extension with declared types.
+
+    Requires: INSTALL spatial; LOAD spatial (run once at db-init).
+    Falls back to pandas read_excel + apply_declared_types if spatial
+    extension is not available.
+
+    :param conn:           Open DuckDB connection.
+    :param path:           Path to the Excel file.
+    :param registry_types: {column: declared_type} — may include format suffix.
+    :return: DataFrame typed per declared types.
+    """
+    from proto_pipe.io.migration import apply_declared_types
+
+    try:
+        conn.execute("LOAD spatial")
+        df = conn.execute(f"SELECT * FROM read_xlsx('{path}')").df()
+    except Exception:
+        # Spatial extension not available — fall back to pandas
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df = pd.read_excel(path)
+
+    # Apply declared types for date format columns
+    date_format_cols = {col: dt for col, dt in registry_types.items() if "|" in dt and col in df.columns}
+    plain_types = {col: dt for col, dt in registry_types.items() if "|" not in dt and col in df.columns}
+
+    if plain_types or date_format_cols:
+        all_types = {**plain_types, **date_format_cols}
+        df = apply_declared_types(df, all_types)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Row-level TRY_CAST validation
+# ---------------------------------------------------------------------------
+
+def _validate_row_types(
+    conn: duckdb.DuckDBPyConnection,
+    df: pd.DataFrame,
+    registry_types: dict[str, str],
+    table_name: str,
+    primary_key: str | None,
+    source_file: str,
+) -> tuple[pd.DataFrame, int]:
+    """Find rows where any column fails TRY_CAST to its declared type.
+
+    Writes blocked rows to source_block via write_source_flags.
+    Returns (clean_df, blocked_count).
+
+    Runs entirely in DuckDB — no pandas type inference.
+    """
+    if not registry_types:
+        return df, 0
+
+    blocked_pks: dict[str, list[str]] = {}  # pk_str → list[reason strings]
+    blocked_cols: dict[str, list[str]] = {}  # pk_str → list[col names]
+
+    pk_select = (
+        f'CAST("{primary_key}" AS VARCHAR)'
+        if primary_key and primary_key in df.columns
+        else "'unknown'"
+    )
+
+    for col, declared_type in registry_types.items():
+        if col not in df.columns:
+            continue
+        base_type = declared_type.split("|")[0].upper() if "|" in declared_type else declared_type.upper()
+
+        try:
+            if "|" in declared_type:
+                # Date with format suffix — use TRY_STRPTIME
+                _, fmt = declared_type.split("|", 1)
+                failing = conn.execute(f"""
+                    SELECT {pk_select} AS pk_val,
+                           CAST("{col}" AS VARCHAR) AS raw_value
+                    FROM df
+                    WHERE TRY_STRPTIME(CAST("{col}" AS VARCHAR), '{fmt}') IS NULL
+                    AND "{col}" IS NOT NULL
+                    AND CAST("{col}" AS VARCHAR) != ''
+                """).df()
+            else:
+                failing = conn.execute(f"""
+                    SELECT {pk_select} AS pk_val,
+                           CAST("{col}" AS VARCHAR) AS raw_value
+                    FROM df
+                    WHERE TRY_CAST("{col}" AS {base_type}) IS NULL
+                    AND "{col}" IS NOT NULL
+                    AND CAST("{col}" AS VARCHAR) != ''
+                """).df()
+        except Exception as exc:
+            print(f"  [warn] TRY_CAST check failed for column '{col}': {exc}")
+            continue
+
+        for _, row in failing.iterrows():
+            pk_str = str(row["pk_val"]) if row["pk_val"] is not None else "unknown"
+            reason = f"[{col}] '{row['raw_value']}' cannot be cast to {base_type}"
+            blocked_pks.setdefault(pk_str, []).append(reason)
+            blocked_cols.setdefault(pk_str, []).append(col)
+
+    if not blocked_pks:
+        return df, 0
+
+    flag_records = [
+        FlagRecord(
+            id=flag_id_for(pk),
+            table_name=table_name,
+            check_name="type_conflict",
+            pk_value=pk,
+            source_file=source_file,
+            bad_columns="|".join(blocked_cols.get(pk, [])),
+            reason=" | ".join(reasons)[:500],
+        )
+        for pk, reasons in blocked_pks.items()
+    ]
+    blocked_count = write_source_flags(conn, flag_records)
+
+    # Remove bad rows from df
+    if primary_key and primary_key in df.columns:
+        bad_pk_strs = set(blocked_pks.keys())
+        df = df[~df[primary_key].astype(str).isin(bad_pk_strs)].copy()
+    else:
+        # No PK — can't safely remove individual rows; fail the whole batch
+        print(
+            f"  [warn] {blocked_count} row(s) failed type validation but no primary_key "
+            f"defined — cannot remove individual rows. All rows blocked."
+        )
+        return pd.DataFrame(columns=df.columns), blocked_count
+
+    print(f"  [type_conflict] {blocked_count} row(s) blocked → source_block")
+    return df, blocked_count
+
+
+# ---------------------------------------------------------------------------
+# ingest_single_file — primary entry point
+# ---------------------------------------------------------------------------
+
 def ingest_single_file(
     conn: duckdb.DuckDBPyConnection,
     path: Path,
@@ -875,104 +724,149 @@ def ingest_single_file(
     log_status_override: str | None = None,
     strip_pipeline_cols: bool = False,
 ) -> dict:
-    """Process one file for a known source. Returns a summary dict entry.
+    """Process one file for a known source. Returns a summary dict.
 
-    Extracted from ingest_directory to allow direct invocation for correction
-    retries without going through the full directory scan.
+    All data loading goes through DuckDB. Pandas is not used in the data path.
 
     :param conn:                  Open DuckDB connection.
-    :param path:                  Path to the file to ingest.
-    :param source:                Source definition dict from sources_config.yaml.
-    :param on_duplicate_override: When set, overrides source.on_duplicate.
-                                  Pass 'upsert' from vp flagged retry to force
-                                  correction rows to overwrite existing data.
-    :param log_status_override:   When set, overrides the ingest_log status.
-                                  Pass 'correction' from vp flagged retry for
-                                  auditability — corrections are distinguishable
-                                  from normal ingests in ingest_log.
+    :param path:                  Path to the file.
+    :param source:                Source definition from sources_config.yaml.
+    :param mode:                  'append' or 'replace'.
+    :param on_duplicate_override: Overrides source.on_duplicate when set.
+                                  Pass 'upsert' from vp flagged retry.
+    :param log_status_override:   Overrides the ingest_state status when set.
+                                  Pass 'correction' from vp flagged retry.
     :param strip_pipeline_cols:   When True, drops all _-prefixed columns after
                                   load. Pass True from vp flagged retry to strip
-                                  flag metadata columns (_flag_id, _flag_reason,
-                                  etc.) from the correction CSV before ingest.
-    :return: Summary dict: {status, table, rows, new_cols, flagged, skipped}
-             or {status: 'failed', message} on failure.
+                                  _flag_id, _flag_reason, _flag_columns etc.
+    :return: {status, table, rows, new_cols, flagged, skipped} or
+             {status: 'failed', message} on failure.
     """
-    from proto_pipe.io.db import (
-        table_exists as _table_exists,
-        get_registry_types,
-        log_ingest as _log_ingest,
-    )
-    from proto_pipe.pipelines.integrity import (
-        check_type_compatibility,
-        IntegrityResult,
-        write_integrity_flags,
-        _ROW_VALIDATORS,
-    )
-
-    # Load file via pandas — used for structural checks and type compat scan.
-    # CSV files are reloaded via DuckDB after validation passes.
-    try:
-        df = load_file(path)
-    except Exception as exc:
-        message = f"Could not load file: {exc}"
-        print(f"[fail] '{path.name}': {message}")
-        _log_ingest(conn, path.name, None, "failed", message=message)
-        return {"status": "failed", "message": message}
-
-    # Strip all pipeline (_-prefixed) columns when requested.
-    # Used by vp flagged retry to remove flag metadata columns from
-    # the correction CSV (e.g. _flag_id, _flag_reason, _flagged_at)
-    # before re-ingesting through the normal type-check and upsert path.
-    if strip_pipeline_cols:
-        df = df[[c for c in df.columns if not c.startswith("_")]]
-
-    # Structural checks
-    issues = _structural_checks(df, source)
-    if issues:
-        message = "; ".join(issues)
-        print(f"[fail] '{path.name}': {message}")
-        _log_ingest(conn, path.name, source["target_table"], "failed", message=message)
-        return {"status": "failed", "message": message}
-
     table = source["target_table"]
     primary_key = source.get("primary_key")
     on_duplicate = on_duplicate_override or source.get(
         "on_duplicate", "flag" if primary_key else "append"
     )
     is_csv = path.suffix.lower() == ".csv"
+    is_excel = path.suffix.lower() in {".xlsx", ".xls"}
+    source_file = str(path)
 
-    integrity_flagged = 0
+    # ── Step 1: Structural checks from file header ────────────────────────
+    # Check for empty file, missing PK column, missing timestamp column.
+    # All checks run from the file header — no DuckDB or pandas load yet.
+    try:
+        if is_csv:
+            with open(path, newline="") as _f:
+                reader = csv.reader(_f)
+                try:
+                    file_cols = next(reader)
+                    has_data = next(reader, None) is not None
+                except StopIteration:
+                    file_cols = []
+                    has_data = False
+        else:
+            # Excel — peek via DuckDB spatial for column names
+            try:
+                conn.execute("LOAD spatial")
+                peek = conn.execute(
+                    f"SELECT * FROM read_xlsx('{path}') LIMIT 1"
+                ).df()
+                file_cols = list(peek.columns)
+                has_data = len(peek) > 0
+            except Exception:
+                # Fallback to pandas for structural peek only
+                peek = pd.read_excel(path, nrows=1)
+                file_cols = list(peek.columns)
+                has_data = len(peek) > 0
+    except Exception as exc:
+        message = f"Could not read file: {exc}"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    if not has_data:
+        message = "File is empty"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    timestamp_col = source.get("timestamp_col")
+    if timestamp_col and timestamp_col not in file_cols:
+        message = f"Missing required timestamp column '{timestamp_col}'"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    if primary_key and primary_key not in file_cols:
+        message = f"Missing primary key column '{primary_key}'"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    # ── Step 2: Registry type lookup + unknown column check ───────────────
+    user_cols = [c for c in file_cols if not c.startswith("_")]
+    registry_types = get_registry_types(conn, user_cols)
+
+    # Unknown column check — only for normal ingest, not correction path.
+    # Correction path (strip_pipeline_cols=True) uses confirmed registry types
+    # from when the source was first created; new columns in corrections are
+    # not expected and would be unusual.
+    if not strip_pipeline_cols:
+        unknown_cols = [c for c in user_cols if c not in registry_types]
+        if unknown_cols:
+            message = (
+                f"Unknown column(s) with no declared type: {', '.join(sorted(unknown_cols))}. "
+                f"Run 'vp edit column-type' to confirm the type(s), then re-ingest."
+            )
+            print(f"[fail] '{path.name}': {message}")
+            log_ingest_state(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
+
+    # ── Step 3: Load via DuckDB ───────────────────────────────────────────
+    try:
+        if is_csv:
+            df = _load_csv_with_types(conn, path, registry_types)
+        else:
+            df = _load_excel_with_types(conn, path, registry_types)
+    except Exception as exc:
+        message = f"Could not load file via DuckDB: {exc}"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    # Strip pipeline columns for correction path
+    if strip_pipeline_cols:
+        df = df[[c for c in df.columns if not c.startswith("_")]]
+
+    # ── Step 4: NULL primary key check ───────────────────────────────────
+    if primary_key and primary_key in df.columns:
+        null_count = conn.execute(
+            f'SELECT count(*) FROM df WHERE "{primary_key}" IS NULL'
+        ).fetchone()[0]
+        if null_count:
+            message = (
+                f"{null_count} row(s) have NULL in primary key '{primary_key}' — file rejected"
+            )
+            print(f"[fail] '{path.name}': {message}")
+            log_ingest_state(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
+
+    # ── Step 5: Row-level TRY_CAST validation ────────────────────────────
+    # Find rows where any column fails to cast to its declared type.
+    # Bad rows → source_block. Clean rows proceed.
+    df, blocked_count = _validate_row_types(
+        conn, df, registry_types, table, primary_key, source_file
+    )
+
+    # Add pipeline timestamp
+    df["_ingested_at"] = datetime.now(timezone.utc)
+
     new_cols: list[str] = []
     flagged_count = 0
     skipped_count = 0
 
-    # ── Scenario A: first ingest ──────────────────────────────────────────
-    if mode == "replace" or not _table_exists(conn, table):
-        user_cols = [c for c in df.columns if not c.startswith("_")]
-        registry_types = get_registry_types(conn, user_cols)
-
-        if registry_types:
-            type_issues = check_type_compatibility(
-                df, registry_types, conn, primary_key
-            )
-            if type_issues:
-                cols_affected = sorted({i.column for i in type_issues})
-                message = (
-                    f"Type mismatch for column(s): {', '.join(cols_affected)}. "
-                    f"Fix the file values or run 'vp edit source' to review "
-                    f"the registered types."
-                )
-                print(f"[fail] '{path.name}': {message}")
-                _log_ingest(conn, path.name, table, "failed", message=message)
-                return {"status": "failed", "message": message}
-
-            if is_csv:
-                df = _load_csv_with_types(conn, path, registry_types)
-            else:
-                df = apply_declared_types(df, registry_types)
-
-        df["_ingested_at"] = datetime.now(timezone.utc)
-
+    # ── Scenario A: first ingest or replace mode ──────────────────────────
+    if mode == "replace" or not table_exists(conn, table):
         try:
             conn.execute(f'DROP TABLE IF EXISTS "{table}"')
             conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
@@ -980,48 +874,33 @@ def ingest_single_file(
         except Exception as exc:
             message = f"DuckDB write failed: {exc}"
             print(f"[fail] '{path.name}': {message}")
-            _log_ingest(conn, path.name, table, "failed", message=message)
+            log_ingest_state(conn, path.name, table, "failed", message=message)
             return {"status": "failed", "message": message}
+
+        # Seed source_pass for all inserted rows
+        if primary_key and primary_key in df.columns and not df.empty:
+            comparable_cols = [
+                c for c in df.columns
+                if not c.startswith("_") and c != primary_key
+            ]
+            pass_records = [
+                {
+                    "pk_value": str(row[primary_key]),
+                    "row_hash": compute_row_hash(row.to_dict(), comparable_cols),
+                    "source_file": source_file,
+                }
+                for _, row in df.iterrows()
+            ]
+            bulk_upsert_source_pass(conn, table, pass_records)
 
     # ── Scenario B: subsequent ingest ─────────────────────────────────────
     else:
-        user_cols = [c for c in df.columns if not c.startswith("_")]
-        registry_types = get_registry_types(conn, user_cols)
-
-        if registry_types:
-            if is_csv:
-                df = _load_csv_with_types(conn, path, registry_types)
-            else:
-                df = apply_declared_types(df, registry_types)
-
-        df["_ingested_at"] = datetime.now(timezone.utc)
-
-        integrity_issues: list[IntegrityResult] = []
-        for validator in _ROW_VALIDATORS:
-            issues = validator(conn, table, df, primary_key)
-            for issue in issues:
-                issue.filename = path.name
-            integrity_issues.extend(issues)
-
-        if integrity_issues:
-            integrity_flagged = write_integrity_flags(conn, table, integrity_issues)
-            if primary_key:
-                bad_pks = {
-                    i.pk_value for i in integrity_issues if i.pk_value is not None
-                }
-                if bad_pks:
-                    df = df[~df[primary_key].astype(str).isin(bad_pks)].copy()
-            print(
-                f"  [integrity] {integrity_flagged} row(s) flagged for type conflicts "
-                f"— see flagged_rows for details"
-            )
-
         try:
             new_cols = auto_migrate(conn, table, df)
 
             if primary_key:
                 df, flagged_count, skipped_count = _handle_duplicates(
-                    conn, table, df, primary_key, on_duplicate
+                    conn, table, df, primary_key, on_duplicate, source_file
                 )
             else:
                 if on_duplicate not in ("append", "flag"):
@@ -1039,22 +918,168 @@ def ingest_single_file(
             print(
                 f"[ok] '{path.name}' → '{table}' "
                 f"({len(df)} inserted, "
-                f"{flagged_count + integrity_flagged} flagged, "
+                f"{flagged_count + blocked_count} blocked, "
                 f"{skipped_count} skipped)"
             )
         except Exception as exc:
             message = f"DuckDB write failed: {exc}"
             print(f"[fail] '{path.name}': {message}")
-            _log_ingest(conn, path.name, table, "failed", message=message)
+            log_ingest_state(conn, path.name, table, "failed", message=message)
             return {"status": "failed", "message": message}
 
     final_status = log_status_override or "ok"
-    _log_ingest(conn, path.name, table, final_status, rows=len(df), new_cols=new_cols)
+    log_ingest_state(
+        conn, path.name, table, final_status,
+        rows=len(df), new_cols=new_cols
+    )
     return {
         "status": "ok",
         "table": table,
         "rows": len(df),
         "new_cols": new_cols,
-        "flagged": flagged_count + integrity_flagged,
+        "flagged": flagged_count + blocked_count,
         "skipped": skipped_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# Utility commands
+# ---------------------------------------------------------------------------
+
+def check_null_overwrites(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    primary_key: str,
+) -> int:
+    """Scan the table for primary keys that appear more than once with
+    different row content. Flags new conflicts to source_block.
+
+    Returns the number of new conflicts flagged.
+    """
+    duplicate_keys = conn.execute(f"""
+        SELECT "{primary_key}"
+        FROM "{table}"
+        GROUP BY "{primary_key}"
+        HAVING count(*) > 1
+    """).df()
+
+    if duplicate_keys.empty:
+        return 0
+
+    all_cols = conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        [table],
+    ).df()["column_name"].tolist()
+    non_key_cols = [
+        c for c in all_cols
+        if c != primary_key and not c.startswith("_")
+    ]
+
+    keys = duplicate_keys[primary_key].tolist()
+    flag_records: list[FlagRecord] = []
+
+    for chunk_start in range(0, len(keys), CHUNK_SIZE):
+        chunk_keys = keys[chunk_start: chunk_start + CHUNK_SIZE]
+        placeholders = ", ".join(["?"] * len(chunk_keys))
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
+            chunk_keys,
+        ).df()
+
+        for key_val, group in rows.groupby(primary_key):
+            if len(group) < 2:
+                continue
+            first = group.iloc[0]
+            for _, later in group.iloc[1:].iterrows():
+                diffs = []
+                for col in non_key_cols:
+                    old_val = first.get(col)
+                    new_val = later.get(col)
+                    try:
+                        old_null = pd.isna(old_val)
+                        new_null = pd.isna(new_val)
+                    except (TypeError, ValueError):
+                        old_null = old_val is None
+                        new_null = new_val is None
+                    if old_null and new_null:
+                        continue
+                    if old_null != new_null or old_val != new_val:
+                        old_str = "NULL" if old_null else str(old_val)
+                        new_str = "NULL" if new_null else str(new_val)
+                        diffs.append(f"{col}: {old_str} -> {new_str}")
+
+                if diffs:
+                    shown = diffs[:_MAX_DIFF_COLS]
+                    leftover = len(diffs) - len(shown)
+                    reason = " | ".join(shown)
+                    if leftover:
+                        reason += f" +{leftover} more"
+                    flag_records.append(FlagRecord(
+                        id=flag_id_for(str(key_val)),
+                        table_name=table,
+                        check_name="duplicate_conflict",
+                        pk_value=str(key_val),
+                        bad_columns=None,
+                        reason=reason,
+                    ))
+
+    if flag_records:
+        write_source_flags(conn, flag_records)
+
+    return len(flag_records)
+
+
+def reset_report(table_name: str, db_path: str) -> None:
+    """Drop a report table and clear its ingest_state entries so files are re-ingested.
+
+    After calling this, the next vp ingest run will recreate the table
+    from source files as if it had never been ingested.
+    """
+    conn = duckdb.connect(db_path)
+    try:
+        if table_exists(conn, table_name):
+            conn.execute(f'DROP TABLE "{table_name}"')
+            print(f"  [reset] Dropped table '{table_name}'")
+        else:
+            print(f"  [reset] Table '{table_name}' does not exist — nothing to drop")
+
+        deleted = conn.execute(
+            "DELETE FROM ingest_state WHERE table_name = ? RETURNING filename",
+            [table_name],
+        ).fetchall()
+        if deleted:
+            filenames = [row[0] for row in deleted]
+            print(
+                f"  [reset] Cleared {len(filenames)} ingest_state entry/entries: "
+                f"{', '.join(filenames)}"
+            )
+
+        # Also clear source_pass for this table
+        from proto_pipe.io.db import clear_source_pass_for_table
+        cleared = clear_source_pass_for_table(conn, table_name)
+        if cleared:
+            print(f"  [reset] Cleared {cleared} source_pass entry/entries")
+
+    finally:
+        conn.close()
+
+
+def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
+    """Register all SQL macros found in macros_dir with the DuckDB connection."""
+    p = Path(macros_dir)
+    if not p.exists():
+        print(f"  [warn] macros_dir '{macros_dir}' not found — skipping macro loading")
+        return
+
+    sql_files = sorted(p.glob("*.sql"))
+    if not sql_files:
+        return
+
+    for sql_file in sql_files:
+        try:
+            sql = sql_file.read_text().strip()
+            if sql:
+                conn.execute(sql)
+                print(f"  [macro] Loaded '{sql_file.name}'")
+        except Exception as e:
+            print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")

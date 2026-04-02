@@ -33,7 +33,7 @@ from ..io.config import config_path_or_override, load_config
 def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     """Scan the incoming directory and load matching files into DuckDB.
 
-    Failures are logged to ingest_log and skipped — the run continues.
+    Failures are logged to ingest_state and skipped — the run continues.
     New tables are created lazily if they weren't present at db-init.
     New columns are auto-migrated without touching existing rows.
 
@@ -76,11 +76,11 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
 
     click.echo(
         f"\n  {ok} loaded, {skipped} skipped, {failed} failed, "
-        f"{flagged} row conflict(s) flagged — see ingest_log for details."
+        f"{flagged} row conflict(s) flagged — see ingest_state for details."
     )
 
     if failed:
-        click.echo("Run: vp ingest-log --status failed  to see failure reasons.")
+        click.echo("Run: vp ingest-log --status failed  to see failure reasons (queries ingest_state).")
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +101,8 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
 def ingest_log(status, table, limit, pipeline_db):
     """Show recent ingest attempts — including failures and their reasons.
 
-    Use this after `vp ingest` reports failures to find out why a file
-    didn't load. Filter by --status failed to focus on problems only.
+    Queries the ingest_state table (was: ingest_log). Use after `vp ingest`
+    to find out why a file didn't load. Filter by --status failed for problems.
 
     \b
     Examples:
@@ -118,7 +118,7 @@ def ingest_log(status, table, limit, pipeline_db):
     try:
         query = """
                  SELECT filename, table_name, status, rows, message, ingested_at
-                 FROM ingest_log
+                 FROM ingest_state
                  WHERE 1=1 \
                  """
         params = []
@@ -156,7 +156,7 @@ def ingest_log(status, table, limit, pipeline_db):
             click.echo()
 
     except Exception as e:
-        click.echo(f"[error] Could not read ingest_log: {e}")
+        click.echo(f"[error] Could not read ingest_state: {e}")
         click.echo("Has `vp db-init` been run yet?")
     finally:
         conn.close()
@@ -178,35 +178,20 @@ def ingest_log(status, table, limit, pipeline_db):
     help="append: add rows. replace: rebuild table from this file.",
 )
 def update_table(table, filepath, pipeline_db, sources_config, mode):
-    """Updates the data table in the pipeline database based on the provided file and configuration.
-    This function processes updates to a specific database table by ingesting data from a file.
-    It supports two modes: appending to the existing table or replacing the table's contents
-    entirely. The function also handles schema migration for the database table if necessary.
+    """Load a single file into a table without scanning the incoming directory.
 
-    Use this to manually load a single file without scanning the whole
-    incoming directory. Respects the same append/replace modes as ingest.
-
-    :param table: Name of the target database table to update
-    :param filepath: Path to the file containing data to ingest
-    :param pipeline_db: (Optional) Custom path to the DuckDB pipeline database.
-        If not provided, the default location is used
-    :param sources_config: (Optional) Path to the YAML file defining source configurations.
-        If not provided, the default configuration path is used
-    :param mode: Operation mode for updating the table. Choices are "append" to add new rows
-        and "replace" to recreate the table. The default mode is "append"
+    Routes through the full ingest path — type validation, source_pass
+    tracking, and ingest_state logging all apply. Equivalent to dropping
+    the file in incoming_dir and running vp ingest, but targeted.
 
     \b
-    Example:
-        - `vp update-table sales data/incoming/sales_2026-03.csv`
-        - `vp update-table sales data/incoming/sales_2026-03.csv --mode replace`
+    Examples:
+      vp update-table van data/incoming/van_2026-03.csv
+      vp update-table van data/incoming/van_2026-03.csv --mode replace
     """
     import duckdb
 
-    from proto_pipe.io.ingest import (
-        load_file,
-    )
-    from ..io.migration import auto_migrate
-    from ..io.db import table_exists, log_ingest, init_ingest_log
+    from proto_pipe.io.ingest import ingest_single_file
     from ..io.config import load_config
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -222,29 +207,29 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
 
     if table not in sources:
         click.echo(f"[error] No source defined for table '{table}' in sources_config.yaml")
+        click.echo("  Run: vp new source — to configure this table as a source.")
         return
 
-    try:
-        df = load_file(path)
-    except Exception as e:
-        click.echo(f"[error] Could not load '{filepath}': {e}")
-        return
-
+    source = sources[table]
     conn = duckdb.connect(p_db)
-    init_ingest_log(conn)
+    try:
+        result = ingest_single_file(conn, path, source, mode=mode)
+    finally:
+        conn.close()
 
-    if mode == "replace" or not table_exists(conn, table):
-        conn.execute(f'DROP TABLE IF EXISTS "{table}"')
-        conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
-        new_cols = []
-        click.echo(f"[ok] '{table}' replaced from '{path.name}' ({len(df)} rows)")
+    if result["status"] == "ok":
+        action = "replaced" if mode == "replace" else "updated"
+        click.echo(
+            f"[ok] '{table}' {action} from '{path.name}' "
+            f"({result['rows']} inserted, {result['flagged']} blocked, "
+            f"{result['skipped']} skipped)"
+        )
+        if result.get("new_cols"):
+            click.echo(f"  New columns added: {', '.join(result['new_cols'])}")
+        if result["flagged"]:
+            click.echo(f"  Run: vp flagged --table {table}")
     else:
-        new_cols = auto_migrate(conn, table, df)
-        conn.execute(f'INSERT INTO "{table}" SELECT * FROM df')
-        click.echo(f"[ok] '{table}' updated from '{path.name}' ({len(df)} rows appended)")
-
-    log_ingest(conn, path.name, table, "ok", rows=len(df), new_cols=new_cols)
-    conn.close()
+        click.echo(f"[error] {result.get('message', 'Ingest failed')}")
 
 
 # ---------------------------------------------------------------------------

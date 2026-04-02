@@ -16,7 +16,7 @@ import pandas as pd
 import pytest
 
 from proto_pipe.cli.scaffold import _filter_uningested
-from proto_pipe.io.db import init_ingest_log, get_column_types
+from proto_pipe.io.db import get_column_types
 from proto_pipe.io.ingest import (
     ingest_directory,
 )

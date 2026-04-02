@@ -280,8 +280,8 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
     Examples:
       vp table # select table interactively
       vp table sales # view sales table
-      vp table flagged_rows --edit # edit flagged rows inline
-      vp table ingest_log --export ingest_log.csv
+      vp table source_block --edit # edit blocked rows inline
+      vp table ingest_state --export ingest_state.csv
     """
     import questionary
 
