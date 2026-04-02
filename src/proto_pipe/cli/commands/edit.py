@@ -557,7 +557,7 @@ def edit_column_type(pipeline_db, diff):
         if not conflicting:
             click.echo("  No column type conflicts found — all sources agree.")
             return
-        df = df[df["column_name"].isin(conflicting)].copy()
+        df = df[df["column_name"].isin(conflicting)].reset_index(drop=True).copy()
         click.echo(
             f"\n── Column Type Conflicts ──── {len(conflicting)} column(s), "
             f"{len(df)} entries ────────────────"
