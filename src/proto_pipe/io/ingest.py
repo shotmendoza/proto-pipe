@@ -459,8 +459,8 @@ def _handle_duplicates(
                         {reason_expr} AS reason,
                         array_to_string(list_filter([
                             {", ".join(
-                                f"CASE WHEN COALESCE(CAST(e.'{c}' AS VARCHAR), '__NULL__') "
-                                f"!= COALESCE(CAST(c.'{c}' AS VARCHAR), '__NULL__') "
+                                f"CASE WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__') "
+                                f"!= COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__') "
                                 f"THEN '{c}' END"
                                 for c in comparable_cols
                             )}
@@ -560,19 +560,13 @@ def _load_csv_with_types(
     }
 
     if registry_types:
-        # Use all_varchar so DuckDB doesn't hard-fail on bad values.
-        # TRY_CAST validation happens in _validate_row_types.
+        # Load as all-varchar so DuckDB never hard-fails on bad values.
+        # apply_declared_types + row filtering happen in ingest_single_file
+        # AFTER _validate_row_types has blocked bad rows.
         df = conn.read_csv(str(path), all_varchar=True).df()
     else:
         # No declared types — let DuckDB infer column types naturally.
         df = conn.read_csv(str(path)).df()
-        return df
-
-    # Apply date-format + plain type coercions.
-    plain_types = {col: t for col, t in registry_types.items()
-                   if col in df.columns and "|" not in t}
-    if plain_types or date_format_cols:
-        df = apply_declared_types(df, {**plain_types, **date_format_cols})
 
     return df
 
@@ -856,11 +850,36 @@ def ingest_single_file(
             return {"status": "failed", "message": message}
 
     # ── Step 5: Row-level TRY_CAST validation ────────────────────────────
-    # Find rows where any column fails to cast to its declared type.
-    # Bad rows → source_block. Clean rows proceed.
+    # When no registry types are declared but the table already exists,
+    # use the table's own column types to validate incoming values.
+    effective_types = dict(registry_types)
+    if not effective_types and table_exists(conn, table):
+        from proto_pipe.io.db import get_column_types
+        existing_table_types = get_column_types(conn, table)
+        effective_types = {
+            col: t for col, t in existing_table_types.items()
+            if col in file_cols and not col.startswith("_")
+        }
+
     df, blocked_count = _validate_row_types(
-        conn, df, registry_types, table, primary_key, source_file
+        conn, df, effective_types, table, primary_key, source_file
     )
+
+    # Apply declared types to clean rows so DuckDB INSERT succeeds.
+    # Done here, AFTER bad rows are removed, so apply_declared_types never
+    # sees values like "N/A" that would be silently coerced to NULL.
+    if effective_types and not df.empty:
+        from proto_pipe.io.migration import apply_declared_types
+        plain_types = {
+            col: t for col, t in effective_types.items()
+            if col in df.columns and "|" not in t
+        }
+        date_fmt_types = {
+            col: t for col, t in effective_types.items()
+            if col in df.columns and "|" in t
+        }
+        if plain_types or date_fmt_types:
+            df = apply_declared_types(df, {**plain_types, **date_fmt_types})
 
     # Add pipeline timestamp
     df["_ingested_at"] = datetime.now(timezone.utc)

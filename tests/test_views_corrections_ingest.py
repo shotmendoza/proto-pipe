@@ -15,7 +15,12 @@ import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.io.db import already_ingested, flag_id_for, init_ingest_state
+from proto_pipe.io.db import (
+    already_ingested,
+    flag_id_for,
+    init_ingest_state,
+    log_ingest_state,
+)
 from proto_pipe.reports.corrections import import_corrections, export_flagged
 from proto_pipe.io.db import init_all_pipeline_tables, init_ingest_state
 from proto_pipe.reports.views import (
@@ -24,6 +29,10 @@ from proto_pipe.reports.views import (
     load_views_config,
     _load_sql,
 )
+
+
+# Compat alias — log_ingest_state was log_ingest in older API
+log_ingest = log_ingest_state
 
 
 # ---------------------------------------------------------------------------
@@ -367,15 +376,7 @@ class TestExportFlagged:
 
     def test_raises_if_table_is_empty(self, conn, tmp_path):
         conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
-        conn.execute("""
-            CREATE TABLE flagged_rows (
-                id         VARCHAR PRIMARY KEY,
-                table_name VARCHAR NOT NULL,
-                check_name VARCHAR,
-                reason     VARCHAR,
-                flagged_at TIMESTAMPTZ NOT NULL
-            )
-        """)
+        init_all_pipeline_tables(conn)  # creates source_block
         _flag_row(conn, "sales", "ORD-EMPTY", "test")
         output = str(tmp_path / "flagged.csv")
         with pytest.raises(ValueError, match="No source rows matched"):

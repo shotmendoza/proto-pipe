@@ -59,7 +59,7 @@ def export_flagged(
     ).fetchone()[0]
 
     if flag_count == 0:
-        raise ValueError(f"No blocked rows found for table '{table_name}'")
+        raise ValueError(f"No flagged rows found for table '{table_name}'")
 
     source_df = conn.execute(f"""
         SELECT

@@ -508,15 +508,21 @@ def run_report(
                     failing_mask = None
                     failing_count = 0
 
-                if failing_count > 0 and pk_col and pk_col in pending_df.columns and failing_mask is not None:
+                if failing_count > 0 and failing_mask is not None:
                     failing_df = pending_df[failing_mask]
                     flag_records = [
                         FlagRecord(
-                            id=flag_id_for(str(row[pk_col])),
+                            id=flag_id_for(
+                                str(row[pk_col]) if pk_col and pk_col in pending_df.columns
+                                else None
+                            ),
                             table_name=target_table,
                             report_name=report_name,
                             check_name=check_name,
-                            pk_value=str(row[pk_col]),
+                            pk_value=(
+                                str(row[pk_col]) if pk_col and pk_col in pending_df.columns
+                                else None
+                            ),
                             reason=f"Check '{check_name}' failed",
                         )
                         for _, row in failing_df.iterrows()
