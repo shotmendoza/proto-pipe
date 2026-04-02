@@ -491,38 +491,47 @@ def run_report(
         context = {"df": pending_df}
         results: dict[str, dict] = {}
 
+        from proto_pipe.checks.result import CheckResult as _CheckResult
+
         for check_name in check_names:
             try:
                 result = check_registry.run(check_name, context)
-                if isinstance(result, pd.Series) and result.dtype == bool:
+                # check_registry.run() returns CheckResult; extract failing mask
+                if isinstance(result, _CheckResult):
+                    failing_mask = result.mask  # Series[bool], True = row failed
+                    failing_count = int(failing_mask.sum()) if failing_mask is not None else 0
+                elif isinstance(result, pd.Series) and result.dtype == bool:
+                    # Legacy path — series where True = row passed
                     failing_mask = ~result
                     failing_count = int(failing_mask.sum())
-
-                    if failing_count > 0 and pk_col and pk_col in pending_df.columns:
-                        failing_df = pending_df[failing_mask]
-                        flag_records = [
-                            FlagRecord(
-                                id=flag_id_for(str(row[pk_col])),
-                                table_name=target_table,
-                                report_name=report_name,
-                                check_name=check_name,
-                                pk_value=str(row[pk_col]),
-                                reason=f"Check '{check_name}' failed",
-                            )
-                            for _, row in failing_df.iterrows()
-                        ]
-                        write_validation_flags(conn, flag_records)
-                        print(
-                            f"  [check] '{check_name}' — "
-                            f"{failing_count} failure(s) → validation_block"
-                        )
-
-                    results[check_name] = {
-                        "status": "failed" if failing_count > 0 else "passed",
-                        "failed_count": failing_count,
-                    }
                 else:
-                    results[check_name] = {"status": "passed", "failed_count": 0}
+                    failing_mask = None
+                    failing_count = 0
+
+                if failing_count > 0 and pk_col and pk_col in pending_df.columns and failing_mask is not None:
+                    failing_df = pending_df[failing_mask]
+                    flag_records = [
+                        FlagRecord(
+                            id=flag_id_for(str(row[pk_col])),
+                            table_name=target_table,
+                            report_name=report_name,
+                            check_name=check_name,
+                            pk_value=str(row[pk_col]),
+                            reason=f"Check '{check_name}' failed",
+                        )
+                        for _, row in failing_df.iterrows()
+                    ]
+                    write_validation_flags(conn, flag_records)
+                    print(
+                        f"  [check] '{check_name}' — "
+                        f"{failing_count} failure(s) → validation_block"
+                    )
+
+                results[check_name] = {
+                    "status": "failed" if failing_count > 0 else "passed",
+                    "result": result if isinstance(result, _CheckResult) else None,
+                    "failed_count": failing_count,
+                }
 
             except Exception as e:
                 print(f"  [check-fail] '{check_name}': {e}")

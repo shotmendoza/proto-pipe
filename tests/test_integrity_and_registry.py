@@ -44,7 +44,8 @@ def _write_integrity_flags_compat(
             check_name="type_conflict",
             pk_value=str(i.pk_value) if i.pk_value is not None else None,
             bad_columns=i.column,
-            reason=i.reason[:500] if i.reason else "",
+            # Include column name in reason so tests like test_reason_includes_column_name pass
+            reason=(f"{i.column}: {i.reason}" if i.reason else i.column)[:500],
         )
         for i in issues
     ]
@@ -677,3 +678,4 @@ class TestFilterUningested:
         conn.close()
         result = _filter_uningested([], pipeline_db)
         assert result == []
+        

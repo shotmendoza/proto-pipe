@@ -225,6 +225,11 @@ def ingest_directory(
     conn = duckdb.connect(db_path)
     _init_ingest_state(conn)
 
+    # Ensure all pipeline tables (source_pass, source_block, validation_block, …)
+    # exist regardless of whether the caller ran init_db first.
+    from proto_pipe.io.db import init_all_pipeline_tables as _init_all
+    _init_all(conn)
+
     summary: dict[str, dict] = {}
     unmatched: list[str] = []
 
@@ -531,12 +536,13 @@ def _load_csv_with_types(
     path: Path,
     registry_types: dict[str, str],
 ) -> pd.DataFrame:
-    """Load a CSV via DuckDB with declared column types applied natively.
+    """Load a CSV via DuckDB with declared column types applied.
 
-    Sniffs CSV headers first so only columns that exist in the file are
-    passed to DuckDB's dtype parameter (passing absent columns raises
-    BinderException). Columns with a date format suffix are loaded as
-    VARCHAR first, then converted via apply_declared_types.
+    When registry_types is non-empty, loads with all_varchar=True so DuckDB
+    never hard-fails on bad values (e.g. "N/A" in a BIGINT column).
+    _validate_row_types then does row-level TRY_CAST and sends bad rows to
+    source_block. When registry_types is empty, falls back to DuckDB type
+    inference.
 
     :param conn:           Open DuckDB connection.
     :param path:           Path to the CSV file.
@@ -548,29 +554,27 @@ def _load_csv_with_types(
     with open(path, newline="") as _f:
         csv_columns = set(next(csv.reader(_f)))
 
-    dtype: dict[str, str] = {}
-    date_format_cols: dict[str, str] = {}
+    date_format_cols: dict[str, str] = {
+        col: t for col, t in registry_types.items()
+        if col in csv_columns and "|" in t
+    }
 
-    for col, declared_type in registry_types.items():
-        if col not in csv_columns:
-            continue
-        if "|" in declared_type:
-            date_format_cols[col] = declared_type
-            dtype[col] = "VARCHAR"
-        else:
-            dtype[col] = declared_type
+    if registry_types:
+        # Use all_varchar so DuckDB doesn't hard-fail on bad values.
+        # TRY_CAST validation happens in _validate_row_types.
+        df = conn.read_csv(str(path), all_varchar=True).df()
+    else:
+        # No declared types — let DuckDB infer column types naturally.
+        df = conn.read_csv(str(path)).df()
+        return df
 
-    df = conn.read_csv(str(path), dtype=dtype).df()
-
-    if date_format_cols:
-        df = apply_declared_types(df, date_format_cols)
+    # Apply date-format + plain type coercions.
+    plain_types = {col: t for col, t in registry_types.items()
+                   if col in df.columns and "|" not in t}
+    if plain_types or date_format_cols:
+        df = apply_declared_types(df, {**plain_types, **date_format_cols})
 
     return df
-
-
-# ---------------------------------------------------------------------------
-# _load_excel_with_types — DuckDB spatial extension
-# ---------------------------------------------------------------------------
 
 def _load_excel_with_types(
     conn: duckdb.DuckDBPyConnection,
@@ -811,7 +815,7 @@ def ingest_single_file(
     # Correction path (strip_pipeline_cols=True) uses confirmed registry types
     # from when the source was first created; new columns in corrections are
     # not expected and would be unusual.
-    if not strip_pipeline_cols:
+    if not strip_pipeline_cols and registry_types:
         unknown_cols = [c for c in user_cols if c not in registry_types]
         if unknown_cols:
             message = (
@@ -1083,3 +1087,4 @@ def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
                 print(f"  [macro] Loaded '{sql_file.name}'")
         except Exception as e:
             print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")
+            

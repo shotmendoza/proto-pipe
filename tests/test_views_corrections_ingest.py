@@ -15,8 +15,9 @@ import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.io.db import  already_ingested, flag_id_for
+from proto_pipe.io.db import already_ingested, flag_id_for, init_ingest_state
 from proto_pipe.reports.corrections import import_corrections, export_flagged
+from proto_pipe.io.db import init_all_pipeline_tables, init_ingest_state
 from proto_pipe.reports.views import (
     create_views,
     refresh_views,
@@ -32,16 +33,17 @@ from proto_pipe.reports.views import (
 def _validation_flag_row(
     conn, table_name: str, pk_value: str, check_name: str, reason: str
 ) -> str:
-    """Insert a validation_flags entry and return its id."""
-    import uuid
-    flag_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"test_report:{check_name}:{pk_value}"))
+    """Insert a validation_block entry and return its id."""
+    import hashlib
+    key = f"test_report:{check_name}:{pk_value}"
+    flag_id = hashlib.md5(key.encode()).hexdigest()
     conn.execute("""
-        INSERT INTO validation_flags
-            (id, report_name, check_name, table_name, pk_col, pk_value, reason, flagged_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO validation_block
+            (id, table_name, report_name, check_name, pk_value, reason, flagged_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO NOTHING
-    """, [flag_id, "test_report", check_name, table_name,
-          "order_id", pk_value, reason, datetime.now(timezone.utc)])
+    """, [flag_id, table_name, "test_report", check_name,
+          pk_value, reason, datetime.now(timezone.utc)])
     return flag_id
 
 @pytest.fixture
@@ -68,30 +70,22 @@ def conn_with_sales(conn):
             ('ORD-003', 200.0, 'EMEA',  'inactive'),
             ('ORD-004', 0.0,   'LATAM', 'active')
     """)
-    conn.execute("""
-        CREATE TABLE flagged_rows (
-            id         VARCHAR PRIMARY KEY,
-            table_name VARCHAR NOT NULL,
-            row_index  INTEGER,
-            check_name VARCHAR,
-            reason     VARCHAR,
-            flagged_at TIMESTAMPTZ NOT NULL
-        )
-    """)
+    # Bootstrap all pipeline tables including source_block (was flagged_rows)
+    init_all_pipeline_tables(conn)
     return conn
 
 
 @pytest.fixture
 def conn_with_ingest_log(conn):
-    """Connection with ingest_log table bootstrapped."""
-    init_ingest_log(conn)
+    """Connection with ingest_state table bootstrapped."""
+    init_ingest_state(conn)
     return conn
 
 
 @pytest.fixture
 def conn_with_sales_and_validation(conn_with_sales):
-    """conn_with_sales extended with the validation_flags table."""
-    init_validation_flags_table(conn_with_sales)
+    """conn_with_sales extended with the validation_block table."""
+    init_all_pipeline_tables(conn_with_sales)
     return conn_with_sales
 
 
@@ -116,13 +110,13 @@ def _write_views_config(tmp_path: Path, views: list[dict]) -> str:
 
 
 def _flag_row(conn, table_name: str, pk_value: str, reason: str) -> str:
-    """Insert a flagged_rows entry using md5(pk_value) as the id and return it."""
+    """Insert a source_block entry using md5(pk_value) as the id and return it."""
     flag_id = flag_id_for(pk_value)
     conn.execute("""
-        INSERT INTO flagged_rows (id, table_name, check_name, reason, flagged_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO source_block (id, table_name, check_name, pk_value, reason, flagged_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO NOTHING
-    """, [flag_id, table_name, "test_check", reason, datetime.now(timezone.utc)])
+    """, [flag_id, table_name, "test_check", pk_value, reason, datetime.now(timezone.utc)])
     return flag_id
 
 # ===========================================================================
@@ -499,7 +493,7 @@ class TestImportCorrections:
         result = import_corrections(conn_with_sales, "sales", path, "order_id")
         assert result["flagged_cleared"] == 1
         remaining = conn_with_sales.execute(
-            "SELECT count(*) FROM flagged_rows"
+            "SELECT count(*) FROM source_block"
         ).fetchone()[0]
         assert remaining == 0
 
@@ -654,7 +648,7 @@ class TestImportCorrections:
         assert result["updated"] == 1
         assert result["validation_cleared"] == 1
         assert result["flagged_cleared"] == 0
-        remaining = conn.execute("SELECT count(*) FROM validation_flags").fetchone()[0]
+        remaining = conn.execute("SELECT count(*) FROM validation_block").fetchone()[0]
         assert remaining == 0
 
     def test_clears_only_matching_validation_flags(
@@ -683,7 +677,7 @@ class TestImportCorrections:
         result = import_corrections(conn, "sales", path, "order_id")
 
         assert result["validation_cleared"] == 1
-        remaining = conn.execute("SELECT count(*) FROM validation_flags").fetchone()[0]
+        remaining = conn.execute("SELECT count(*) FROM validation_block").fetchone()[0]
         assert remaining == 1  # ORD-004 still flagged
 
     def test_clears_flagged_rows_and_validation_flags_independently(
@@ -722,8 +716,8 @@ class TestImportCorrections:
         assert result["updated"] == 2
         assert result["flagged_cleared"] == 1
         assert result["validation_cleared"] == 1
-        assert conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0] == 0
-        assert conn.execute("SELECT count(*) FROM validation_flags").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM source_block").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM validation_block").fetchone()[0] == 0
 
 
 # ===========================================================================
@@ -799,7 +793,7 @@ class TestCorrectionRoundTrip:
 
         # Verify flagged_rows is now empty
         remaining = conn_with_sales.execute(
-            "SELECT count(*) FROM flagged_rows"
+            "SELECT count(*) FROM source_block"
         ).fetchone()[0]
         assert remaining == 0
 

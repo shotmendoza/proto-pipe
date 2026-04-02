@@ -193,16 +193,22 @@ def delete_report(report, yes, reports_config):
             else:
                 click.echo(f"  [skip] Report table '{target_table}' not found in DB")
 
-            cleared_block = conn.execute(
-                "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
-                [report],
-            ).fetchall()
-            if cleared_block:
-                click.echo(f"  [ok] Cleared {len(cleared_block)} validation_block entry/entries")
+            try:
+                cleared_block = conn.execute(
+                    "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
+                    [report],
+                ).fetchall()
+                if cleared_block:
+                    click.echo(f"  [ok] Cleared {len(cleared_block)} validation_block entry/entries")
+            except Exception:
+                pass  # table may not exist on older DBs pre-migration
 
-            cleared_pass = clear_validation_pass_for_report(conn, report)
-            if cleared_pass:
-                click.echo(f"  [ok] Cleared {cleared_pass} validation_pass entry/entries")
+            try:
+                cleared_pass = clear_validation_pass_for_report(conn, report)
+                if cleared_pass:
+                    click.echo(f"  [ok] Cleared {cleared_pass} validation_pass entry/entries")
+            except Exception:
+                pass  # table may not exist on older DBs pre-migration
 
         finally:
             conn.close()
@@ -342,3 +348,4 @@ def delete_table(table_name, table, yes, pipeline_db):
 
 def delete_commands(cli: click.Group) -> None:
     cli.add_command(delete_cmd)
+    

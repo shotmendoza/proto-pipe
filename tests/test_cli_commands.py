@@ -369,8 +369,8 @@ class TestFlaggedClear:
 
         with duckdb.connect(db_with_pipeline_tables) as conn:
             conn.execute("""
-                INSERT INTO flagged_rows (id, table_name, check_name, reason, flagged_at)
-                VALUES ('abc123', 'sales', 'null_check', 'test flag',
+                INSERT INTO source_block (id, table_name, check_name, pk_value, reason, flagged_at)
+                VALUES ('abc123', 'sales', 'null_check', 'pk-abc', 'test flag',
                         TIMESTAMPTZ '2026-01-01T00:00:00+00:00')
             """)
 
@@ -383,7 +383,7 @@ class TestFlaggedClear:
 
         with duckdb.connect(db_with_pipeline_tables) as conn:
             count = conn.execute(
-                "SELECT count(*) FROM flagged_rows WHERE table_name = 'sales'"
+                "SELECT count(*) FROM source_block WHERE table_name = 'sales'"
             ).fetchone()[0]
         assert count == 0
 
@@ -396,3 +396,4 @@ class TestFlaggedClear:
             result = runner.invoke(flagged_clear, ["--table", "sales", "--yes"])
 
         assert result.exit_code == 0
+        
