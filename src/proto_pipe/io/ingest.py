@@ -184,10 +184,14 @@ def load_file(path: Path) -> pd.DataFrame:
     :rtype: pd.DataFrame
     :raises ValueError: If the file type is unsupported (neither .csv, .xlsx, nor .xls).
     """
+    import warnings
+
     suffix = path.suffix.lower()
 
     if suffix == ".csv":
-        return pd.read_csv(path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", pd.errors.DtypeWarning)
+            return pd.read_csv(path)
 
     if suffix in {".xlsx", ".xls"}:
         return pd.read_excel(path)

@@ -24,15 +24,15 @@ def delete_cmd():
 
 
 @delete_cmd.command("source")
-@click.option("--table", default=None, help="Source table name to delete.")
+@click.option("--table", default=None, help="Source table name to delete (skips multi-select).")
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
 def delete_source(table, yes, pipeline_db, sources_config):
-    """Remove a source and all its associated data.
+    """Remove one or more sources and all their associated data.
 
     Drops the DB table, removes the config entry, clears ingest_log
-    and flagged_rows entries for this table. column_type_registry
+    and flagged_rows entries for each table. column_type_registry
     entries are kept since other sources may share those columns.
 
     \b
@@ -48,77 +48,85 @@ def delete_source(table, yes, pipeline_db, sources_config):
     p_db = config_path_or_override("pipeline_db", pipeline_db)
 
     config = SourceConfig(src_cfg)
+    all_sources = config.all()
 
-    if not table:
-        sources = config.all()
-        if not sources:
-            click.echo("No sources configured.")
-            return
-        name = questionary.select(
-            "Which source would you like to delete?",
-            choices=[s["name"] for s in sources],
-        ).ask()
-        if not name:
-            click.echo("Cancelled.")
-            return
-        source = config.get(name)
-    else:
+    if not all_sources:
+        click.echo("No sources configured.")
+        return
+
+    # --table bypasses multi-select for scripted use
+    if table:
         source = config.get_by_table(table)
         if not source:
             click.echo(f"[error] No source found for table '{table}'")
             return
-        name = source["name"]
+        selected = [source]
+    else:
+        names = questionary.checkbox(
+            "Select sources to delete:",
+            choices=[s["name"] for s in all_sources],
+        ).ask()
+        if not names:
+            click.echo("Cancelled.")
+            return
+        selected = [config.get(n) for n in names]
 
-    target_table = source["target_table"]
+    # Show summary and confirm
+    click.echo()
+    for source in selected:
+        click.echo(f"  {source['name']:<28} table: {source['target_table']}")
 
     if not yes:
-        click.confirm(
-            f"Delete source '{name}' (table: '{target_table}')?\n"
-            f"  This will drop the DB table, clear ingest_log and flagged_rows.\n"
-            f"  This cannot be undone.",
-            abort=True,
-        )
-
-    try:
-        conn = duckdb.connect(p_db)
         try:
-            # Drop DB table
-            if table_exists(conn, target_table):
-                conn.execute(f'DROP TABLE "{target_table}"')
-                click.echo(f"  [ok] Dropped table '{target_table}'")
-            else:
-                click.echo(f"  [skip] Table '{target_table}' not found in DB")
+            click.confirm(
+                f"\nDelete {len(selected)} source(s)? "
+                f"This will drop their DB tables, clear ingest_log and flagged_rows. "
+                f"This cannot be undone.",
+                abort=True,
+            )
+        except click.Abort:
+            click.echo("\n  Cancelled.")
+            return
 
-            # Clear ingest_log
-            deleted_log = conn.execute(
-                "DELETE FROM ingest_log WHERE table_name = ? RETURNING id",
-                [target_table],
-            ).fetchall()
-            if deleted_log:
-                click.echo(f"  [ok] Cleared {len(deleted_log)} ingest_log entry/entries")
+    conn = duckdb.connect(p_db)
+    try:
+        for source in selected:
+            name = source["name"]
+            target_table = source["target_table"]
+            click.echo(f"\n── {name} ──────────────────────────────────────")
+            try:
+                if table_exists(conn, target_table):
+                    conn.execute(f'DROP TABLE "{target_table}"')
+                    click.echo(f"  [ok] Dropped table '{target_table}'")
+                else:
+                    click.echo(f"  [skip] Table '{target_table}' not found in DB")
 
-            # Clear flagged_rows
-            deleted_flags = conn.execute(
-                "DELETE FROM flagged_rows WHERE table_name = ? RETURNING id",
-                [target_table],
-            ).fetchall()
-            if deleted_flags:
-                click.echo(
-                    f"  [ok] Cleared {len(deleted_flags)} flagged_rows entry/entries"
-                )
+                deleted_log = conn.execute(
+                    "DELETE FROM ingest_log WHERE table_name = ? RETURNING id",
+                    [target_table],
+                ).fetchall()
+                if deleted_log:
+                    click.echo(f"  [ok] Cleared {len(deleted_log)} ingest_log entry/entries")
 
-        finally:
-            conn.close()
+                deleted_flags = conn.execute(
+                    "DELETE FROM flagged_rows WHERE table_name = ? RETURNING id",
+                    [target_table],
+                ).fetchall()
+                if deleted_flags:
+                    click.echo(
+                        f"  [ok] Cleared {len(deleted_flags)} flagged_rows entry/entries"
+                    )
 
-        # Remove from config
-        config.remove(name)
-        click.echo(f"  [ok] Removed '{name}' from sources_config.yaml")
-        click.echo(f"\n[ok] Source '{name}' deleted.")
+                config.remove(name)
+                click.echo(f"  [ok] Removed '{name}' from sources_config.yaml")
 
-    except click.Abort:
-        click.echo("\n  Cancelled.")
-    except Exception as e:
-        click.echo(f"[error] {e}")
+            except Exception as e:
+                click.echo(f"  [error] {name}: {e}")
+
+    finally:
+        conn.close()
+
+    click.echo(f"\n[ok] {len(selected)} source(s) deleted.")
 
 
 @delete_cmd.command("report")
