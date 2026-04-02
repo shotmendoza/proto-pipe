@@ -366,6 +366,17 @@ def run_report(
         check_names = [n for n in all_names if check_registry.get_kind(n) == "check"]
         context = {"df": df}
         results = run_checks(check_names, check_registry, context, parallel=parallel_checks)
+
+        # Advance watermark on full pass — mirrors the full validation path
+        all_passed = all(v.get("status") == "passed" for v in results.values())
+        if all_passed:
+            ts_col = source_config.get("timestamp_col") or "_ingested_at"
+            if ts_col and ts_col in df.columns:
+                max_ts = df[ts_col].max()
+                if not isinstance(max_ts, datetime):
+                    max_ts = datetime.fromisoformat(str(max_ts)).replace(tzinfo=timezone.utc)
+                watermark_store.set(report_name, max_ts)
+
         return {"report": report_name, "status": "completed", "results": results}
 
     # ── Full validation path ──────────────────────────────────────────────

@@ -105,49 +105,12 @@ def excel_reports_config(pipeline_db) -> dict:
 @pytest.fixture()
 def infra_db(pipeline_db) -> str:
     """Pipeline DB with all infrastructure tables created."""
+    from proto_pipe.io.db import init_all_pipeline_tables
+    from proto_pipe.reports.query import init_report_runs_table
     init_db(pipeline_db)
     conn = duckdb.connect(pipeline_db)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS flagged_rows (
-            id           VARCHAR PRIMARY KEY,
-            table_name   VARCHAR NOT NULL,
-            check_name   VARCHAR,
-            reason       VARCHAR,
-            flagged_at   TIMESTAMPTZ NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS report_runs (
-            id           VARCHAR PRIMARY KEY,
-            report_name  VARCHAR NOT NULL,
-            status       VARCHAR NOT NULL,
-            started_at   TIMESTAMPTZ NOT NULL,
-            finished_at  TIMESTAMPTZ
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS check_params_history (
-            id          VARCHAR PRIMARY KEY,
-            check_name  VARCHAR NOT NULL,
-            report_name VARCHAR NOT NULL,
-            table_name  VARCHAR NOT NULL,
-            param_name  VARCHAR NOT NULL,
-            param_value VARCHAR,
-            recorded_at TIMESTAMPTZ NOT NULL
-        )
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS validation_flags (
-        id           VARCHAR PRIMARY KEY,
-        report_name  VARCHAR NOT NULL,
-        check_name   VARCHAR NOT NULL,
-        table_name   VARCHAR NOT NULL,
-        pk_col       VARCHAR,
-        pk_value     VARCHAR,
-        reason       VARCHAR,
-        flagged_at   TIMESTAMPTZ NOT NULL
-    )
-""")
+    init_all_pipeline_tables(conn)
+    init_report_runs_table(conn)
     conn.close()
     return pipeline_db
 
@@ -174,27 +137,27 @@ def _run_checks(infra_db, excel_reports_config, watermark_db):
 
 def _get_flagged_rows(infra_db) -> pd.DataFrame:
     conn = duckdb.connect(infra_db)
-    df = conn.execute("SELECT * FROM flagged_rows").df()
+    df = conn.execute("SELECT * FROM source_block").df()
     conn.close()
     return df
 
 
 def _clear_flags(infra_db, table: str):
     conn = duckdb.connect(infra_db)
-    conn.execute("DELETE FROM flagged_rows WHERE table_name = ?", [table])
+    conn.execute("DELETE FROM source_block WHERE table_name = ?", [table])
     conn.close()
 
 
 def _get_validation_flags(infra_db) -> pd.DataFrame:
     conn = duckdb.connect(infra_db)
-    df = conn.execute("SELECT * FROM validation_flags").df()
+    df = conn.execute("SELECT * FROM validation_block").df()
     conn.close()
     return df
 
 
 def _clear_validation_flags(infra_db):
     conn = duckdb.connect(infra_db)
-    conn.execute("DELETE FROM validation_flags")
+    conn.execute("DELETE FROM validation_block")
     conn.close()
 
 
@@ -356,7 +319,7 @@ class TestExcelWorkflow:
         flagged = _get_flagged_rows(infra_db)
         assert not flagged.empty
         assert all(flagged["table_name"] == "sales")
-        assert all(flagged["check_name"] == "duplicate_conflict")
+        assert all(flagged["check_name"] == "duplicate_conflict")  # source_block check_name
 
     def test_step11_flagged_rows_contain_conflict_reason(
         self, infra_db, excel_file, excel_file_conflict, excel_sources_config
@@ -384,3 +347,4 @@ class TestExcelWorkflow:
 
         flagged_after = _get_flagged_rows(infra_db)
         assert flagged_after.empty
+        

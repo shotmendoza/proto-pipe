@@ -12,7 +12,7 @@ import pytest
 
 from proto_pipe.checks.built_in import BUILT_IN_CHECKS
 from proto_pipe.checks.helpers import DECORATED_CHECKS, custom_check, register_custom_check
-from proto_pipe.io.db import init_ingest_log, table_exists
+from proto_pipe.io.db import init_ingest_state, init_all_pipeline_tables, table_exists
 from proto_pipe.io.ingest import (
     init_db,
     ingest_directory,
@@ -70,10 +70,10 @@ def _read_table(db_path: str, table_name: str) -> pd.DataFrame:
 def _setup_db_with_table(db_path: str, table_name: str, df: pd.DataFrame) -> None:
     init_db(db_path)
     conn = duckdb.connect(db_path)
-    init_ingest_log(conn)
+    init_ingest_state(conn)
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" AS SELECT * FROM df')
     conn.execute("""
-        INSERT INTO ingest_log (id, filename, table_name, status, rows, ingested_at)
+        INSERT INTO ingest_state (id, filename, table_name, status, rows, ingested_at)
         VALUES (gen_random_uuid()::VARCHAR, 'sales_2026.csv', ?, 'ok', 3, NOW())
     """, [table_name])
     conn.close()
@@ -684,7 +684,7 @@ def test_reset_report_drops_table(tmp_path):
     conn.close()
 
 
-def test_reset_report_clears_ingest_log(tmp_path):
+def test_reset_report_clears_ingest_state(tmp_path):
     db_path = str(tmp_path / "pipeline.db")
     df = pd.DataFrame({"id": [1], "val": ["x"]})
     _setup_db_with_table(db_path, "sales", df)
@@ -693,7 +693,7 @@ def test_reset_report_clears_ingest_log(tmp_path):
 
     conn = duckdb.connect(db_path)
     count = conn.execute(
-        "SELECT count(*) FROM ingest_log WHERE table_name = 'sales'"
+        "SELECT count(*) FROM ingest_state WHERE table_name = 'sales'"
     ).fetchone()[0]
     conn.close()
     assert count == 0
@@ -709,9 +709,9 @@ def test_reset_report_does_not_affect_other_tables(tmp_path):
     db_path = str(tmp_path / "pipeline.db")
     init_db(db_path)
     conn = duckdb.connect(db_path)
-    init_ingest_log(conn)
+    init_ingest_state(conn)
     conn.execute("""
-        INSERT INTO ingest_log (id, filename, table_name, status, rows, ingested_at)
+        INSERT INTO ingest_state (id, filename, table_name, status, rows, ingested_at)
         VALUES
             (gen_random_uuid()::VARCHAR, 'sales.csv', 'sales', 'ok', 3, NOW()),
             (gen_random_uuid()::VARCHAR, 'inventory.csv', 'inventory', 'ok', 5, NOW())
@@ -722,7 +722,7 @@ def test_reset_report_does_not_affect_other_tables(tmp_path):
 
     conn = duckdb.connect(db_path)
     inventory_count = conn.execute(
-        "SELECT count(*) FROM ingest_log WHERE table_name = 'inventory'"
+        "SELECT count(*) FROM ingest_state WHERE table_name = 'inventory'"
     ).fetchone()[0]
     conn.close()
     assert inventory_count == 1

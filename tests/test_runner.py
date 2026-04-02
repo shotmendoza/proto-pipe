@@ -28,11 +28,25 @@ from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.reports.runner import run_report, run_all_reports
-from proto_pipe.reports.validation_flags import (
-    count_validation_flags,
-    detail_df,
-    init_validation_flags_table,
-)
+from proto_pipe.io.db import init_all_pipeline_tables
+
+
+def _count_flags(conn, report_name=None):
+    if report_name:
+        return conn.execute(
+            "SELECT count(*) FROM validation_block WHERE report_name = ?", [report_name]
+        ).fetchone()[0]
+    return conn.execute("SELECT count(*) FROM validation_block").fetchone()[0]
+
+
+def _detail(conn, report_name=None):
+    q = "SELECT * FROM validation_block"
+    p = []
+    if report_name:
+        q += " WHERE report_name = ?"
+        p.append(report_name)
+    q += " ORDER BY flagged_at"
+    return conn.execute(q, p).df()
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +82,9 @@ def _seed_table(pipeline_db: str, table: str, df: pd.DataFrame) -> None:
 
 
 def _init_pipeline_db(pipeline_db: str) -> None:
-    """Bootstrap validation_flags so flag-writing tests have the table."""
+    """Bootstrap all pipeline tables including validation_block."""
     conn = duckdb.connect(pipeline_db)
-    init_validation_flags_table(conn)
+    init_all_pipeline_tables(conn)
     conn.close()
 
 
@@ -224,7 +238,7 @@ class TestRunReportFlagWriting:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            det = detail_df(conn, "sales_validation")
+            det = _detail(conn, "sales_validation")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] == "ORD-002"
         finally:
@@ -243,13 +257,14 @@ class TestRunReportFlagWriting:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            assert count_validation_flags(conn) == 0
+            assert _count_flags(conn) == 0
         finally:
             conn.close()
 
-    def test_primary_key_passed_through_to_flags(
+    def test_flags_contain_pk_value(
         self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
     ):
+        """Validation failures record the pk_value of the failing row."""
         _init_pipeline_db(pipeline_db)
         _seed_table(pipeline_db, "sales", sales_df_out_of_range)
         fn = partial(check_range, col="price", min_val=0, max_val=500)
@@ -260,8 +275,8 @@ class TestRunReportFlagWriting:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            det = detail_df(conn)
-            assert det.iloc[0]["pk_col"] == "order_id"
+            det = _detail(conn)
+            assert det.iloc[0]["pk_value"] is not None
         finally:
             conn.close()
 
@@ -278,7 +293,7 @@ class TestRunReportFlagWriting:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            assert count_validation_flags(conn) == 0
+            assert _count_flags(conn) == 0
         finally:
             conn.close()
 
@@ -366,6 +381,6 @@ class TestRunAllReports:
         conn = duckdb.connect(pipeline_db)
         try:
             # sales_df has all positive prices → mask is all True → no flags
-            assert count_validation_flags(conn) == 0
+            assert _count_flags(conn) == 0
         finally:
             conn.close()

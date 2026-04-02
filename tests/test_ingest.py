@@ -9,15 +9,17 @@ Covers:
 
 import duckdb
 import pandas as pd
+import pytest
 
 from proto_pipe.io.db import table_exists
 from proto_pipe.io.ingest import (
     resolve_source,
-    _structural_checks,
     init_db,
     ingest_directory,
+    ingest_single_file,
     init_source_tables,
 )
+from proto_pipe.io.db import init_all_pipeline_tables
 
 
 # ---------------------------------------------------------------------------
@@ -48,55 +50,75 @@ class TestResolveSource:
 
 
 # ---------------------------------------------------------------------------
-# _structural_checks
+# Structural checks — tested via ingest_single_file
+# _structural_checks was removed; checks now run from file header inside
+# ingest_single_file. Tests use actual CSV files and check result status.
 # ---------------------------------------------------------------------------
 
+@pytest.fixture()
+def _conn(tmp_path):
+    """Fresh DB connection with all pipeline tables."""
+    import duckdb
+    conn = duckdb.connect(str(tmp_path / "struct_test.db"))
+    init_all_pipeline_tables(conn)
+    yield conn
+    conn.close()
+
+
+def _source(timestamp_col="updated_at", primary_key=None):
+    s = {"name": "sales", "target_table": "sales", "patterns": ["sales_*.csv"]}
+    if timestamp_col:
+        s["timestamp_col"] = timestamp_col
+    if primary_key:
+        s["primary_key"] = primary_key
+    return s
+
+
 class TestStructuralChecks:
-    def test_clean_df_passes(self, sales_df):
-        source = {"timestamp_col": "updated_at"}
-        assert _structural_checks(sales_df, source) == []
+    def test_empty_file_fails(self, tmp_path, _conn):
+        path = tmp_path / "sales_empty.csv"
+        path.write_text("order_id,price,updated_at\n")
+        result = ingest_single_file(_conn, path, _source())
+        assert result["status"] == "failed"
+        assert "empty" in result["message"].lower()
 
-    def test_empty_df_fails(self):
-        source = {"timestamp_col": "updated_at"}
-        issues = _structural_checks(pd.DataFrame(), source)
-        assert any("empty" in i.lower() for i in issues)
+    def test_missing_timestamp_col_fails(self, tmp_path, _conn, sales_df):
+        path = tmp_path / "sales_2026.csv"
+        sales_df.to_csv(path, index=False)
+        result = ingest_single_file(_conn, path, _source(timestamp_col="nonexistent_col"))
+        assert result["status"] == "failed"
+        assert "nonexistent_col" in result["message"]
 
-    def test_missing_timestamp_col_fails(self, sales_df):
-        source = {"timestamp_col": "nonexistent_col"}
-        issues = _structural_checks(sales_df, source)
-        assert any("nonexistent_col" in i for i in issues)
+    def test_clean_file_passes(self, tmp_path, _conn, sales_df):
+        path = tmp_path / "sales_2026.csv"
+        sales_df.to_csv(path, index=False)
+        result = ingest_single_file(_conn, path, _source())
+        assert result["status"] == "ok"
 
-    def test_no_timestamp_col_defined_passes(self, sales_df):
-        source = {}
-        assert _structural_checks(sales_df, source) == []
+    def test_no_timestamp_col_defined_passes(self, tmp_path, _conn, sales_df):
+        path = tmp_path / "sales_2026.csv"
+        sales_df.to_csv(path, index=False)
+        result = ingest_single_file(_conn, path, _source(timestamp_col=None))
+        assert result["status"] == "ok"
 
-    def test_null_primary_key_in_file_fails(self, sales_df):
-        """File with NULL values in the primary key column is rejected."""
+    def test_null_primary_key_fails(self, tmp_path, _conn, sales_df):
         df = sales_df.copy()
         df.loc[0, "order_id"] = None
-        source = {"primary_key": "order_id", "timestamp_col": "updated_at"}
-        issues = _structural_checks(df, source)
-        assert any("NULL" in i for i in issues)
+        path = tmp_path / "sales_2026.csv"
+        df.to_csv(path, index=False)
+        result = ingest_single_file(_conn, path, _source(primary_key="order_id"))
+        assert result["status"] == "failed"
+        assert "NULL" in result["message"] or "null" in result["message"].lower()
 
-    def test_null_primary_key_message_includes_count(self, sales_df):
+    def test_null_primary_key_message_includes_count(self, tmp_path, _conn, sales_df):
         df = sales_df.copy()
         df.loc[0, "order_id"] = None
         df.loc[2, "order_id"] = None
-        source = {"primary_key": "order_id", "timestamp_col": "updated_at"}
-        issues = _structural_checks(df, source)
-        assert any("2" in i for i in issues)
-
-    def test_no_primary_key_defined_ignores_nulls(self, sales_df):
-        """Source without primary_key skips the null key check entirely."""
-        df = sales_df.copy()
-        df.loc[0, "order_id"] = None
-        source = {"timestamp_col": "updated_at"}
-        assert _structural_checks(df, source) == []
-
-    def test_primary_key_col_not_in_df_ignores_null_check(self, sales_df):
-        """If the pk column isn't in the file, null check is skipped (different error path)."""
-        source = {"primary_key": "nonexistent_col", "timestamp_col": "updated_at"}
-        assert _structural_checks(sales_df, source) == []
+        path = tmp_path / "sales_2026.csv"
+        df.to_csv(path, index=False)
+        result = ingest_single_file(_conn, path, _source(primary_key="order_id"))
+        assert result["status"] == "failed"
+        assert "2" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +134,11 @@ class TestInitDb:
         assert table_exists(conn, "inventory")
         conn.close()
 
-    def test_creates_ingest_log(self, pipeline_db, sources_config):
+    def test_creates_ingest_state(self, pipeline_db, sources_config):
         init_db(pipeline_db)
         init_source_tables(pipeline_db, sources_config["sources"])
         conn = duckdb.connect(pipeline_db)
-        assert table_exists(conn, "ingest_log")
+        assert table_exists(conn, "ingest_state")
         conn.close()
 
     def test_idempotent(self, pipeline_db, sources_config):
@@ -167,7 +189,7 @@ class TestIngestDirectoryHappyPath:
         ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
         conn = duckdb.connect(pipeline_db)
         row = conn.execute(
-            "SELECT status, rows FROM ingest_log WHERE filename = 'sales_2026-03.csv'"
+            "SELECT status, rows FROM ingest_state WHERE filename = 'sales_2026-03.csv'"
         ).fetchone()
         conn.close()
         assert row[0] == "ok"
@@ -283,7 +305,7 @@ class TestIngestFailures:
         ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
         conn = duckdb.connect(pipeline_db)
         row = conn.execute(
-            "SELECT status FROM ingest_log WHERE filename = 'unknown_data_2026.csv'"
+            "SELECT status FROM ingest_state WHERE filename = 'unknown_data_2026.csv'"
         ).fetchone()
         conn.close()
         assert row[0] == "skipped"

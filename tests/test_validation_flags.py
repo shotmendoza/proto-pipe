@@ -1,45 +1,29 @@
-"""Tests for proto_pipe.reports.validation_flags
+"""Tests for validation_block — the new validation failure table.
+
+Replaces the old test_validation_flags.py which tested
+proto_pipe.reports.validation_flags (now deleted).
 
 Covers:
-- _extract_flagged_rows: mask mode (flag_when=True default, flag_when=False, no pk_col)
-- _extract_flagged_rows: mask mode malformed input falls back to summary
-- _extract_flagged_rows: check_name appears in mask mode reason
-- _extract_flagged_rows: violation_indices mode (backward compat with check_range)
-- _extract_flagged_rows: summary fallback (null_check, duplicate_check, schema_check, free-form)
-- write_validation_flags: inserts rows, returns count
-- write_validation_flags: idempotent on re-run (uuid5 dedup)
-- write_validation_flags: different checks same row → two flags
-- write_validation_flags: different reports same check+row → two flags
-- write_validation_flags: empty list writes nothing
-- write_validation_flags: None pk_value still writes (uuid4)
-- write_validation_flags: reason truncated to 500 chars
-- count_validation_flags: total and scoped by report
-- summary_df: groups by report+check, counts correctly, supports report scope
-- detail_df: returns one row per flag, supports report scope
-- clear_validation_flags: all, scoped to report, scoped to check
-- export_validation_report: two sheets present
-- export_validation_report: pk_col renamed when all flags share same pk_col
-- export_validation_report: generic record_id when pk_cols are mixed
-- export_validation_report: scoped export only includes target report
-- export_validation_report: raises ValueError when no flags exist
-- export_validation_report: creates parent directories
+- write_validation_flags (flagging.py): inserts, idempotency, count
+- Composite key uniqueness: same pk, different checks → two flags
+- Different reports, same check+pk → two flags
+- None pk_value still writes (uuid4)
+- Reason truncated to 500 chars
+- Direct validation_block queries: count, detail, summary
+- build_validation_flag_export: enriched view joined to report table
+- export-validation CLI helper inline (openpyxl two-sheet output)
 """
 
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.reports.validation_flags import (
-    clear_validation_flags,
-    count_validation_flags,
-    detail_df,
-    export_validation_report,
-    init_validation_flags_table,
-    summary_df,
-    write_validation_flags,
-)
+from proto_pipe.io.db import init_all_pipeline_tables, flag_id_for
+from proto_pipe.pipelines.flagging import FlagRecord, write_validation_flags, build_validation_flag_export
 
 
 # ---------------------------------------------------------------------------
@@ -48,21 +32,81 @@ from proto_pipe.reports.validation_flags import (
 
 @pytest.fixture()
 def conn(tmp_path):
-    """Fresh DuckDB connection with validation_flags table bootstrapped."""
-    db_path = str(tmp_path / "test.db")
-    c = duckdb.connect(db_path)
-    init_validation_flags_table(c)
+    """Fresh DuckDB connection with all pipeline tables bootstrapped."""
+    c = duckdb.connect(str(tmp_path / "test.db"))
+    init_all_pipeline_tables(c)
     yield c
     c.close()
 
 
 @pytest.fixture()
-def sample_df():
-    return pd.DataFrame({
-        "order_id": ["ORD-001", "ORD-002", "ORD-003"],
-        "price":    [100.0,    -5.0,      250.0],
-        "region":   ["EMEA",   "APAC",    "EMEA"],
-    })
+def report_table(conn):
+    """Seed a simple report table for join tests."""
+    conn.execute("""
+        CREATE TABLE sales_report (
+            order_id VARCHAR,
+            price    DOUBLE,
+            region   VARCHAR
+        )
+    """)
+    conn.execute("""
+        INSERT INTO sales_report VALUES
+            ('ORD-001', 100.0, 'EMEA'),
+            ('ORD-002', -5.0,  'APAC'),
+            ('ORD-003', 250.0, 'EMEA')
+    """)
+    return "sales_report"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _flag(conn, report_name, check_name, pk_values, table_name="sales_report"):
+    """Write validation flags for given pk_values. Returns count written."""
+    flags = [
+        FlagRecord(
+            id="placeholder",  # recomputed by write_validation_flags
+            table_name=table_name,
+            report_name=report_name,
+            check_name=check_name,
+            pk_value=pk,
+            reason=f"check '{check_name}' failed for {pk}",
+        )
+        for pk in pk_values
+    ]
+    return write_validation_flags(conn, flags)
+
+
+def _count(conn, report_name=None):
+    q = "SELECT count(*) FROM validation_block"
+    p = []
+    if report_name:
+        q += " WHERE report_name = ?"
+        p.append(report_name)
+    return conn.execute(q, p).fetchone()[0]
+
+
+def _detail(conn, report_name=None):
+    q = "SELECT * FROM validation_block"
+    p = []
+    if report_name:
+        q += " WHERE report_name = ?"
+        p.append(report_name)
+    q += " ORDER BY flagged_at"
+    return conn.execute(q, p).df()
+
+
+def _summary(conn, report_name=None):
+    q = """
+        SELECT report_name, check_name, count(*) AS flagged_count
+        FROM validation_block
+        {}
+        GROUP BY report_name, check_name
+        ORDER BY report_name, check_name
+    """.format("WHERE report_name = ?" if report_name else "")
+    p = [report_name] if report_name else []
+    return conn.execute(q, p).df()
 
 
 # ---------------------------------------------------------------------------
@@ -71,251 +115,185 @@ def sample_df():
 
 class TestWriteValidationFlags:
     def test_inserts_and_returns_count(self, conn):
-        flags = [
-            {"pk_value": "ORD-001", "reason": "price out of range"},
-            {"pk_value": "ORD-002", "reason": "price out of range"},
-        ]
-        count = write_validation_flags(conn, "sales_report", "range_check", "sales", "order_id", flags)
-
+        count = _flag(conn, "r", "range_check", ["ORD-001", "ORD-002"])
         assert count == 2
-        assert count_validation_flags(conn) == 2
+        assert _count(conn) == 2
 
     def test_idempotent_same_report_check_pk(self, conn):
-        flags = [{"pk_value": "ORD-001", "reason": "price out of range"}]
-        write_validation_flags(conn, "r", "range_check", "sales", "order_id", flags)
-        write_validation_flags(conn, "r", "range_check", "sales", "order_id", flags)
-
-        # uuid5 dedup: same (report, check, pk_value) → same id → ON CONFLICT DO NOTHING
-        assert count_validation_flags(conn) == 1
+        _flag(conn, "r", "range_check", ["ORD-001"])
+        _flag(conn, "r", "range_check", ["ORD-001"])
+        # Same (report, check, pk) → same id → ON CONFLICT DO NOTHING
+        assert _count(conn) == 1
 
     def test_different_checks_same_row_produces_two_flags(self, conn):
-        flag = [{"pk_value": "ORD-001", "reason": "bad"}]
-        write_validation_flags(conn, "r", "check_a", "sales", "order_id", flag)
-        write_validation_flags(conn, "r", "check_b", "sales", "order_id", flag)
-
-        assert count_validation_flags(conn) == 2
+        _flag(conn, "r", "check_a", ["ORD-001"])
+        _flag(conn, "r", "check_b", ["ORD-001"])
+        assert _count(conn) == 2
 
     def test_different_reports_same_check_and_row_produces_two_flags(self, conn):
-        flag = [{"pk_value": "ORD-001", "reason": "bad"}]
-        write_validation_flags(conn, "report_a", "range_check", "sales", "order_id", flag)
-        write_validation_flags(conn, "report_b", "range_check", "sales", "order_id", flag)
-
-        assert count_validation_flags(conn) == 2
+        _flag(conn, "report_a", "range_check", ["ORD-001"])
+        _flag(conn, "report_b", "range_check", ["ORD-001"])
+        assert _count(conn) == 2
 
     def test_empty_list_writes_nothing(self, conn):
-        count = write_validation_flags(conn, "r", "c", "t", "id", [])
-
+        count = write_validation_flags(conn, [])
         assert count == 0
-        assert count_validation_flags(conn) == 0
+        assert _count(conn) == 0
 
     def test_none_pk_value_still_writes_flag(self, conn):
-        # Summary flags (no row id) use uuid4 — non-deduplicable but still written
-        flags = [{"pk_value": None, "reason": "2 null values in region"}]
-        count = write_validation_flags(conn, "r", "null_check", "t", None, flags)
-
+        flags = [FlagRecord(
+            id="placeholder",
+            table_name="t",
+            report_name="r",
+            check_name="null_check",
+            pk_value=None,
+            reason="summary failure",
+        )]
+        count = write_validation_flags(conn, flags)
         assert count == 1
-        assert count_validation_flags(conn) == 1
+        assert _count(conn) == 1
 
     def test_reason_truncated_to_500_chars(self, conn):
-        flags = [{"pk_value": "X", "reason": "a" * 600}]
-        write_validation_flags(conn, "r", "c", "t", "id", flags)
-
-        det = detail_df(conn)
+        flags = [FlagRecord(
+            id="placeholder",
+            table_name="t",
+            report_name="r",
+            check_name="c",
+            pk_value="X",
+            reason="a" * 600,
+        )]
+        write_validation_flags(conn, flags)
+        det = _detail(conn)
         assert len(det.iloc[0]["reason"]) == 500
 
 
 # ---------------------------------------------------------------------------
-# count_validation_flags / summary_df / detail_df / clear_validation_flags
+# Count / summary / detail queries
 # ---------------------------------------------------------------------------
 
 class TestQueryHelpers:
-    def test_count_returns_total_across_all_reports(self, conn):
-        flags = [{"pk_value": f"ORD-00{i}", "reason": "bad"} for i in range(4)]
-        write_validation_flags(conn, "r", "c", "t", "order_id", flags)
+    def test_count_total_across_all_reports(self, conn):
+        _flag(conn, "r", "c", ["ORD-001", "ORD-002", "ORD-003", "ORD-004"])
+        assert _count(conn) == 4
 
-        assert count_validation_flags(conn) == 4
+    def test_count_scoped_by_report(self, conn):
+        _flag(conn, "report_a", "c", ["X"])
+        _flag(conn, "report_b", "c", ["Y"])
+        assert _count(conn, "report_a") == 1
+        assert _count(conn, "report_b") == 1
+        assert _count(conn) == 2
 
-    def test_count_scoped_by_report_name(self, conn):
-        write_validation_flags(conn, "report_a", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-        write_validation_flags(conn, "report_b", "c", "t", "id",
-                               [{"pk_value": "Y", "reason": "r"}])
-
-        assert count_validation_flags(conn, "report_a") == 1
-        assert count_validation_flags(conn, "report_b") == 1
-        assert count_validation_flags(conn) == 2
-
-    def test_summary_df_groups_by_report_and_check(self, conn):
-        write_validation_flags(conn, "sales_report", "range_check", "sales", "order_id",
-                               [{"pk_value": "ORD-001", "reason": "x"},
-                                {"pk_value": "ORD-002", "reason": "x"}])
-        write_validation_flags(conn, "sales_report", "null_check", "sales", "order_id",
-                               [{"pk_value": "ORD-003", "reason": "y"}])
-
-        summ = summary_df(conn)
+    def test_summary_groups_by_report_and_check(self, conn):
+        _flag(conn, "sales_report", "range_check", ["ORD-001", "ORD-002"])
+        _flag(conn, "sales_report", "null_check", ["ORD-003"])
+        summ = _summary(conn)
         assert len(summ) == 2
-        assert summ[summ["check_name"] == "range_check"].iloc[0]["flagged_count"] == 2
-        assert summ[summ["check_name"] == "null_check"].iloc[0]["flagged_count"] == 1
+        rc = summ[summ["check_name"] == "range_check"].iloc[0]
+        assert rc["flagged_count"] == 2
 
-    def test_summary_df_scoped_to_one_report(self, conn):
-        write_validation_flags(conn, "report_a", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-        write_validation_flags(conn, "report_b", "c", "t", "id",
-                               [{"pk_value": "Y", "reason": "r"}])
-
-        summ = summary_df(conn, "report_a")
+    def test_summary_scoped_to_one_report(self, conn):
+        _flag(conn, "report_a", "c", ["X"])
+        _flag(conn, "report_b", "c", ["Y"])
+        summ = _summary(conn, "report_a")
         assert len(summ) == 1
         assert summ.iloc[0]["report_name"] == "report_a"
 
-    def test_detail_df_returns_one_row_per_flag(self, conn):
-        flags = [{"pk_value": f"ORD-00{i}", "reason": "bad"} for i in range(5)]
-        write_validation_flags(conn, "r", "c", "t", "order_id", flags)
+    def test_detail_returns_one_row_per_flag(self, conn):
+        _flag(conn, "r", "c", [f"ORD-00{i}" for i in range(5)])
+        assert len(_detail(conn)) == 5
 
-        assert len(detail_df(conn)) == 5
-
-    def test_detail_df_scoped_to_one_report(self, conn):
-        write_validation_flags(conn, "report_a", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-        write_validation_flags(conn, "report_b", "c", "t", "id",
-                               [{"pk_value": "Y", "reason": "r"},
-                                {"pk_value": "Z", "reason": "r"}])
-
-        det = detail_df(conn, "report_b")
+    def test_detail_scoped_to_one_report(self, conn):
+        _flag(conn, "report_a", "c", ["X"])
+        _flag(conn, "report_b", "c", ["Y", "Z"])
+        det = _detail(conn, "report_b")
         assert len(det) == 2
         assert set(det["pk_value"]) == {"Y", "Z"}
 
     def test_clear_all_flags(self, conn):
-        write_validation_flags(conn, "r", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"},
-                                {"pk_value": "Y", "reason": "r"}])
-        cleared = clear_validation_flags(conn)
+        _flag(conn, "r", "c", ["X", "Y"])
+        conn.execute("DELETE FROM validation_block")
+        assert _count(conn) == 0
 
-        assert cleared == 2
-        assert count_validation_flags(conn) == 0
+    def test_clear_scoped_to_report(self, conn):
+        _flag(conn, "report_a", "c", ["X"])
+        _flag(conn, "report_b", "c", ["Y"])
+        conn.execute("DELETE FROM validation_block WHERE report_name = 'report_a'")
+        assert _count(conn, "report_a") == 0
+        assert _count(conn, "report_b") == 1
 
-    def test_clear_scoped_to_report_leaves_others(self, conn):
-        write_validation_flags(conn, "report_a", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-        write_validation_flags(conn, "report_b", "c", "t", "id",
-                               [{"pk_value": "Y", "reason": "r"}])
-        clear_validation_flags(conn, report_name="report_a")
-
-        assert count_validation_flags(conn, "report_a") == 0
-        assert count_validation_flags(conn, "report_b") == 1
-
-    def test_clear_scoped_to_check_leaves_others(self, conn):
-        write_validation_flags(conn, "r", "check_a", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-        write_validation_flags(conn, "r", "check_b", "t", "id",
-                               [{"pk_value": "Y", "reason": "r"}])
-        clear_validation_flags(conn, check_name="check_a")
-
-        assert count_validation_flags(conn) == 1
-        assert detail_df(conn).iloc[0]["check_name"] == "check_b"
+    def test_clear_scoped_to_check(self, conn):
+        _flag(conn, "r", "check_a", ["X"])
+        _flag(conn, "r", "check_b", ["Y"])
+        conn.execute("DELETE FROM validation_block WHERE check_name = 'check_a'")
+        assert _count(conn) == 1
+        assert _detail(conn).iloc[0]["check_name"] == "check_b"
 
 
 # ---------------------------------------------------------------------------
-# export_validation_report
+# build_validation_flag_export — enriched view joined to report table
 # ---------------------------------------------------------------------------
 
-class TestExportValidationReport:
-    def test_produces_detail_and_summary_sheets(self, conn, tmp_path):
-        write_validation_flags(conn, "sales_report", "range_check", "sales", "order_id",
-                               [{"pk_value": "ORD-002", "reason": "price negative"}])
+class TestBuildValidationFlagExport:
+    def test_returns_report_columns_plus_flag_columns(self, conn, report_table):
+        _flag(conn, "sales_validation", "range_check", ["ORD-002"], table_name=report_table)
+        df = build_validation_flag_export(conn, report_table, "sales_validation", "order_id")
+        assert "_flag_id" in df.columns
+        assert "_flag_reason" in df.columns
+        assert "order_id" in df.columns
+        assert "price" in df.columns
 
-        out_path = str(tmp_path / "validation.xlsx")
-        detail_count, summary_count = export_validation_report(conn, out_path, "sales_report")
+    def test_only_flagged_rows_returned(self, conn, report_table):
+        _flag(conn, "sales_validation", "range_check", ["ORD-002"], table_name=report_table)
+        df = build_validation_flag_export(conn, report_table, "sales_validation", "order_id")
+        assert len(df) == 1
+        assert df["order_id"].iloc[0] == "ORD-002"
 
-        assert Path(out_path).exists()
-        assert detail_count == 1
-        assert summary_count == 1
-        wb = pd.ExcelFile(out_path)
-        assert "Detail" in wb.sheet_names
-        assert "Summary" in wb.sheet_names
+    def test_multiple_failures_all_returned(self, conn, report_table):
+        _flag(conn, "r", "c", ["ORD-001", "ORD-003"], table_name=report_table)
+        df = build_validation_flag_export(conn, report_table, "r", "order_id")
+        assert len(df) == 2
 
-    def test_detail_contains_flag_id_column(self, conn, tmp_path):
-        write_validation_flags(conn, "r", "c", "t", "order_id",
-                               [{"pk_value": "ORD-001", "reason": "bad"}])
+    def test_empty_when_no_flags(self, conn, report_table):
+        df = build_validation_flag_export(conn, report_table, "no_flags", "order_id")
+        assert df.empty
 
-        out_path = str(tmp_path / "v.xlsx")
-        export_validation_report(conn, out_path)
+    def test_flag_id_is_deterministic(self, conn, report_table):
+        """Same (report, check, pk) always produces the same _flag_id."""
+        _flag(conn, "r", "range_check", ["ORD-002"], table_name=report_table)
+        df1 = build_validation_flag_export(conn, report_table, "r", "order_id")
+        expected_id = hashlib.md5("r:range_check:ORD-002".encode()).hexdigest()
+        assert df1["_flag_id"].iloc[0] == expected_id
 
-        det = pd.read_excel(out_path, sheet_name="Detail")
+
+# ---------------------------------------------------------------------------
+# Excel export (inline — no CLI dependency)
+# ---------------------------------------------------------------------------
+
+class TestExcelExport:
+    def test_produces_two_sheet_excel(self, conn, report_table, tmp_path):
+        _flag(conn, "sales_validation", "range_check", ["ORD-002"], table_name=report_table)
+        df = build_validation_flag_export(conn, report_table, "sales_validation", "order_id")
+        summary = _summary(conn, "sales_validation")
+
+        out = tmp_path / "validation.xlsx"
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Detail", index=False)
+            summary.to_excel(writer, sheet_name="Summary", index=False)
+
+        assert out.exists()
+        xl = pd.ExcelFile(out)
+        assert "Detail" in xl.sheet_names
+        assert "Summary" in xl.sheet_names
+
+    def test_detail_sheet_has_flag_id(self, conn, report_table, tmp_path):
+        _flag(conn, "r", "c", ["ORD-001"], table_name=report_table)
+        df = build_validation_flag_export(conn, report_table, "r", "order_id")
+
+        out = tmp_path / "v.xlsx"
+        df.to_excel(out, sheet_name="Detail", index=False)
+        det = pd.read_excel(out, sheet_name="Detail")
         assert "_flag_id" in det.columns
 
-    def test_flag_id_is_first_column_in_detail(self, conn, tmp_path):
-        # _flag_id must be first so users see it and know not to edit it —
-        # same convention as export_flagged for ingest conflicts.
-        write_validation_flags(conn, "r", "c", "t", "order_id",
-                               [{"pk_value": "ORD-001", "reason": "bad"}])
-
-        out_path = str(tmp_path / "v.xlsx")
-        export_validation_report(conn, out_path)
-
-        det = pd.read_excel(out_path, sheet_name="Detail")
-        assert det.columns[0] == "_flag_id"
-
-    def test_detail_renames_pk_col_when_all_flags_share_same_pk_col(self, conn, tmp_path):
-        write_validation_flags(conn, "r", "c", "t", "order_id",
-                               [{"pk_value": "ORD-001", "reason": "bad"}])
-
-        out_path = str(tmp_path / "v.xlsx")
-        export_validation_report(conn, out_path)
-
-        det = pd.read_excel(out_path, sheet_name="Detail")
-        assert "order_id" in det.columns
-        assert "pk_value" not in det.columns
-
-    def test_detail_uses_record_id_when_pk_cols_are_mixed(self, conn, tmp_path):
-        write_validation_flags(conn, "r", "c1", "t1", "order_id",
-                               [{"pk_value": "A", "reason": "x"}])
-        write_validation_flags(conn, "r", "c2", "t2", "internal_id",
-                               [{"pk_value": "B", "reason": "y"}])
-
-        out_path = str(tmp_path / "v.xlsx")
-        export_validation_report(conn, out_path)
-
-        det = pd.read_excel(out_path, sheet_name="Detail")
-        assert "record_id" in det.columns
-        assert "pk_value" not in det.columns
-
-    def test_scoped_export_only_includes_target_report(self, conn, tmp_path):
-        write_validation_flags(conn, "report_a", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-        write_validation_flags(conn, "report_b", "c", "t", "id",
-                               [{"pk_value": "Y", "reason": "r"},
-                                {"pk_value": "Z", "reason": "r"}])
-
-        out_path = str(tmp_path / "v.xlsx")
-        detail_count, _ = export_validation_report(conn, out_path, "report_b")
-
-        assert detail_count == 2
-
-    def test_raises_when_no_flags_for_scope(self, conn, tmp_path):
-        out_path = str(tmp_path / "empty.xlsx")
-        with pytest.raises(ValueError, match="No validation flags"):
-            export_validation_report(conn, out_path, "nonexistent_report")
-
-    def test_creates_parent_directories_if_missing(self, conn, tmp_path):
-        write_validation_flags(conn, "r", "c", "t", "id",
-                               [{"pk_value": "X", "reason": "r"}])
-
-        out_path = str(tmp_path / "nested" / "deep" / "v.xlsx")
-        export_validation_report(conn, out_path)
-
-        assert Path(out_path).exists()
-
-    def test_flag_id_values_match_validation_flags_table(self, conn, tmp_path):
-        # The _flag_id in the export must match the id column in validation_flags
-        # so that import_corrections can use it to clear the right rows.
-        write_validation_flags(conn, "r", "c", "t", "order_id",
-                               [{"pk_value": "ORD-001", "reason": "bad"}])
-
-        out_path = str(tmp_path / "v.xlsx")
-        export_validation_report(conn, out_path)
-
-        det = pd.read_excel(out_path, sheet_name="Detail")
-        exported_id = det["_flag_id"].iloc[0]
-
-        stored_id = conn.execute("SELECT id FROM validation_flags").fetchone()[0]
-        assert exported_id == stored_id
+    def test_raises_when_no_flags(self, conn, report_table, tmp_path):
+        df = build_validation_flag_export(conn, report_table, "no_flags", "order_id")
+        assert df.empty

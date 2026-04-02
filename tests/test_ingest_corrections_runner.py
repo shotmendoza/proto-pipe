@@ -1,912 +1,1085 @@
+"""Ingestion module.
+
+Scans a directory for CSV and Excel files, matches each file to a source
+definition by pattern, and loads the data into DuckDB tables.
+
+Data layer invariants (see CLAUDE.md):
+- ALL data loading goes through DuckDB. Pandas is never used in the data path.
+- CSV files loaded via DuckDB read_csv() with dtype from column_type_registry.
+- Excel files loaded via DuckDB read_xlsx() (spatial extension).
+- load_file() is retained only for the correction workflow (strip_pipeline_cols path).
+- Unknown columns (not in column_type_registry) fail the file.
+- Bad row values (TRY_CAST fails) are written to source_block and removed from the
+  insert set. Clean rows proceed.
+- Duplicate handling compares against source_pass, not the source table directly.
+
+Table lifecycle:
+- vp new source  — confirms column types, writes column_type_registry
+- vp db-init     — creates pipeline tables including source_pass and source_block
+- First ingest   — CREATE TABLE AS SELECT, writes source_pass for all rows
+- Subsequent     — auto_migrate new columns, _handle_duplicates via source_pass
+
+Duplicate row handling (on_duplicate in sources_config.yaml):
+- flag   — compare hash against source_pass; changed rows → source_block (default)
+- append — insert all rows, no conflict checking, no source_pass update
+- upsert — overwrite existing; update source_pass only when hash changed
+- skip   — ignore rows already in source_pass
+
+Each ingest run logs results to ingest_state (was: ingest_log).
 """
-Tests covering all behaviour with the final flag identity design:
-
-  id = md5(str(pk_value)) — deterministic, computable in DuckDB SQL,
-                             no extra columns in source tables or flagged_rows.
-
-  ingest.py:
-    - TestFlagIdForHelper — md5 derivation, determinism
-    - TestDirectoryValidation
-    - TestNullPrimaryKeyWarning
-    - TestChunking
-    - TestMultipleExistingRows
-    - TestOnDuplicateModes
-    - TestCheckNullOverwritesIdempotent
-    - TestWriteFlagIdempotent — ON CONFLICT DO NOTHING
-
-  corrections.py:
-    - TestExportFlaggedJoin — join on md5(pk_col), drift-free
-    - TestImportCorrectionsXlsx
-    - TestImportCorrectionsBatched
-    - TestImportCorrectionsNotFound
-
-  runner.py:
-    - TestWatermarkOnlyAdvancesOnFullPass
-
-  Integration:
-    - TestFullRoundTripWithExport
-"""
-
-import hashlib
+import csv
+import warnings
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from typing import Literal, Callable
 
 import duckdb
-import pandas as pd
-import pytest
+import pandas as pd  # type: ignore
 
-from proto_pipe.io.db import init_ingest_log, flag_id_for
-from proto_pipe.io.ingest import (
-    ingest_directory, _handle_duplicates, check_null_overwrites,
-    CHUNK_SIZE,
-    _write_flag,
+from proto_pipe.constants import NUMERIC_DUCKDB_TYPES
+from proto_pipe.io.db import (
+    get_columns as get_existing_columns,
+    get_column_types as get_existing_column_types,
+    table_exists,
+    flag_id_for,
+    get_registry_types,
+    log_ingest_state,
+    get_source_pass_hashes,
+    bulk_upsert_source_pass,
 )
-from proto_pipe.reports.corrections import export_flagged, import_corrections, dated_export_path
+from proto_pipe.io.migration import auto_migrate
+from proto_pipe.pipelines.flagging import (
+    FlagRecord,
+    write_source_flags,
+    compute_row_hash,
+    compute_row_hash_sql,
+)
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Constants
 # ---------------------------------------------------------------------------
 
-def _make_db(tmp_path: Path) -> str:
-    return str(tmp_path / "pipeline.db")
+_SUPPORTED_FILE_SUFFIXES = {".csv", ".xlsx", ".xls"}
+_MAX_DIFF_COLS = 5
+CHUNK_SIZE = 1000
 
 
-def _make_incoming(tmp_path: Path) -> Path:
-    d = tmp_path / "incoming"
-    d.mkdir()
-    return d
+# ---------------------------------------------------------------------------
+# Metadata bootstrap
+# ---------------------------------------------------------------------------
+
+def _populate_builtin_metadata(conn: duckdb.DuckDBPyConnection) -> None:
+    """Write metadata for all built-in checks. Safe to call multiple times."""
+    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+    from proto_pipe.checks.registry import CheckParamInspector
+
+    for name, func in BUILT_IN_CHECKS.items():
+        inspector = CheckParamInspector(func)
+        inspector.write_to_db(conn, name)
 
 
-def _init_flagged_rows(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create the flagged_rows table — minimal schema, id is md5(pk_value)."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS flagged_rows (
-            id         VARCHAR PRIMARY KEY,
-            table_name VARCHAR NOT NULL,
-            check_name VARCHAR,
-            reason     VARCHAR,
-            flagged_at TIMESTAMPTZ NOT NULL
+# ---------------------------------------------------------------------------
+# File support
+# ---------------------------------------------------------------------------
+
+def _is_supported_file(path: Path) -> bool:
+    """Return True if the file has a supported extension."""
+    return path.suffix.lower() in _SUPPORTED_FILE_SUFFIXES
+
+
+# ---------------------------------------------------------------------------
+# Pattern matching
+# ---------------------------------------------------------------------------
+
+def _pattern_specificity(pattern: str) -> int:
+    """Return the number of literal (non-wildcard) characters in a pattern.
+
+    Used to rank competing matches — more literal characters = more specific.
+    Example: "foo you*.csv" → 11 beats "foo*.csv" → 7.
+    """
+    return sum(1 for c in pattern if c not in ("*", "?", "[", "]"))
+
+
+def resolve_source(
+    filename: str,
+    sources: list[dict],
+) -> dict | None:
+    """Return the source whose pattern most specifically matches the filename.
+
+    Picks the source whose best-matching pattern has the highest specificity
+    score (most literal characters). "foo you*.csv" always beats "foo*.csv"
+    for "foo you bar.csv", regardless of config order.
+
+    Ties fall back to config order with a warning.
+    """
+    matches: list[tuple[dict, int]] = []
+    for source in sources:
+        best = max(
+            (_pattern_specificity(p) for p in source["patterns"] if fnmatch(filename, p)),
+            default=None,
         )
-    """)
+        if best is not None:
+            matches.append((source, best))
 
+    if not matches:
+        return None
 
-def _flag(conn, table, pk_value, reason="test reason"):
-    """Insert a flag using the same md5 id derivation as _write_flag."""
-    fid = flag_id_for(pk_value)
-    conn.execute("""
-        INSERT INTO flagged_rows (id, table_name, check_name, reason, flagged_at)
-        VALUES (?, ?, 'test_check', ?, ?)
-        ON CONFLICT (id) DO NOTHING
-    """, [fid, table, reason, datetime.now(timezone.utc)])
-    return fid
+    best_score = max(score for _, score in matches)
+    winners = [s for s, score in matches if score == best_score]
 
-
-def _sources(on_duplicate="flag", primary_key="order_id"):
-    return [{
-        "name": "sales",
-        "patterns": ["sales_*.csv"],
-        "target_table": "sales",
-        "timestamp_col": "updated_at",
-        "primary_key": primary_key,
-        "on_duplicate": on_duplicate,
-    }]
-
-
-def _write_csv(path: Path, rows: list[dict]) -> Path:
-    pd.DataFrame(rows).to_csv(path, index=False)
-    return path
-
-
-def _expected_flag_id(pk_value) -> str:
-    return hashlib.md5(str(pk_value).encode()).hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# TestFlagIdForHelper
-# ---------------------------------------------------------------------------
-
-class TestFlagIdForHelper:
-    def test_same_pk_same_id(self):
-        assert flag_id_for("ORD-1") == flag_id_for("ORD-1")
-
-    def test_different_pk_different_id(self):
-        assert flag_id_for("ORD-1") != flag_id_for("ORD-2")
-
-    def test_matches_expected_md5(self):
-        assert flag_id_for("ORD-1") == _expected_flag_id("ORD-1")
-
-    def test_integer_pk(self):
-        assert flag_id_for(42) == hashlib.md5(b"42").hexdigest()
-
-    def test_result_is_hex_string(self):
-        result = flag_id_for("ORD-1")
-        assert len(result) == 32
-        assert all(c in "0123456789abcdef" for c in result)
-
-
-# ---------------------------------------------------------------------------
-# TestWriteFlagIdempotent
-# ---------------------------------------------------------------------------
-
-class TestWriteFlagIdempotent:
-    def test_same_pk_twice_produces_one_row(self):
-        conn = duckdb.connect(":memory:")
-        _init_flagged_rows(conn)
-        _write_flag(conn, "sales", ["price: 100 -> -50"], pk_value="ORD-1")
-        _write_flag(conn, "sales", ["price: 100 -> -50"], pk_value="ORD-1")
-        count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        assert count == 1
-
-    def test_different_pk_produces_two_rows(self):
-        conn = duckdb.connect(":memory:")
-        _init_flagged_rows(conn)
-        _write_flag(conn, "sales", ["price: 100 -> -50"], pk_value="ORD-1")
-        _write_flag(conn, "sales", ["price: 200 -> -75"], pk_value="ORD-2")
-        count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        assert count == 2
-
-    def test_no_pk_uses_uuid4_not_deduplicated(self):
-        """Flags without pk_value use uuid4 — two calls produce two rows."""
-        conn = duckdb.connect(":memory:")
-        _init_flagged_rows(conn)
-        _write_flag(conn, "sales", ["some: change"])
-        _write_flag(conn, "sales", ["some: change"])
-        count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        assert count == 2
-
-    def test_flag_id_matches_flag_id_for(self):
-        conn = duckdb.connect(":memory:")
-        _init_flagged_rows(conn)
-        _write_flag(conn, "sales", ["price: 100 -> -50"], pk_value="ORD-1")
-        stored_id = conn.execute(
-            "SELECT id FROM flagged_rows"
-        ).fetchone()[0]
-        assert stored_id == flag_id_for("ORD-1")
-
-
-# ---------------------------------------------------------------------------
-# TestDirectoryValidation
-# ---------------------------------------------------------------------------
-
-class TestDirectoryValidation:
-    def test_missing_directory_raises(self, tmp_path):
-        db = _make_db(tmp_path)
-        conn = duckdb.connect(db)
-        init_ingest_log(conn)
-        conn.close()
-        with pytest.raises(ValueError, match="Incoming directory not found"):
-            ingest_directory(str(tmp_path / "nonexistent"), [], db)
-
-    def test_file_not_dir_raises(self, tmp_path):
-        db = _make_db(tmp_path)
-        not_dir = tmp_path / "file.txt"
-        not_dir.write_text("hello")
-        conn = duckdb.connect(db)
-        init_ingest_log(conn)
-        conn.close()
-        with pytest.raises(ValueError, match="is not a directory"):
-            ingest_directory(str(not_dir), [], db)
-
-
-# ---------------------------------------------------------------------------
-# TestNullPrimaryKeyWarning
-# ---------------------------------------------------------------------------
-
-class TestNullPrimaryKeyWarning:
-    def test_null_key_in_file_rejects_entire_file(self, tmp_path):
-        """A file with any NULL primary key values is rejected before touching the DB."""
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        _write_csv(
-            inc / "sales_jan.csv",
-            [
-                {"order_id": None, "price": 10.0, "updated_at": "2026-01-01"},
-                {"order_id": "ORD-1", "price": 20.0, "updated_at": "2026-01-02"},
-            ],
+    if len(winners) > 1:
+        names = ", ".join(f"'{w['name']}'" for w in winners)
+        print(
+            f"[warn] '{filename}' matches multiple sources with equal specificity: "
+            f"{names}. Using '{winners[0]['name']}' — make patterns more specific "
+            f"to resolve this ambiguity."
         )
-        summary = ingest_directory(str(inc), _sources(), db)
-        assert summary["sales_jan.csv"]["status"] == "failed"
-        assert "NULL" in summary["sales_jan.csv"]["message"]
 
-    def test_null_key_logged_in_ingest_log(self, tmp_path):
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        _write_csv(
-            inc / "sales_jan.csv",
-            [
-                {"order_id": None, "price": 10.0, "updated_at": "2026-01-01"},
-            ],
+    return winners[0]
+
+
+# ---------------------------------------------------------------------------
+# load_file — correction path only
+# ---------------------------------------------------------------------------
+
+def load_file(path: Path) -> pd.DataFrame:
+    """Load a CSV or Excel file into a DataFrame.
+
+    Used ONLY for the correction workflow (strip_pipeline_cols path) where
+    pipeline metadata columns need to be stripped before re-ingest.
+    Not used in the primary data loading path — all ingestion goes through DuckDB.
+
+    :param path: Path to the file.
+    :return: DataFrame. Types are re-inferred by DuckDB during subsequent processing.
+    :raises ValueError: If the file type is unsupported.
+    """
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", pd.errors.DtypeWarning)
+            return pd.read_csv(path)
+
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(path)
+
+    raise ValueError(f"Unsupported file type: {path.suffix}")
+
+
+# ---------------------------------------------------------------------------
+# DB initialisation
+# ---------------------------------------------------------------------------
+
+def init_db(db_path: str) -> None:
+    """Initialise the pipeline database and bootstrap all pipeline tables."""
+    from proto_pipe.io.db import init_all_pipeline_tables
+
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(db_path) as conn:
+        init_all_pipeline_tables(conn)
+        _populate_builtin_metadata(conn)
+
+
+def init_source_tables(db_path: str, sources: list[dict]) -> None:
+    """Create placeholder tables for user-defined sources."""
+    with duckdb.connect(db_path) as conn:
+        for source in sources:
+            table = source["target_table"]
+            if table_exists(conn, table):
+                print(f"[skip] Table '{table}' already exists")
+                continue
+            conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" (_placeholder VARCHAR)')
+            print(f"[ok] Created table '{table}'")
+
+
+# ---------------------------------------------------------------------------
+# Ingest directory
+# ---------------------------------------------------------------------------
+
+def ingest_directory(
+    directory: str,
+    sources: list[dict],
+    db_path: str,
+    mode: str = "append",
+    run_checks: bool = False,
+    check_registry=None,
+    report_registry=None,
+) -> dict:
+    """Scan a directory, match files to source definitions, load into DuckDB."""
+    from proto_pipe.io.db import (
+        init_ingest_state as _init_ingest_state,
+        already_ingested as _already_ingested,
+    )
+
+    directory_path = Path(directory)
+    if not directory_path.exists():
+        raise ValueError(
+            f"Incoming directory not found: '{directory}'\n"
+            f"Check the incoming_dir setting in pipeline.yaml or pass --incoming-dir."
         )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        row = conn.execute(
-            "SELECT status, message FROM ingest_log WHERE filename = 'sales_jan.csv'"
-        ).fetchone()
-        conn.close()
-        assert row[0] == "failed"
-        assert "NULL" in row[1]
+    if not directory_path.is_dir():
+        raise ValueError(f"incoming_dir '{directory}' exists but is not a directory.")
 
-    def test_null_key_does_not_touch_existing_table(self, tmp_path):
-        """Existing table is untouched when a file is rejected for NULL keys."""
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        # First ingest — clean file
-        _write_csv(
-            inc / "sales_jan.csv",
-            [
-                {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        # Second ingest — file with NULL key
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
-                {"order_id": None, "price": 10.0, "updated_at": "2026-02-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        conn.close()
-        assert count == 1  # original row untouched
+    conn = duckdb.connect(db_path)
+    _init_ingest_state(conn)
 
+    summary: dict[str, dict] = {}
+    unmatched: list[str] = []
 
-# ---------------------------------------------------------------------------
-# TestChunking
-# ---------------------------------------------------------------------------
+    for path in sorted(Path(directory).iterdir()):
+        if not _is_supported_file(path):
+            continue
 
-class TestChunking:
-    def test_large_file_all_rows_inserted(self, tmp_path):
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        n = CHUNK_SIZE * 2 + 50
-        _write_csv(inc / "sales_jan.csv", [
-            {"order_id": f"ORD-{i}", "price": float(i), "updated_at": "2026-01-01"}
-            for i in range(n)
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate="append"), db)
-        conn = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        conn.close()
-        assert count == n
+        source = resolve_source(path.name, sources)
+        if source is None:
+            unmatched.append(path.name)
+            continue
 
-    def test_chunk_boundary_identical_rows_deduped(self, tmp_path):
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        rows = [
-            {"order_id": f"ORD-{i}", "price": float(i), "updated_at": "2026-01-01"}
-            for i in range(CHUNK_SIZE + 5)
-        ]
-        _write_csv(inc / "sales_jan.csv", rows)
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        conn.close()
-        _write_csv(inc / "sales_feb.csv", rows)
-        ingest_directory(str(inc), _sources(), db)
-        conn  = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        conn.close()
-        assert count == CHUNK_SIZE + 5
+        if mode != "replace" and _already_ingested(conn, path.name):
+            print(f"[skipped] '{path.name}' — already ingested")
+            summary[path.name] = {"status": "skipped", "message": "already ingested"}
+            continue
 
+        result = ingest_single_file(conn, path, source, mode=mode)
+        summary[path.name] = result
 
-# ---------------------------------------------------------------------------
-# TestMultipleExistingRows
-# ---------------------------------------------------------------------------
-
-class TestMultipleExistingRows:
-    def test_no_crash_on_duplicate_keys_in_table(self, tmp_path):
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        _write_csv(inc / "sales_jan.csv", [
-            {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate="append"), db)
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": 200.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate="append"), db)
-
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        df = pd.DataFrame([
-            {"order_id": "ORD-1", "price": 999.0, "updated_at": "2026-03-01"}
-        ])
-        result_df, flagged, _ = _handle_duplicates(conn, "sales", df, "order_id", "flag")
-        conn.close()
-        assert flagged == 1
-        assert len(result_df) == 0
-
-
-# ---------------------------------------------------------------------------
-# TestOnDuplicateModes
-# ---------------------------------------------------------------------------
-
-class TestOnDuplicateModes:
-    def _setup(self, tmp_path, on_duplicate):
-        db  = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        _write_csv(inc / "sales_jan.csv", [
-            {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-            {"order_id": "ORD-2", "price": 200.0, "updated_at": "2026-01-01"},
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate=on_duplicate), db)
-        return db, inc
-
-    def test_flag_blocks_changed_row(self, tmp_path):
-        db, inc = self._setup(tmp_path, "flag")
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        conn.close()
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": 999.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(), db)
-        conn  = duckdb.connect(db)
-        price = conn.execute("SELECT price FROM sales WHERE order_id='ORD-1'").fetchone()[0]
-        flags = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        conn.close()
-        assert price == 100.0
-        assert flags == 1
-
-    def test_flag_passes_identical_row(self, tmp_path):
-        db, inc = self._setup(tmp_path, "flag")
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        conn.close()
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-        ])
-        ingest_directory(str(inc), _sources(), db)
-        conn  = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        flags = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        conn.close()
-        assert count == 2
-        assert flags == 0
-
-    def test_upsert_replaces_row(self, tmp_path):
-        db, inc = self._setup(tmp_path, "upsert")
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": 999.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate="upsert"), db)
-        conn  = duckdb.connect(db)
-        price = conn.execute("SELECT price FROM sales WHERE order_id='ORD-1'").fetchone()[0]
-        conn.close()
-        assert price == 999.0
-
-    def test_skip_keeps_original(self, tmp_path):
-        db, inc = self._setup(tmp_path, "skip")
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": 999.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate="skip"), db)
-        conn  = duckdb.connect(db)
-        price = conn.execute("SELECT price FROM sales WHERE order_id='ORD-1'").fetchone()[0]
-        conn.close()
-        assert price == 100.0
-
-    def test_append_allows_duplicate(self, tmp_path):
-        db, inc = self._setup(tmp_path, "append")
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": 999.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(on_duplicate="append"), db)
-        conn  = duckdb.connect(db)
-        count = conn.execute(
-            "SELECT count(*) FROM sales WHERE order_id='ORD-1'"
-        ).fetchone()[0]
-        conn.close()
-        assert count == 2
-
-    def test_flag_inserts_genuinely_new_key(self, tmp_path):
-        db, inc = self._setup(tmp_path, "flag")
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        conn.close()
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-99", "price": 50.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(), db)
-        conn  = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        conn.close()
-        assert count == 3
-
-
-# ---------------------------------------------------------------------------
-# TestCheckNullOverwritesIdempotent
-# ---------------------------------------------------------------------------
-
-class TestCheckNullOverwritesIdempotent:
-    def test_running_twice_produces_one_flag(self, tmp_path):
-        db   = _make_db(tmp_path)
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        df = pd.DataFrame([
-            {"order_id": "ORD-1", "price": 100.0},
-            {"order_id": "ORD-1", "price": 200.0},
-        ])
-        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
-        first  = check_null_overwrites(conn, "sales", "order_id")
-        second = check_null_overwrites(conn, "sales", "order_id")
-        total  = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        conn.close()
-        assert first  == 1
-        assert second == 1
-        assert total  == 1
-
-    def test_finds_conflicts_across_chunk_boundary(self, tmp_path):
-        db   = _make_db(tmp_path)
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        rows = []
-        for i in range(CHUNK_SIZE + 3):
-            rows.append({"order_id": f"ORD-{i}", "price": float(i)})
-            rows.append({"order_id": f"ORD-{i}", "price": float(i) + 1})
-        df = pd.DataFrame(rows)
-        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
-        flagged = check_null_overwrites(conn, "sales", "order_id")
-        conn.close()
-        assert flagged == CHUNK_SIZE + 3
-
-    def test_returns_zero_when_no_duplicates(self, tmp_path):
-        """Table with all unique primary keys returns 0."""
-        db = _make_db(tmp_path)
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        df = pd.DataFrame(
-            [
-                {"order_id": "ORD-1", "price": 100.0},
-                {"order_id": "ORD-2", "price": 200.0},
-                {"order_id": "ORD-3", "price": 300.0},
-            ]
-        )
-        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
-        result = check_null_overwrites(conn, "sales", "order_id")
-        conn.close()
-        assert result == 0
-
-    def test_identical_duplicate_rows_not_flagged(self, tmp_path):
-        """Two rows with the same primary key but identical content produce no flag."""
-        db = _make_db(tmp_path)
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        df = pd.DataFrame(
-            [
-                {"order_id": "ORD-1", "price": 100.0},
-                {"order_id": "ORD-1", "price": 100.0},  # exact duplicate
-            ]
-        )
-        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
-        result = check_null_overwrites(conn, "sales", "order_id")
-        conn.close()
-        assert result == 0
-
-
-# ---------------------------------------------------------------------------
-# TestExportFlaggedJoin
-# ---------------------------------------------------------------------------
-
-class TestExportFlaggedJoin:
-    def _make_conn(self):
-        conn = duckdb.connect(":memory:")
-        conn.execute("""
-                     CREATE TABLE sales (order_id VARCHAR, price DOUBLE, region VARCHAR)
-                     """)
-        conn.execute("""
-                     INSERT INTO sales VALUES
-                                           ('ORD-1', 100.0, 'EMEA'),
-                                           ('ORD-2', 200.0, 'APAC'),
-                                           ('ORD-3', 300.0, 'LATAM')
-                     """)
-        _init_flagged_rows(conn)
-        return conn
-
-    def test_export_produces_csv(self, tmp_path):
-        conn = self._make_conn()
-        _flag(conn, "sales", "ORD-2", "price out of range")
-        output = str(tmp_path / "flagged.csv")
-        count = export_flagged(conn, "sales", output, primary_key="order_id")
-        assert count == 1
-        assert Path(output).exists()
-        df = pd.read_csv(output)
-        assert "_flag_id" in df.columns
-        assert "_flag_reason" in df.columns
-        assert df["order_id"].iloc[0] == "ORD-2"
-
-    def test_export_correct_row_after_deletion(self, tmp_path):
-        """Deleting another row does not affect which row is exported."""
-        conn = self._make_conn()
-        _flag(conn, "sales", "ORD-2", "negative price")
-        conn.execute("DELETE FROM sales WHERE order_id = 'ORD-1'")
-        output = str(tmp_path / "flagged.csv")
-        export_flagged(conn, "sales", output, primary_key="order_id")
-        df = pd.read_csv(output)
-        assert df["order_id"].iloc[0] == "ORD-2"
-
-    def test_export_flag_id_matches_flag_id_for(self, tmp_path):
-        conn = self._make_conn()
-        _flag(conn, "sales", "ORD-1", "test")
-        output = str(tmp_path / "flagged.csv")
-        export_flagged(conn, "sales", output, primary_key="order_id")
-        df = pd.read_csv(output)
-        assert df["_flag_id"].iloc[0] == flag_id_for("ORD-1")
-
-    def test_raises_when_no_flags(self, tmp_path):
-        conn = self._make_conn()
-        with pytest.raises(ValueError, match="No flagged rows found"):
-            export_flagged(
-                conn, "sales", str(tmp_path / "out.csv"), primary_key="order_id"
+        if (
+            run_checks
+            and check_registry
+            and report_registry
+            and result.get("status") == "ok"
+        ):
+            _run_inline_checks(
+                conn,
+                source["target_table"],
+                source,
+                check_registry,
+                report_registry,
+                path.name,
             )
 
-    def test_raises_when_primary_key_is_none(self, tmp_path):
-        """export_flagged requires primary_key — None raises immediately."""
-        conn = self._make_conn()
-        _flag(conn, "sales", "ORD-1", "test")
-        with pytest.raises(ValueError, match="primary_key is required"):
-            export_flagged(conn, "sales", str(tmp_path / "out.csv"), primary_key=None)
-
-    def test_dated_filename(self, tmp_path):
-        path = dated_export_path(str(tmp_path), "sales")
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        assert today in path
-        assert path.endswith(".csv")
-
-
-# ---------------------------------------------------------------------------
-# TestImportCorrectionsXlsx
-# ---------------------------------------------------------------------------
-
-class TestImportCorrectionsXlsx:
-    def test_accepts_xlsx(self, tmp_path):
-        conn = duckdb.connect(":memory:")
-        conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
-        conn.execute("INSERT INTO sales VALUES ('ORD-1', 100.0)")
-        _init_flagged_rows(conn)
-        xlsx = tmp_path / "corrections.xlsx"
-        pd.DataFrame([{"order_id": "ORD-1", "price": 150.0}]).to_excel(xlsx, index=False)
-        result = import_corrections(conn, "sales", str(xlsx), "order_id")
-        assert result["updated"] == 1
-        price = conn.execute("SELECT price FROM sales").fetchone()[0]
-        assert price == 150.0
-
-    def test_rejects_unsupported_extension(self, tmp_path):
-        conn = duckdb.connect(":memory:")
-        conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
-        bad  = tmp_path / "corrections.json"
-        bad.write_text('[{"order_id": "ORD-1"}]')
-        with pytest.raises(ValueError, match="Unsupported file type"):
-            import_corrections(conn, "sales", str(bad), "order_id")
-
-
-# ---------------------------------------------------------------------------
-# TestImportCorrectionsBatched
-# ---------------------------------------------------------------------------
-
-class TestImportCorrectionsBatched:
-    def test_large_corrections_all_applied(self, tmp_path):
-        n = 500
-        conn = duckdb.connect(":memory:")
-        df = pd.DataFrame([{"order_id": f"ORD-{i}", "price": float(i)} for i in range(n)])
-        conn.execute("CREATE TABLE sales AS SELECT * FROM df")
-        _init_flagged_rows(conn)
-        corr = tmp_path / "corrections.csv"
-        pd.DataFrame([
-            {"order_id": f"ORD-{i}", "price": float(i) + 1000} for i in range(n)
-        ]).to_csv(corr, index=False)
-        result = import_corrections(conn, "sales", str(corr), "order_id")
-        assert result["updated"] == n
-        sample = conn.execute(
-            "SELECT price FROM sales WHERE order_id = 'ORD-0'"
-        ).fetchone()[0]
-        assert sample == 1000.0
-
-
-# ---------------------------------------------------------------------------
-# TestImportCorrectionsNotFound
-# ---------------------------------------------------------------------------
-
-class TestImportCorrectionsNotFound:
-    def test_not_found_counted(self, tmp_path):
-        conn = duckdb.connect(":memory:")
-        conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
-        conn.execute("INSERT INTO sales VALUES ('ORD-1', 100.0)")
-        _init_flagged_rows(conn)
-        corr = tmp_path / "corrections.csv"
-        pd.DataFrame([{"order_id": "GHOST", "price": 1.0}]).to_csv(corr, index=False)
-        result = import_corrections(conn, "sales", str(corr), "order_id")
-        assert result["not_found"] == 1
-        assert result["updated"]   == 0
-
-    def test_found_key_updated_when_others_missing(self, tmp_path):
-        conn = duckdb.connect(":memory:")
-        conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
-        conn.execute("INSERT INTO sales VALUES ('ORD-1', 100.0)")
-        _init_flagged_rows(conn)
-        corr = tmp_path / "corrections.csv"
-        pd.DataFrame([
-            {"order_id": "ORD-1", "price": 150.0},
-            {"order_id": "GHOST", "price": 999.0},
-        ]).to_csv(corr, index=False)
-        import_corrections(conn, "sales", str(corr), "order_id")
-        price = conn.execute("SELECT price FROM sales").fetchone()[0]
-        assert price == 150.0
-
-
-# ---------------------------------------------------------------------------
-# TestWatermarkOnlyAdvancesOnFullPass
-# ---------------------------------------------------------------------------
-
-class TestWatermarkOnlyAdvancesOnFullPass:
-
-    def test_watermark_held_when_check_fails(self, tmp_path):
-        from proto_pipe.reports.runner import run_report
-        from proto_pipe.checks.registry import CheckRegistry
-        from proto_pipe.pipelines.watermark import WatermarkStore
-
-        watermark_store = WatermarkStore(str(tmp_path / "watermarks.db"))
-        check_registry = CheckRegistry()
-
-        def always_fails(ctx: dict) -> pd.Series:
-            raise RuntimeError("check failed at runtime")
-
-        check_registry.register("failing_check", always_fails)
-
-        report_config = {
-            "name": "test_report",
-            "source": {
-                "path": ":memory:",
-                "table": "sales",
-                "timestamp_col": "updated_at",
-            },
-            "options": {"parallel": False},
-            "resolved_checks": ["failing_check"],
-        }
-        with patch("proto_pipe.reports.runner.load_from_duckdb") as mock_load:
-            mock_load.return_value = pd.DataFrame(
-                [{"order_id": "ORD-1", "updated_at": "2026-01-01"}]
+    if unmatched:
+        print(f"[warn] No source match for: {', '.join(unmatched)}")
+        for filename in unmatched:
+            log_ingest_state(
+                conn, filename, None, "skipped", message="No matching source pattern"
             )
-            result = run_report(report_config, check_registry, watermark_store)
 
-        assert watermark_store.get("test_report") is None
-        assert result["results"]["failing_check"]["status"] == "error"
+    conn.close()
+    return summary
 
-    def test_watermark_advances_when_all_pass(self):
-        from proto_pipe.reports.runner import run_report
-        from proto_pipe.checks.result import CheckResult
-        import pandas as pd
-        watermark_store = MagicMock()
-        watermark_store.get.return_value = None
-        check_registry = MagicMock()
-        check_registry.run.return_value = CheckResult(
-            passed=True,
-            mask=pd.Series([], dtype=bool),
-            reason="",
+
+# ---------------------------------------------------------------------------
+# Inline checks (post-ingest)
+# ---------------------------------------------------------------------------
+
+def _run_inline_checks(
+    conn,
+    table,
+    source,
+    check_registry,
+    report_registry,
+    filename,
+) -> None:
+    """Run registered checks against a table immediately after ingest."""
+    matching = [
+        r for r in report_registry.all()
+        if r.get("source", {}).get("table") == table
+    ]
+    if not matching:
+        return
+
+    df = conn.execute(f'SELECT * FROM "{table}"').df()
+    context = {"df": df}
+
+    for report in matching:
+        for check_name in report.get("resolved_checks", []):
+            try:
+                result = check_registry.run(check_name, context)
+                print(f"[check] {check_name}: {result}")
+            except Exception as e:
+                print(f"[check-fail] {check_name}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# _handle_duplicates — compares against source_pass, not source table
+# ---------------------------------------------------------------------------
+
+def _handle_duplicates(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    df: pd.DataFrame,
+    primary_key: str,
+    on_duplicate: Literal["append", "upsert", "skip", "flag"] = "flag",
+    source_file: str = "",
+) -> tuple[pd.DataFrame, int, int]:
+    """Process incoming rows against source_pass by primary key.
+
+    Compares incoming row hashes against source_pass (not the source table)
+    to avoid phantom type-mismatch conflicts. Writes conflicts to source_block.
+    Updates source_pass for accepted rows.
+
+    Returns (rows_to_insert, blocked_count, skipped_count).
+
+    on_duplicate modes:
+        append — insert everything, no checking, no source_pass update
+        upsert — overwrite existing; update source_pass when hash changed
+        skip   — ignore rows already in source_pass
+        flag   — identical hash → skip; changed hash → source_block; new → insert
+    """
+    if on_duplicate == "append":
+        return df, 0, 0
+
+    if primary_key not in df.columns:
+        print(
+            f"[warn] primary_key '{primary_key}' not in incoming columns "
+            f"— appending all rows"
         )
-        report_config = {
-            "name": "test_report",
-            "source": {"path": ":memory:", "table": "sales", "timestamp_col": "updated_at"},
-            "options": {"parallel": False},
-            "resolved_checks": ["passing_check"],
-        }
-        with patch("proto_pipe.reports.runner.load_from_duckdb") as mock_load:
-            mock_load.return_value = pd.DataFrame([
-                {"order_id": "ORD-1",
-                 "updated_at": pd.Timestamp("2026-01-01", tz="UTC")}
-            ])
-            run_report(report_config, check_registry, watermark_store)
-        watermark_store.set.assert_called_once()
+        return df, 0, 0
+
+    non_null_df = df[df[primary_key].notna()].copy()
+    if non_null_df.empty:
+        return df, 0, 0
+
+    comparable_cols = [
+        c for c in non_null_df.columns
+        if c != primary_key
+        and c in get_existing_columns(conn, table)
+        and not c.startswith("_")
+    ]
+
+    rows_to_insert: list[tuple] = []
+    pass_records: list[dict] = []
+    total_blocked = 0
+    total_skipped = 0
+
+    for chunk_start in range(0, len(non_null_df), CHUNK_SIZE):
+        chunk = non_null_df.iloc[chunk_start: chunk_start + CHUNK_SIZE]
+        chunk_pk_strs = [str(pk) for pk in chunk[primary_key].tolist()]
+
+        # Compare against source_pass — not the source table
+        existing_hashes = get_source_pass_hashes(conn, table, chunk_pk_strs)
+
+        # ── upsert ────────────────────────────────────────────────────────
+        if on_duplicate == "upsert":
+            placeholders = ", ".join(["?"] * len(chunk[primary_key].tolist()))
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
+                chunk[primary_key].tolist(),
+            )
+            rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+            # Update source_pass only when hash changed
+            for _, row in chunk.iterrows():
+                pk_str = str(row[primary_key])
+                row_hash = compute_row_hash(row.to_dict(), comparable_cols)
+                if existing_hashes.get(pk_str) != row_hash:
+                    pass_records.append({
+                        "pk_value": pk_str,
+                        "row_hash": row_hash,
+                        "source_file": source_file,
+                    })
+            continue
+
+        # ── skip ──────────────────────────────────────────────────────────
+        if on_duplicate == "skip":
+            new_rows = chunk[~chunk[primary_key].astype(str).isin(existing_hashes.keys())]
+            skipped = len(chunk) - len(new_rows)
+            if skipped:
+                print(f"[skip] {skipped} row(s) already in source_pass — skipped")
+            rows_to_insert.extend(new_rows.itertuples(index=False, name=None))
+            total_skipped += skipped
+            for _, row in new_rows.iterrows():
+                pk_str = str(row[primary_key])
+                pass_records.append({
+                    "pk_value": pk_str,
+                    "row_hash": compute_row_hash(row.to_dict(), comparable_cols),
+                    "source_file": source_file,
+                })
+            continue
+
+        # ── flag ──────────────────────────────────────────────────────────
+        if on_duplicate == "flag":
+            if not comparable_cols:
+                rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+                continue
+
+            conflict_pks: list[str] = []
+            for _, row in chunk.iterrows():
+                pk_str = str(row[primary_key])
+                row_hash = compute_row_hash(row.to_dict(), comparable_cols)
+
+                if pk_str not in existing_hashes:
+                    # New row — insert and track in source_pass
+                    rows_to_insert.append(tuple(row))
+                    pass_records.append({
+                        "pk_value": pk_str,
+                        "row_hash": row_hash,
+                        "source_file": source_file,
+                    })
+                elif existing_hashes[pk_str] == row_hash:
+                    # Identical — skip silently
+                    pass
+                else:
+                    # Changed — block and flag
+                    conflict_pks.append(pk_str)
+
+            if conflict_pks:
+                # Compute diff strings for conflicting rows via DuckDB
+                # (queries source table for current values — only for display purposes)
+                col_diff_exprs = [
+                    f"CASE"
+                    f"  WHEN COALESCE(CAST(e.\"{c}\" AS VARCHAR), '__NULL__')"
+                    f"    != COALESCE(CAST(c.\"{c}\" AS VARCHAR), '__NULL__')"
+                    f"  THEN '{c}: '"
+                    f"    || COALESCE(CAST(e.\"{c}\" AS VARCHAR), 'NULL')"
+                    f"    || ' -> '"
+                    f"    || COALESCE(CAST(c.\"{c}\" AS VARCHAR), 'NULL')"
+                    f"  END"
+                    for c in comparable_cols
+                ]
+                reason_expr = (
+                    "array_to_string(list_filter(["
+                    + ", ".join(col_diff_exprs)
+                    + "], x -> x IS NOT NULL), ' | ')"
+                )
+
+                conflict_chunk = chunk[chunk[primary_key].astype(str).isin(conflict_pks)]
+                placeholders = ", ".join(["?"] * len(conflict_pks))
+
+                diff_sql = f"""
+                    SELECT
+                        CAST(c."{primary_key}" AS VARCHAR) AS pk_str,
+                        {reason_expr} AS reason,
+                        array_to_string(list_filter([
+                            {", ".join(
+                                f"CASE WHEN COALESCE(CAST(e.'{c}' AS VARCHAR), '__NULL__') "
+                                f"!= COALESCE(CAST(c.'{c}' AS VARCHAR), '__NULL__') "
+                                f"THEN '{c}' END"
+                                for c in comparable_cols
+                            )}
+                        ], x -> x IS NOT NULL), '|') AS bad_cols
+                    FROM conflict_chunk c
+                    LEFT JOIN (
+                        SELECT DISTINCT ON ("{primary_key}") *
+                        FROM "{table}"
+                        WHERE CAST("{primary_key}" AS VARCHAR) IN ({placeholders})
+                    ) e ON CAST(c."{primary_key}" AS VARCHAR)
+                          = CAST(e."{primary_key}" AS VARCHAR)
+                    WHERE CAST(c."{primary_key}" AS VARCHAR) IN ({placeholders})
+                """
+                try:
+                    diffs_df = conn.execute(diff_sql, conflict_pks + conflict_pks).df()
+                except Exception:
+                    # Fallback: plain reason without diff details
+                    diffs_df = pd.DataFrame({
+                        "pk_str": conflict_pks,
+                        "reason": ["values changed"] * len(conflict_pks),
+                        "bad_cols": [None] * len(conflict_pks),
+                    })
+
+                flag_records = []
+                for _, diff_row in diffs_df.iterrows():
+                    pk_str = str(diff_row["pk_str"])
+                    reason = str(diff_row.get("reason", ""))[:500]
+                    bad_cols = str(diff_row.get("bad_cols", "")) or None
+                    flag_records.append(FlagRecord(
+                        id=flag_id_for(pk_str),
+                        table_name=table,
+                        check_name="duplicate_conflict",
+                        pk_value=pk_str,
+                        source_file=source_file,
+                        bad_columns=bad_cols,
+                        reason=reason,
+                    ))
+                    print(
+                        f"  [blocked] key={pk_str} — "
+                        f"{reason[:80]}{'...' if len(reason) > 80 else ''}"
+                    )
+
+                write_source_flags(conn, flag_records)
+                total_blocked += len(flag_records)
+
+            continue
+
+        # Unknown mode
+        print(f"[warn] Unknown on_duplicate '{on_duplicate}' — appending chunk")
+        rows_to_insert.extend(chunk.itertuples(index=False, name=None))
+
+    if total_blocked:
+        print(f"[blocked] {total_blocked} conflict(s) → source_block (original rows kept)")
+
+    # Bulk update source_pass for all accepted rows
+    if pass_records:
+        bulk_upsert_source_pass(conn, table, pass_records)
+
+    result_df = (
+        pd.DataFrame(rows_to_insert, columns=df.columns)
+        if rows_to_insert
+        else pd.DataFrame(columns=df.columns)
+    )
+    return result_df, total_blocked, total_skipped
 
 
 # ---------------------------------------------------------------------------
-# TestFullRoundTripWithExport
+# _load_csv_with_types — DuckDB-native typed CSV loading
 # ---------------------------------------------------------------------------
 
-class TestFullRoundTripWithExport:
-    def test_ingest_flag_export_fix_import(self, tmp_path):
-        db  = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
+def _load_csv_with_types(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    registry_types: dict[str, str],
+) -> pd.DataFrame:
+    """Load a CSV via DuckDB with declared column types applied natively.
 
-        _write_csv(inc / "sales_jan.csv", [
-            {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-            {"order_id": "ORD-2", "price": 200.0, "updated_at": "2026-01-01"},
-        ])
-        ingest_directory(str(inc), _sources(), db)
+    Sniffs CSV headers first so only columns that exist in the file are
+    passed to DuckDB's dtype parameter (passing absent columns raises
+    BinderException). Columns with a date format suffix are loaded as
+    VARCHAR first, then converted via apply_declared_types.
 
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        conn.close()
+    :param conn:           Open DuckDB connection.
+    :param path:           Path to the CSV file.
+    :param registry_types: {column: declared_type} — may include format suffix.
+    :return: DataFrame typed per declared types.
+    """
+    from proto_pipe.io.migration import apply_declared_types
 
-        # Changed price triggers flag
-        _write_csv(inc / "sales_feb.csv", [
-            {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
-        ])
-        ingest_directory(str(inc), _sources(), db)
+    with open(path, newline="") as _f:
+        csv_columns = set(next(csv.reader(_f)))
 
-        conn       = duckdb.connect(db)
-        flag_count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        assert flag_count == 1
+    dtype: dict[str, str] = {}
+    date_format_cols: dict[str, str] = {}
 
-        # Export
-        export_path = str(tmp_path / "flagged_sales.csv")
-        count = export_flagged(conn, "sales", export_path, primary_key="order_id")
-        assert count == 1
-        assert Path(export_path).exists()
+    for col, declared_type in registry_types.items():
+        if col not in csv_columns:
+            continue
+        if "|" in declared_type:
+            date_format_cols[col] = declared_type
+            dtype[col] = "VARCHAR"
+        else:
+            dtype[col] = declared_type
 
-        exported = pd.read_csv(export_path)
-        assert "_flag_id"     in exported.columns
-        assert "_flag_reason" in exported.columns
-        assert "order_id"     in exported.columns
-        assert exported["order_id"].iloc[0] == "ORD-1"
+    df = conn.read_csv(str(path), dtype=dtype).df()
 
-        # Fix and re-import
-        exported.loc[exported["order_id"] == "ORD-1", "price"] = 75.0
-        exported.to_csv(export_path, index=False)
+    if date_format_cols:
+        df = apply_declared_types(df, date_format_cols)
 
-        result = import_corrections(conn, "sales", export_path, "order_id")
-        conn.close()
+    return df
 
-        assert result["updated"] >= 1
-        assert result["flagged_cleared"] == 1
 
-        conn = duckdb.connect(db)
-        price = conn.execute(
-            "SELECT price FROM sales WHERE order_id = 'ORD-1'"
+# ---------------------------------------------------------------------------
+# _load_excel_with_types — DuckDB spatial extension
+# ---------------------------------------------------------------------------
+
+def _load_excel_with_types(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    registry_types: dict[str, str],
+) -> pd.DataFrame:
+    """Load an Excel file via DuckDB spatial extension with declared types.
+
+    Requires: INSTALL spatial; LOAD spatial (run once at db-init).
+    Falls back to pandas read_excel + apply_declared_types if spatial
+    extension is not available.
+
+    :param conn:           Open DuckDB connection.
+    :param path:           Path to the Excel file.
+    :param registry_types: {column: declared_type} — may include format suffix.
+    :return: DataFrame typed per declared types.
+    """
+    from proto_pipe.io.migration import apply_declared_types
+
+    try:
+        conn.execute("LOAD spatial")
+        df = conn.execute(f"SELECT * FROM read_xlsx('{path}')").df()
+    except Exception:
+        # Spatial extension not available — fall back to pandas
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            df = pd.read_excel(path)
+
+    # Apply declared types for date format columns
+    date_format_cols = {col: dt for col, dt in registry_types.items() if "|" in dt and col in df.columns}
+    plain_types = {col: dt for col, dt in registry_types.items() if "|" not in dt and col in df.columns}
+
+    if plain_types or date_format_cols:
+        all_types = {**plain_types, **date_format_cols}
+        df = apply_declared_types(df, all_types)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Row-level TRY_CAST validation
+# ---------------------------------------------------------------------------
+
+def _validate_row_types(
+    conn: duckdb.DuckDBPyConnection,
+    df: pd.DataFrame,
+    registry_types: dict[str, str],
+    table_name: str,
+    primary_key: str | None,
+    source_file: str,
+) -> tuple[pd.DataFrame, int]:
+    """Find rows where any column fails TRY_CAST to its declared type.
+
+    Writes blocked rows to source_block via write_source_flags.
+    Returns (clean_df, blocked_count).
+
+    Runs entirely in DuckDB — no pandas type inference.
+    """
+    if not registry_types:
+        return df, 0
+
+    blocked_pks: dict[str, list[str]] = {}  # pk_str → list[reason strings]
+    blocked_cols: dict[str, list[str]] = {}  # pk_str → list[col names]
+
+    pk_select = (
+        f'CAST("{primary_key}" AS VARCHAR)'
+        if primary_key and primary_key in df.columns
+        else "'unknown'"
+    )
+
+    for col, declared_type in registry_types.items():
+        if col not in df.columns:
+            continue
+        base_type = declared_type.split("|")[0].upper() if "|" in declared_type else declared_type.upper()
+
+        try:
+            if "|" in declared_type:
+                # Date with format suffix — use TRY_STRPTIME
+                _, fmt = declared_type.split("|", 1)
+                failing = conn.execute(f"""
+                    SELECT {pk_select} AS pk_val,
+                           CAST("{col}" AS VARCHAR) AS raw_value
+                    FROM df
+                    WHERE TRY_STRPTIME(CAST("{col}" AS VARCHAR), '{fmt}') IS NULL
+                    AND "{col}" IS NOT NULL
+                    AND CAST("{col}" AS VARCHAR) != ''
+                """).df()
+            else:
+                failing = conn.execute(f"""
+                    SELECT {pk_select} AS pk_val,
+                           CAST("{col}" AS VARCHAR) AS raw_value
+                    FROM df
+                    WHERE TRY_CAST("{col}" AS {base_type}) IS NULL
+                    AND "{col}" IS NOT NULL
+                    AND CAST("{col}" AS VARCHAR) != ''
+                """).df()
+        except Exception as exc:
+            print(f"  [warn] TRY_CAST check failed for column '{col}': {exc}")
+            continue
+
+        for _, row in failing.iterrows():
+            pk_str = str(row["pk_val"]) if row["pk_val"] is not None else "unknown"
+            reason = f"[{col}] '{row['raw_value']}' cannot be cast to {base_type}"
+            blocked_pks.setdefault(pk_str, []).append(reason)
+            blocked_cols.setdefault(pk_str, []).append(col)
+
+    if not blocked_pks:
+        return df, 0
+
+    flag_records = [
+        FlagRecord(
+            id=flag_id_for(pk),
+            table_name=table_name,
+            check_name="type_conflict",
+            pk_value=pk,
+            source_file=source_file,
+            bad_columns="|".join(blocked_cols.get(pk, [])),
+            reason=" | ".join(reasons)[:500],
+        )
+        for pk, reasons in blocked_pks.items()
+    ]
+    blocked_count = write_source_flags(conn, flag_records)
+
+    # Remove bad rows from df
+    if primary_key and primary_key in df.columns:
+        bad_pk_strs = set(blocked_pks.keys())
+        df = df[~df[primary_key].astype(str).isin(bad_pk_strs)].copy()
+    else:
+        # No PK — can't safely remove individual rows; fail the whole batch
+        print(
+            f"  [warn] {blocked_count} row(s) failed type validation but no primary_key "
+            f"defined — cannot remove individual rows. All rows blocked."
+        )
+        return pd.DataFrame(columns=df.columns), blocked_count
+
+    print(f"  [type_conflict] {blocked_count} row(s) blocked → source_block")
+    return df, blocked_count
+
+
+# ---------------------------------------------------------------------------
+# ingest_single_file — primary entry point
+# ---------------------------------------------------------------------------
+
+def ingest_single_file(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    source: dict,
+    mode: str = "append",
+    on_duplicate_override: str | None = None,
+    log_status_override: str | None = None,
+    strip_pipeline_cols: bool = False,
+) -> dict:
+    """Process one file for a known source. Returns a summary dict.
+
+    All data loading goes through DuckDB. Pandas is not used in the data path.
+
+    :param conn:                  Open DuckDB connection.
+    :param path:                  Path to the file.
+    :param source:                Source definition from sources_config.yaml.
+    :param mode:                  'append' or 'replace'.
+    :param on_duplicate_override: Overrides source.on_duplicate when set.
+                                  Pass 'upsert' from vp flagged retry.
+    :param log_status_override:   Overrides the ingest_state status when set.
+                                  Pass 'correction' from vp flagged retry.
+    :param strip_pipeline_cols:   When True, drops all _-prefixed columns after
+                                  load. Pass True from vp flagged retry to strip
+                                  _flag_id, _flag_reason, _flag_columns etc.
+    :return: {status, table, rows, new_cols, flagged, skipped} or
+             {status: 'failed', message} on failure.
+    """
+    table = source["target_table"]
+    primary_key = source.get("primary_key")
+    on_duplicate = on_duplicate_override or source.get(
+        "on_duplicate", "flag" if primary_key else "append"
+    )
+    is_csv = path.suffix.lower() == ".csv"
+    is_excel = path.suffix.lower() in {".xlsx", ".xls"}
+    source_file = str(path)
+
+    # ── Step 1: Structural checks from file header ────────────────────────
+    # Check for empty file, missing PK column, missing timestamp column.
+    # All checks run from the file header — no DuckDB or pandas load yet.
+    try:
+        if is_csv:
+            with open(path, newline="") as _f:
+                reader = csv.reader(_f)
+                try:
+                    file_cols = next(reader)
+                    has_data = next(reader, None) is not None
+                except StopIteration:
+                    file_cols = []
+                    has_data = False
+        else:
+            # Excel — peek via DuckDB spatial for column names
+            try:
+                conn.execute("LOAD spatial")
+                peek = conn.execute(
+                    f"SELECT * FROM read_xlsx('{path}') LIMIT 1"
+                ).df()
+                file_cols = list(peek.columns)
+                has_data = len(peek) > 0
+            except Exception:
+                # Fallback to pandas for structural peek only
+                peek = pd.read_excel(path, nrows=1)
+                file_cols = list(peek.columns)
+                has_data = len(peek) > 0
+    except Exception as exc:
+        message = f"Could not read file: {exc}"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    if not has_data:
+        message = "File is empty"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    timestamp_col = source.get("timestamp_col")
+    if timestamp_col and timestamp_col not in file_cols:
+        message = f"Missing required timestamp column '{timestamp_col}'"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    if primary_key and primary_key not in file_cols:
+        message = f"Missing primary key column '{primary_key}'"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    # ── Step 2: Registry type lookup + unknown column check ───────────────
+    user_cols = [c for c in file_cols if not c.startswith("_")]
+    registry_types = get_registry_types(conn, user_cols)
+
+    # Unknown column check — only for normal ingest, not correction path.
+    # Correction path (strip_pipeline_cols=True) uses confirmed registry types
+    # from when the source was first created; new columns in corrections are
+    # not expected and would be unusual.
+    if not strip_pipeline_cols and registry_types:
+        unknown_cols = [c for c in user_cols if c not in registry_types]
+        if unknown_cols:
+            message = (
+                f"Unknown column(s) with no declared type: {', '.join(sorted(unknown_cols))}. "
+                f"Run 'vp edit column-type' to confirm the type(s), then re-ingest."
+            )
+            print(f"[fail] '{path.name}': {message}")
+            log_ingest_state(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
+
+    # ── Step 3: Load via DuckDB ───────────────────────────────────────────
+    try:
+        if is_csv:
+            df = _load_csv_with_types(conn, path, registry_types)
+        else:
+            df = _load_excel_with_types(conn, path, registry_types)
+    except Exception as exc:
+        message = f"Could not load file via DuckDB: {exc}"
+        print(f"[fail] '{path.name}': {message}")
+        log_ingest_state(conn, path.name, table, "failed", message=message)
+        return {"status": "failed", "message": message}
+
+    # Strip pipeline columns for correction path
+    if strip_pipeline_cols:
+        df = df[[c for c in df.columns if not c.startswith("_")]]
+
+    # ── Step 4: NULL primary key check ───────────────────────────────────
+    if primary_key and primary_key in df.columns:
+        null_count = conn.execute(
+            f'SELECT count(*) FROM df WHERE "{primary_key}" IS NULL'
         ).fetchone()[0]
-        remaining = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        conn.close()
+        if null_count:
+            message = (
+                f"{null_count} row(s) have NULL in primary key '{primary_key}' — file rejected"
+            )
+            print(f"[fail] '{path.name}': {message}")
+            log_ingest_state(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
 
-        assert price == 75.0
-        assert remaining == 0
+    # ── Step 5: Row-level TRY_CAST validation ────────────────────────────
+    # Find rows where any column fails to cast to its declared type.
+    # Bad rows → source_block. Clean rows proceed.
+    df, blocked_count = _validate_row_types(
+        conn, df, registry_types, table, primary_key, source_file
+    )
 
+    # Add pipeline timestamp
+    df["_ingested_at"] = datetime.now(timezone.utc)
 
-# ---------------------------------------------------------------------------
-# TestSQLFlagMode — classify query path in _handle_duplicates
-# ---------------------------------------------------------------------------
-class TestSQLFlagMode:
-    """The flag mode classify query runs in pure SQL — no iterrows on the
-    incoming DataFrame. These tests verify correctness of the SQL path."""
+    new_cols: list[str] = []
+    flagged_count = 0
+    skipped_count = 0
 
-    def _setup(self, tmp_path):
-        db = _make_db(tmp_path)
-        inc = _make_incoming(tmp_path)
-        _write_csv(
-            inc / "sales_jan.csv",
-            [
-                {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-                {"order_id": "ORD-2", "price": 200.0, "updated_at": "2026-01-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        _init_flagged_rows(conn)
-        conn.close()
-        return db, inc
+    # ── Scenario A: first ingest or replace mode ──────────────────────────
+    if mode == "replace" or not table_exists(conn, table):
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            conn.execute(f'CREATE TABLE "{table}" AS SELECT * FROM df')
+            print(f"[ok] '{path.name}' → '{table}' ({len(df)} rows, created)")
+        except Exception as exc:
+            message = f"DuckDB write failed: {exc}"
+            print(f"[fail] '{path.name}': {message}")
+            log_ingest_state(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
 
-    def test_new_key_inserted(self, tmp_path):
-        db, inc = self._setup(tmp_path)
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
-                {"order_id": "ORD-NEW", "price": 50.0, "updated_at": "2026-02-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        count = conn.execute(
-            "SELECT count(*) FROM sales WHERE order_id = 'ORD-NEW'"
-        ).fetchone()[0]
-        conn.close()
-        assert count == 1
-
-    def test_identical_row_not_inserted_not_flagged(self, tmp_path):
-        """Same key, same content — silently dropped, no flag, no duplicate row."""
-        db, inc = self._setup(tmp_path)
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
-                {"order_id": "ORD-1", "price": 100.0, "updated_at": "2026-01-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        flags = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        conn.close()
-        assert count == 2  # no new row inserted
-        assert flags == 0  # no flag raised
-
-    def test_conflict_reason_names_changed_column(self, tmp_path):
-        """The reason string built in SQL names the column that changed."""
-        db, inc = self._setup(tmp_path)
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
-                {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        reason = conn.execute("SELECT reason FROM flagged_rows").fetchone()[0]
-        conn.close()
-        assert "price" in reason
-        assert "100.0" in reason
-        assert "-50.0" in reason
-
-    def test_conflict_id_is_md5_of_pk(self, tmp_path):
-        """The flag id equals md5(pk_value) so export_flagged can join on it."""
-        db, inc = self._setup(tmp_path)
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
-                {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        stored_id = conn.execute("SELECT id FROM flagged_rows").fetchone()[0]
-        conn.close()
-        assert stored_id == _expected_flag_id("ORD-1")
-
-    def test_mixed_chunk_new_identical_conflict(self, tmp_path):
-        """A single file containing all three categories is handled correctly."""
-        db, inc = self._setup(tmp_path)
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
+        # Seed source_pass for all inserted rows
+        if primary_key and primary_key in df.columns and not df.empty:
+            comparable_cols = [
+                c for c in df.columns
+                if not c.startswith("_") and c != primary_key
+            ]
+            pass_records = [
                 {
-                    "order_id": "ORD-1",
-                    "price": -50.0,
-                    "updated_at": "2026-02-01",
-                },  # conflict
-                {
-                    "order_id": "ORD-2",
-                    "price": 200.0,
-                    "updated_at": "2026-01-01",
-                },  # identical
-                {
-                    "order_id": "ORD-NEW",
-                    "price": 300.0,
-                    "updated_at": "2026-02-01",
-                },  # new
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
-        flags = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
-        ord1 = conn.execute(
-            "SELECT price FROM sales WHERE order_id = 'ORD-1'"
-        ).fetchone()[0]
-        new_count = conn.execute(
-            "SELECT count(*) FROM sales WHERE order_id = 'ORD-NEW'"
-        ).fetchone()[0]
-        conn.close()
-        assert count == 3  # ORD-1, ORD-2, ORD-NEW
-        assert flags == 1  # only ORD-1 conflicted
-        assert ord1 == 100.0  # original preserved
-        assert new_count == 1  # new row inserted
+                    "pk_value": str(row[primary_key]),
+                    "row_hash": compute_row_hash(row.to_dict(), comparable_cols),
+                    "source_file": source_file,
+                }
+                for _, row in df.iterrows()
+            ]
+            bulk_upsert_source_pass(conn, table, pass_records)
 
-    def test_conflict_row_exportable_after_flag(self, tmp_path):
-        """A flagged row can be immediately exported via export_flagged."""
-        db, inc = self._setup(tmp_path)
-        _write_csv(
-            inc / "sales_feb.csv",
-            [
-                {"order_id": "ORD-1", "price": -50.0, "updated_at": "2026-02-01"},
-            ],
-        )
-        ingest_directory(str(inc), _sources(), db)
-        conn = duckdb.connect(db)
-        output = str(tmp_path / "flagged.csv")
-        count = export_flagged(conn, "sales", output, primary_key="order_id")
+    # ── Scenario B: subsequent ingest ─────────────────────────────────────
+    else:
+        try:
+            new_cols = auto_migrate(conn, table, df)
+
+            if primary_key:
+                df, flagged_count, skipped_count = _handle_duplicates(
+                    conn, table, df, primary_key, on_duplicate, source_file
+                )
+            else:
+                if on_duplicate not in ("append", "flag"):
+                    print(
+                        f"[warn] on_duplicate='{on_duplicate}' ignored for "
+                        f"'{table}' — no primary_key defined"
+                    )
+
+            if not df.empty:
+                col_list = ", ".join(f'"{c}"' for c in df.columns)
+                conn.execute(
+                    f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM df'
+                )
+
+            print(
+                f"[ok] '{path.name}' → '{table}' "
+                f"({len(df)} inserted, "
+                f"{flagged_count + blocked_count} blocked, "
+                f"{skipped_count} skipped)"
+            )
+        except Exception as exc:
+            message = f"DuckDB write failed: {exc}"
+            print(f"[fail] '{path.name}': {message}")
+            log_ingest_state(conn, path.name, table, "failed", message=message)
+            return {"status": "failed", "message": message}
+
+    final_status = log_status_override or "ok"
+    log_ingest_state(
+        conn, path.name, table, final_status,
+        rows=len(df), new_cols=new_cols
+    )
+    return {
+        "status": "ok",
+        "table": table,
+        "rows": len(df),
+        "new_cols": new_cols,
+        "flagged": flagged_count + blocked_count,
+        "skipped": skipped_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Utility commands
+# ---------------------------------------------------------------------------
+
+def check_null_overwrites(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    primary_key: str,
+) -> int:
+    """Scan the table for primary keys that appear more than once with
+    different row content. Flags new conflicts to source_block.
+
+    Returns the number of new conflicts flagged.
+    """
+    duplicate_keys = conn.execute(f"""
+        SELECT "{primary_key}"
+        FROM "{table}"
+        GROUP BY "{primary_key}"
+        HAVING count(*) > 1
+    """).df()
+
+    if duplicate_keys.empty:
+        return 0
+
+    all_cols = conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        [table],
+    ).df()["column_name"].tolist()
+    non_key_cols = [
+        c for c in all_cols
+        if c != primary_key and not c.startswith("_")
+    ]
+
+    keys = duplicate_keys[primary_key].tolist()
+    flag_records: list[FlagRecord] = []
+
+    for chunk_start in range(0, len(keys), CHUNK_SIZE):
+        chunk_keys = keys[chunk_start: chunk_start + CHUNK_SIZE]
+        placeholders = ", ".join(["?"] * len(chunk_keys))
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE "{primary_key}" IN ({placeholders})',
+            chunk_keys,
+        ).df()
+
+        for key_val, group in rows.groupby(primary_key):
+            if len(group) < 2:
+                continue
+            first = group.iloc[0]
+            for _, later in group.iloc[1:].iterrows():
+                diffs = []
+                for col in non_key_cols:
+                    old_val = first.get(col)
+                    new_val = later.get(col)
+                    try:
+                        old_null = pd.isna(old_val)
+                        new_null = pd.isna(new_val)
+                    except (TypeError, ValueError):
+                        old_null = old_val is None
+                        new_null = new_val is None
+                    if old_null and new_null:
+                        continue
+                    if old_null != new_null or old_val != new_val:
+                        old_str = "NULL" if old_null else str(old_val)
+                        new_str = "NULL" if new_null else str(new_val)
+                        diffs.append(f"{col}: {old_str} -> {new_str}")
+
+                if diffs:
+                    shown = diffs[:_MAX_DIFF_COLS]
+                    leftover = len(diffs) - len(shown)
+                    reason = " | ".join(shown)
+                    if leftover:
+                        reason += f" +{leftover} more"
+                    flag_records.append(FlagRecord(
+                        id=flag_id_for(str(key_val)),
+                        table_name=table,
+                        check_name="duplicate_conflict",
+                        pk_value=str(key_val),
+                        bad_columns=None,
+                        reason=reason,
+                    ))
+
+    if flag_records:
+        write_source_flags(conn, flag_records)
+
+    return len(flag_records)
+
+
+def reset_report(table_name: str, db_path: str) -> None:
+    """Drop a report table and clear its ingest_state entries so files are re-ingested.
+
+    After calling this, the next vp ingest run will recreate the table
+    from source files as if it had never been ingested.
+    """
+    conn = duckdb.connect(db_path)
+    try:
+        if table_exists(conn, table_name):
+            conn.execute(f'DROP TABLE "{table_name}"')
+            print(f"  [reset] Dropped table '{table_name}'")
+        else:
+            print(f"  [reset] Table '{table_name}' does not exist — nothing to drop")
+
+        deleted = conn.execute(
+            "DELETE FROM ingest_state WHERE table_name = ? RETURNING filename",
+            [table_name],
+        ).fetchall()
+        if deleted:
+            filenames = [row[0] for row in deleted]
+            print(
+                f"  [reset] Cleared {len(filenames)} ingest_state entry/entries: "
+                f"{', '.join(filenames)}"
+            )
+
+        # Also clear source_pass for this table
+        from proto_pipe.io.db import clear_source_pass_for_table
+        cleared = clear_source_pass_for_table(conn, table_name)
+        if cleared:
+            print(f"  [reset] Cleared {cleared} source_pass entry/entries")
+
+    finally:
         conn.close()
-        assert count == 1
-        df = pd.read_csv(output)
-        assert df["order_id"].iloc[0] == "ORD-1"
-        assert df["price"].iloc[0] == 100.0  # original price in table
+
+
+def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
+    """Register all SQL macros found in macros_dir with the DuckDB connection."""
+    p = Path(macros_dir)
+    if not p.exists():
+        print(f"  [warn] macros_dir '{macros_dir}' not found — skipping macro loading")
+        return
+
+    sql_files = sorted(p.glob("*.sql"))
+    if not sql_files:
+        return
+
+    for sql_file in sql_files:
+        try:
+            sql = sql_file.read_text().strip()
+            if sql:
+                conn.execute(sql)
+                print(f"  [macro] Loaded '{sql_file.name}'")
+        except Exception as e:
+            print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")

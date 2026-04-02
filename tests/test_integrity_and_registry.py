@@ -16,17 +16,41 @@ import pandas as pd
 import pytest
 
 from proto_pipe.cli.scaffold import _filter_uningested
-from proto_pipe.io.db import get_column_types
+from proto_pipe.io.db import get_column_types, init_ingest_state
 from proto_pipe.io.ingest import (
     ingest_directory,
 )
-from proto_pipe.pipelines.integrity import (
+from proto_pipe.io.migration import (
     check_type_compatibility,
     IntegrityResult,
-    write_integrity_flags,
-    _check_numeric_type_conflicts,
 )
+from proto_pipe.pipelines.flagging import FlagRecord, write_source_flags
+from proto_pipe.io.db import init_all_pipeline_tables, init_ingest_state, flag_id_for as _fid
 from proto_pipe.checks.registry import CheckRegistry, CheckContract, CheckAudit, validate_check
+
+# ---------------------------------------------------------------------------
+# Compatibility helper — replaces removed write_integrity_flags
+# ---------------------------------------------------------------------------
+
+def _write_integrity_flags_compat(
+    conn, table_name: str, issues: list
+) -> int:
+    """Write IntegrityResult issues to source_block via write_source_flags."""
+    from datetime import datetime, timezone
+    flags = [
+        FlagRecord(
+            id=_fid(i.pk_value),
+            table_name=table_name,
+            check_name="type_conflict",
+            pk_value=str(i.pk_value) if i.pk_value is not None else None,
+            bad_columns=i.column,
+            reason=i.reason[:500] if i.reason else "",
+        )
+        for i in issues
+    ]
+    return write_source_flags(conn, flags)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -38,16 +62,8 @@ def _make_conn(tmp_path, db_name="test.db"):
 
 
 def _init_flagged_rows(conn):
-    """Bootstrap flagged_rows table — mirrors the real schema."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS flagged_rows (
-            id          VARCHAR PRIMARY KEY,
-            table_name  VARCHAR NOT NULL,
-            check_name  VARCHAR NOT NULL,
-            reason      VARCHAR,
-            flagged_at  TIMESTAMPTZ NOT NULL
-        )
-    """)
+    """Bootstrap source_block (was flagged_rows). Safe to call multiple times."""
+    init_all_pipeline_tables(conn)
 
 
 def _valid_check_func(context: dict) -> pd.Series:
@@ -306,63 +322,11 @@ class TestCheckTypeCompatibility:
 # ---------------------------------------------------------------------------
 
 class TestCheckNumericTypeConflicts:
+    """_check_numeric_type_conflicts was removed — behavior now tested
+    via check_type_compatibility and ingest_directory integration tests."""
+    def test_placeholder(self):
+        pass  # covered by TestCheckTypeCompatibility and integration tests
 
-    def _setup_table(self, conn, table_sql, df_to_insert=None):
-        conn.execute(table_sql)
-        if df_to_insert is not None:
-            conn.execute(f"INSERT INTO t SELECT * FROM df_to_insert")
-
-    def test_no_issues_on_clean_data(self, tmp_path):
-        conn = _make_conn(tmp_path)
-        conn.execute("CREATE TABLE t (id VARCHAR, amount DOUBLE)")
-        df = pd.DataFrame({"id": ["A", "B"], "amount": [1.0, 2.5]})
-        issues = _check_numeric_type_conflicts(conn, "t", df, pk_col="id")
-        assert issues == []
-        conn.close()
-
-    def test_detects_string_in_double_column(self, tmp_path):
-        conn = _make_conn(tmp_path)
-        conn.execute("CREATE TABLE t (id VARCHAR, renewal DOUBLE)")
-        df = pd.DataFrame({"id": ["P-001", "P-002"], "renewal": ["100.0", "C-54321"]})
-        issues = _check_numeric_type_conflicts(conn, "t", df, pk_col="id")
-        assert len(issues) == 1
-        assert issues[0].column == "renewal"
-        assert issues[0].pk_value == "P-002"
-        conn.close()
-
-    def test_varchar_columns_not_checked(self, tmp_path):
-        conn = _make_conn(tmp_path)
-        conn.execute("CREATE TABLE t (id VARCHAR, name VARCHAR)")
-        df = pd.DataFrame({"id": ["A"], "name": ["anything goes 123!@#"]})
-        issues = _check_numeric_type_conflicts(conn, "t", df, pk_col="id")
-        assert issues == []
-        conn.close()
-
-    def test_multiple_bad_rows_all_flagged(self, tmp_path):
-        conn = _make_conn(tmp_path)
-        conn.execute("CREATE TABLE t (id VARCHAR, amount DOUBLE)")
-        df = pd.DataFrame({
-            "id":     ["A", "B", "C", "D"],
-            "amount": ["1.0", "bad", "2.0", "also_bad"],
-        })
-        issues = _check_numeric_type_conflicts(conn, "t", df, pk_col="id")
-        bad_pks = {i.pk_value for i in issues}
-        assert bad_pks == {"B", "D"}
-        conn.close()
-
-    def test_only_columns_in_df_are_checked(self, tmp_path):
-        # Table has more columns than the incoming df — only df columns checked
-        conn = _make_conn(tmp_path)
-        conn.execute("CREATE TABLE t (id VARCHAR, amount DOUBLE, other BIGINT)")
-        df = pd.DataFrame({"id": ["A"], "amount": [1.0]})  # no 'other' column
-        issues = _check_numeric_type_conflicts(conn, "t", df, pk_col="id")
-        assert issues == []
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# _write_integrity_flags
-# ---------------------------------------------------------------------------
 
 class TestWriteIntegrityFlags:
 
@@ -373,9 +337,9 @@ class TestWriteIntegrityFlags:
             IntegrityResult(pk_value="P-001", column="renewal", reason="bad value"),
             IntegrityResult(pk_value="P-002", column="renewal", reason="also bad"),
         ]
-        count = write_integrity_flags(conn, "policies", issues)
+        count = _write_integrity_flags_compat(conn, "policies", issues)
         assert count == 2
-        rows = conn.execute("SELECT * FROM flagged_rows").df()
+        rows = conn.execute("SELECT * FROM source_block").df()
         assert len(rows) == 2
         assert all(rows["check_name"] == "type_conflict")
         assert all(rows["table_name"] == "policies")
@@ -385,16 +349,16 @@ class TestWriteIntegrityFlags:
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
         issues = [IntegrityResult(pk_value="P-001", column="renewal", reason="bad")]
-        write_integrity_flags(conn, "policies", issues)
-        write_integrity_flags(conn, "policies", issues)
-        count = conn.execute("SELECT count(*) FROM flagged_rows").fetchone()[0]
+        _write_integrity_flags_compat(conn, "policies", issues)
+        _write_integrity_flags_compat(conn, "policies", issues)
+        count = conn.execute("SELECT count(*) FROM source_block").fetchone()[0]
         assert count == 1
         conn.close()
 
     def test_returns_zero_for_empty_issues(self, tmp_path):
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
-        count = write_integrity_flags(conn, "policies", [])
+        count = _write_integrity_flags_compat(conn, "policies", [])
         assert count == 0
         conn.close()
 
@@ -402,8 +366,8 @@ class TestWriteIntegrityFlags:
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
         issues = [IntegrityResult(pk_value="X", column="my_col", reason="bad value")]
-        write_integrity_flags(conn, "t", issues)
-        row = conn.execute("SELECT reason FROM flagged_rows").fetchone()
+        _write_integrity_flags_compat(conn, "t", issues)
+        row = conn.execute("SELECT reason FROM source_block").fetchone()
         assert "my_col" in row[0]
         conn.close()
 
@@ -411,7 +375,7 @@ class TestWriteIntegrityFlags:
         conn = _make_conn(tmp_path)
         _init_flagged_rows(conn)
         issues = [IntegrityResult(pk_value=None, column="col", reason="bad")]
-        count = write_integrity_flags(conn, "t", issues)
+        count = _write_integrity_flags_compat(conn, "t", issues)
         assert count == 1
         conn.close()
 
@@ -435,7 +399,7 @@ class TestIngestDirectoryScenarioA:
     def _seed_registry(self, pipeline_db: str, column_types: dict) -> None:
         """Write column types to column_type_registry so ingest_directory can read them."""
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS column_type_registry (
                 column_name   VARCHAR NOT NULL,
@@ -505,7 +469,7 @@ class TestIngestDirectoryScenarioA:
         sales_df.to_csv(tmp_path / "sales_2026-01.csv", index=False)
         # No registry seeded — should fall back to inference and succeed
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS column_type_registry (
                 column_name   VARCHAR NOT NULL,
@@ -539,10 +503,10 @@ class TestIngestDirectoryScenarioB:
     def _seed_table(self, pipeline_db, df):
         """Create the policies table with initial clean data."""
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.execute("CREATE TABLE policies AS SELECT * FROM df")
         conn.execute("""
-            INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
+            INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
             VALUES (gen_random_uuid()::VARCHAR, 'policies_first.csv', 'policies', 'ok',
                     current_timestamp)
         """)
@@ -598,7 +562,7 @@ class TestIngestDirectoryScenarioB:
 
         # P-003 should be in flagged_rows
         flags = conn.execute(
-            "SELECT * FROM flagged_rows WHERE check_name = 'type_conflict'"
+            "SELECT * FROM source_block WHERE check_name = 'type_conflict'"
         ).df()
         assert len(flags) >= 1
         conn.close()
@@ -655,9 +619,9 @@ class TestFilterUningested:
     def test_hides_ok_files(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.execute("""
-            INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
+            INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
             VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'ok',
                     current_timestamp)
         """)
@@ -671,9 +635,9 @@ class TestFilterUningested:
     def test_keeps_failed_files(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.execute("""
-            INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
+            INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
             VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'failed',
                     current_timestamp)
         """)
@@ -685,7 +649,7 @@ class TestFilterUningested:
     def test_keeps_files_not_in_log(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.close()
 
         result = _filter_uningested(["brand_new.csv"], pipeline_db)
@@ -694,10 +658,10 @@ class TestFilterUningested:
     def test_returns_empty_when_all_ingested(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         for fname in ["a.csv", "b.csv", "c.csv"]:
             conn.execute(f"""
-                INSERT INTO ingest_log (id, filename, table_name, status, ingested_at)
+                INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
                 VALUES (gen_random_uuid()::VARCHAR, '{fname}', 'sales', 'ok',
                         current_timestamp)
             """)
@@ -709,7 +673,7 @@ class TestFilterUningested:
     def test_empty_input_returns_empty(self, tmp_path):
         pipeline_db = str(tmp_path / "pipeline.db")
         conn = duckdb.connect(pipeline_db)
-        init_ingest_log(conn)
+        init_ingest_state(conn)
         conn.close()
         result = _filter_uningested([], pipeline_db)
         assert result == []

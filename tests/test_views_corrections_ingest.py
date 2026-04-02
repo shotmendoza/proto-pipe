@@ -17,7 +17,6 @@ import pytest
 
 from proto_pipe.io.db import  already_ingested, flag_id_for
 from proto_pipe.reports.corrections import import_corrections, export_flagged
-from proto_pipe.reports.validation_flags import init_validation_flags_table
 from proto_pipe.reports.views import (
     create_views,
     refresh_views,

@@ -161,13 +161,26 @@ def write_validation_flags(
 
     Uses ON CONFLICT DO NOTHING — idempotent.
     report_name must be set on every FlagRecord passed here.
+
+    IDs are recomputed here from (report_name, check_name, pk_value) so that
+    the same row failing the same check in the same report always produces the
+    same id — regardless of what the caller passed. Falls back to uuid4 when
+    pk_value is None.
     """
     if not flags:
         return 0
 
+    import uuid
+
+    def _vid(f: FlagRecord) -> str:
+        if f.pk_value is None:
+            return str(uuid.uuid4())
+        key = f"{f.report_name}:{f.check_name}:{f.pk_value}"
+        return hashlib.md5(key.encode()).hexdigest()
+
     flags_df = pd.DataFrame([
         {
-            "id":           f.id,
+            "id":           _vid(f),
             "table_name":   f.table_name,
             "report_name":  f.report_name,
             "check_name":   f.check_name,

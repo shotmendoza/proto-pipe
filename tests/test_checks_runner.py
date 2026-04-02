@@ -25,11 +25,26 @@ from proto_pipe.checks.built_in import check_nulls, check_range
 from proto_pipe.checks.result import CheckResult
 from proto_pipe.checks.runner import run_check_safe, run_checks, run_checks_and_flag
 from proto_pipe.checks.registry import CheckRegistry
-from proto_pipe.reports.validation_flags import (
-    count_validation_flags,
-    detail_df,
-    init_validation_flags_table,
-)
+from proto_pipe.io.db import init_all_pipeline_tables
+
+
+# ---------------------------------------------------------------------------
+# Helpers replacing validation_flags module functions
+# ---------------------------------------------------------------------------
+
+def _count_flags(conn: duckdb.DuckDBPyConnection, report_name: str) -> int:
+    """Count validation_block entries for a report."""
+    return conn.execute(
+        "SELECT count(*) FROM validation_block WHERE report_name = ?", [report_name]
+    ).fetchone()[0]
+
+
+def _detail(conn: duckdb.DuckDBPyConnection, report_name: str) -> "pd.DataFrame":
+    """Return validation_block rows for a report, ordered by flagged_at."""
+    return conn.execute(
+        "SELECT * FROM validation_block WHERE report_name = ? ORDER BY flagged_at",
+        [report_name],
+    ).df()
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +60,7 @@ def registry():
 def pipeline_db(tmp_path):
     db_path = str(tmp_path / "pipeline.db")
     conn = duckdb.connect(db_path)
-    init_validation_flags_table(conn)
+    init_all_pipeline_tables(conn)
     conn.close()
     return db_path
 
@@ -182,7 +197,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            det = detail_df(conn, "sales_report")
+            det = _detail(conn, "sales_report")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] == "ORD-002"
             assert det.iloc[0]["reason"] is not None
@@ -208,7 +223,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            det = detail_df(conn, "sales_report")
+            det = _detail(conn, "sales_report")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] == "ORD-002"
         finally:
@@ -232,7 +247,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            det = detail_df(conn, "sales_report")
+            det = _detail(conn, "sales_report")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] is None
             assert "completely broken" in det.iloc[0]["reason"]
@@ -255,7 +270,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            assert count_validation_flags(conn, "sales_report") == 1
+            assert _count_flags(conn, "sales_report") == 1
         finally:
             conn.close()
 
@@ -280,7 +295,7 @@ class TestRunChecksAndFlag:
         conn = duckdb.connect(pipeline_db)
         try:
             # Both checks flag ORD-002 with different check names → 2 flags
-            assert count_validation_flags(conn, "sales_report") == 2
+            assert _count_flags(conn, "sales_report") == 2
         finally:
             conn.close()
 
@@ -299,7 +314,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            assert count_validation_flags(conn, "r") == 1
+            assert _count_flags(conn, "r") == 1
         finally:
             conn.close()
 
@@ -335,7 +350,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            det = detail_df(conn, "r")
+            det = _detail(conn, "r")
             assert len(det) == 1
             assert det.iloc[0]["pk_value"] is None
         finally:
@@ -356,7 +371,7 @@ class TestRunChecksAndFlag:
 
         conn = duckdb.connect(pipeline_db)
         try:
-            assert count_validation_flags(conn, "sales_report") == 0
+            assert _count_flags(conn, "sales_report") == 0
         finally:
             conn.close()
 
