@@ -27,6 +27,7 @@ Duplicate row handling (on_duplicate in sources_config.yaml):
 Each ingest run logs results (including failures) to the `ingest_log` table
 so failures are visible without stopping the entire run.
 """
+import csv
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
@@ -798,10 +799,16 @@ def _load_csv_with_types(
     :param registry_types: {column: declared_type} — may include format suffix.
     :return: DataFrame with columns typed per declared types.
     """
+    with open(path, newline="") as f:
+        csv_columns = set(next(csv.reader(f)))
+
     dtype: dict[str, str] = {}
     date_format_cols: dict[str, str] = {}
 
     for col, declared_type in registry_types.items():
+        if col not in csv_columns:
+            continue
+
         if "|" in declared_type:
             # Date with format suffix — load as VARCHAR, convert after
             date_format_cols[col] = declared_type
