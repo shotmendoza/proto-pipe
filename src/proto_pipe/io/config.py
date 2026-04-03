@@ -452,7 +452,8 @@ def set_path(key: str, value: str, path: Path = DEFAULT_SETTINGS_PATH) -> None:
             f"Unknown path key '{key}'. "
             f"Valid keys: {list(settings['paths'].keys())}"
         )
-    settings["paths"][key] = value
-    save_settings(settings, path)
+    raw = load_config(path) if path.exists() else {}
+    raw.setdefault("paths", {})[key] = value
+    save_settings(raw, path)
 
 
