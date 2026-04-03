@@ -386,6 +386,12 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     for key, value in loaded.items():
         if key != "paths":
             merged[key] = value
+            
+    # Resolve all relative paths against pipeline.yaml's own directory,
+    # not the CWD — so vp works correctly from any subdirectory.
+    for key, val in merged["paths"].items():
+        if val and not Path(val).is_absolute():
+            merged["paths"][key] = str((config_dir / val).resolve())
     return merged
 
 
