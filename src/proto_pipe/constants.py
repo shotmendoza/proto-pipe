@@ -5,6 +5,17 @@ from pathlib import Path
 
 import pandas as pd
 
+
+def _find_settings_path() -> Path:
+    """Walk up from CWD looking for pipeline.yaml, like git finds .git."""
+    current = Path.cwd()
+    for parent in [current, *current.parents]:
+        candidate = parent / "pipeline.yaml"
+        if candidate.exists():
+            return candidate
+    return Path("pipeline.yaml")  # fallback — will trigger the defaults path
+
+
 # Tables created and managed by the pipeline itself.
 # Excluded from user-facing table lists (e.g. vp new-report, vp table).
 PIPELINE_TABLES: frozenset[str] = frozenset({
