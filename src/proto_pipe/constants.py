@@ -14,6 +14,9 @@ def _find_settings_path() -> Path:
         if candidate.exists():
             return candidate
     return Path("pipeline.yaml")  # fallback — will trigger the defaults path
+    
+    
+DEFAULT_SETTINGS_PATH = _find_settings_path()
 
 
 # Tables created and managed by the pipeline itself.
