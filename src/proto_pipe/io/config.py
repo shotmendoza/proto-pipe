@@ -429,6 +429,16 @@ def get_path(key: str, path: Path = DEFAULT_SETTINGS_PATH) -> str:
     :rtype: str
     """
     return load_settings(path)["paths"][key]
+    
+
+def _find_settings_path() -> Path:
+    """Walk up from CWD looking for pipeline.yaml, like git finds .git."""
+    current = Path.cwd()
+    for parent in [current, *current.parents]:
+        candidate = parent / "pipeline.yaml"
+        if candidate.exists():
+            return candidate
+    return Path("pipeline.yaml")  # fallback — will trigger the defaults path
 
 
 def set_path(key: str, value: str, path: Path = DEFAULT_SETTINGS_PATH) -> None:
