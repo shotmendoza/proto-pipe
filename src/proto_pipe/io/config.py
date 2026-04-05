@@ -16,9 +16,6 @@ from proto_pipe.constants import _DEFAULTS, DEFAULT_SETTINGS_PATH
 
 # TODO: Create an abstract class for the Config. Lot's of shared methods.
 
-DEFAULT_SETTINGS_PATH = _find_settings_path()
-
-
 class SourceConfig:
     """Wraps sources_config.yaml with typed accessors and write methods.
 
