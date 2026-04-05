@@ -63,7 +63,6 @@ _DEFAULTS = {
     "macros_dir": "macros",
 }
 VALID_PATH_KEYS = list(_DEFAULTS["paths"].keys())
-DEFAULT_SETTINGS_PATH = Path("pipeline.yaml")
 
 NULLABLE_EXTENSION_DTYPES = (
     pd.Int8Dtype,
