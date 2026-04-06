@@ -103,6 +103,13 @@ class CheckResult:
         )
 
 
+@dataclass(frozen=True)
+class CheckOutcome:
+    status: str   # "passed" | "failed" | "unavailable" | "error"
+    result: CheckResult | None = None
+    error: str | None = None
+
+
 def wrap_series_check(func: Callable) -> Callable:
     """A decorator function to wrap a callable and ensure its return value is processed
     into a `CheckResult` object using the `from_series` method. This wrapper also

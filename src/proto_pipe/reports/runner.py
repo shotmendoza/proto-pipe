@@ -368,7 +368,7 @@ def run_report(
         results = run_checks(check_names, check_registry, context, parallel=parallel_checks)
 
         # Advance watermark on full pass — mirrors the full validation path
-        all_passed = all(v.get("status") == "passed" for v in results.values())
+        all_passed = all(v.status == "passed" for v in results.values())
         if all_passed:
             ts_col = source_config.get("timestamp_col") or "_ingested_at"
             if ts_col and ts_col in df.columns:

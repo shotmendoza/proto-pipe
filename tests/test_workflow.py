@@ -318,7 +318,7 @@ class TestCustomCheckInPipeline:
             uuid.uuid5(uuid.NAMESPACE_DNS, f"quantity_positive:{sorted({}.items())}")
         )
         assert expected_key in sales_result["results"]
-        result = sales_result["results"][expected_key]["result"]
+        result = sales_result["results"][expected_key].result
         from proto_pipe.checks.result import CheckResult
 
         assert isinstance(result, CheckResult)

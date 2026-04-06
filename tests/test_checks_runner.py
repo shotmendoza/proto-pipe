@@ -87,13 +87,13 @@ class TestRunCheckSafe:
     def test_returns_passed_on_success(self, registry, context):
         registry.register("null_check", check_nulls)
         outcome = run_check_safe(registry, "null_check", context)
-        assert outcome["status"] == "passed"
-        assert "result" in outcome
+        assert outcome.status == "passed"
+        assert outcome.result is not None
 
     def test_result_is_check_result(self, registry, context):
         registry.register("null_check", check_nulls)
         outcome = run_check_safe(registry, "null_check", context)
-        assert isinstance(outcome["result"], CheckResult)
+        assert isinstance(outcome.result, CheckResult)
 
     def test_returns_error_on_exception(self, registry, context):
         def always_raises(ctx) -> pd.Series:
@@ -101,8 +101,8 @@ class TestRunCheckSafe:
 
         registry.register("bad_check", always_raises)
         outcome = run_check_safe(registry, "bad_check", context)
-        assert outcome["status"] == "error"
-        assert "something went wrong" in outcome["error"]
+        assert outcome.status == "error"
+        assert "something went wrong" in outcome.error
 
     def test_does_not_re_raise_exception(self, registry, context):
         def always_raises(ctx) -> pd.Series:
@@ -110,12 +110,12 @@ class TestRunCheckSafe:
 
         registry.register("boom_check", always_raises)
         outcome = run_check_safe(registry, "boom_check", context)
-        assert outcome["status"] == "error"
+        assert outcome.status == "error"
 
     def test_unregistered_check_returns_error(self, registry, context):
         outcome = run_check_safe(registry, "nonexistent_check", context)
-        assert outcome["status"] == "error"
-        assert "nonexistent_check" in outcome["error"]
+        assert outcome.status == "error"
+        assert "nonexistent_check" in outcome.error
 
     def test_returns_error_on_exception_with_correct_message(self, registry, context):
         def always_raises(ctx) -> pd.Series:
@@ -123,8 +123,8 @@ class TestRunCheckSafe:
 
         registry.register("bad_check", always_raises)
         outcome = run_check_safe(registry, "bad_check", context)
-        assert outcome["status"] == "error"
-        assert "fail" in outcome["error"]
+        assert outcome.status == "error"
+        assert "fail" in outcome.error
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +158,7 @@ class TestRunChecks:
         seq = run_checks(names, registry, context, parallel=False)
         par = run_checks(names, registry, context, parallel=True)
 
-        assert {k: v["status"] for k, v in seq.items()} == {k: v["status"] for k, v in par.items()}
+        assert {k: v.status for k, v in seq.items()} == {k: v.status for k, v in par.items()}
 
     def test_one_failed_check_does_not_prevent_others(self, registry, context):
         def always_raises(ctx) -> pd.Series:
@@ -169,8 +169,8 @@ class TestRunChecks:
 
         results = run_checks(["bad_check", "null_check"], registry, context)
 
-        assert results["bad_check"]["status"] == "error"
-        assert results["null_check"]["status"] == "passed"
+        assert results["bad_check"].status == "error"
+        assert results["null_check"].status == "passed"
 
     def test_empty_check_list_returns_empty_dict(self, registry, context):
         results = run_checks([], registry, context)
@@ -329,7 +329,7 @@ class TestRunChecksAndFlag:
             report_name=None,
         )
 
-        assert results["null_check"]["status"] == "passed"
+        assert results["null_check"].status == "passed"
 
     def test_no_pk_col_flags_written_with_none_pk_value(self, registry, pipeline_db, sample_df):
         def check_negative(ctx, col: str = "price") -> pd.Series:
@@ -389,4 +389,4 @@ class TestRunChecksAndFlag:
         )
 
         assert "null_check" in results
-        assert results["null_check"]["status"] in ("passed", "failed", "error", "unavailable")
+        assert results["null_check"].status in ("passed", "failed", "error", "unavailable")

@@ -101,7 +101,7 @@ class TestRunReport:
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        assert result["results"]["null_check"]["status"] == "passed"
+        assert result["results"]["null_check"].status == "passed"
 
     def test_skips_when_no_rows_newer_than_watermark(
         self, pipeline_db, sales_df, check_registry, watermark_store
@@ -138,7 +138,7 @@ class TestRunReport:
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        assert result["results"]["failing_check"]["status"] == "error"
+        assert result["results"]["failing_check"].status == "error"
 
     def test_range_violation_is_captured_not_raised(
         self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
@@ -151,7 +151,7 @@ class TestRunReport:
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        check_result = result["results"]["price_range"]["result"]
+        check_result = result["results"]["price_range"].result
         assert isinstance(check_result, CheckResult)
         assert check_result.passed is False
         assert check_result.mask.sum() == 1
