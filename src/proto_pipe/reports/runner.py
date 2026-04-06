@@ -33,6 +33,89 @@ from proto_pipe.reports.query import _log_run, init_report_runs_table
 
 
 # ---------------------------------------------------------------------------
+# Dependency inference helpers
+# ---------------------------------------------------------------------------
+def _get_target_table(report_config: dict) -> str:
+    """Compute the output table name for a report config.
+
+    Uses explicit target_table if set in config, otherwise defaults to
+    <source_table>_report. This mirrors the logic in run_report and is the
+    canonical rule used for dependency inference across run_all_reports and
+    _build_execution_layers.
+    """
+    source_table = report_config.get("source", {}).get("table", "")
+    return report_config.get(
+        "target_table",
+        f"{source_table}_report" if source_table else report_config["name"],
+    )
+
+
+def _build_execution_layers(reports: list[dict]) -> list[list[dict]]:
+    """Topologically sort reports into execution layers by inferred dependency.
+
+    Dependency rule
+    ---------------
+    Report B depends on report A when B.source.table matches A's target_table.
+    target_table is resolved via _get_target_table: explicit config value first,
+    falling back to '<source_table>_report'.
+
+    Execution contract
+    ------------------
+    - Reports in the same layer have no dependencies on each other and may
+      run concurrently.
+    - Every layer must complete before the next layer begins.
+    - Reports with no dependencies are always in layer 0.
+
+    Raises
+    ------
+    ValueError
+        If a dependency cycle is detected, naming the reports involved.
+    """
+    name_to_report: dict[str, dict] = {r["name"]: r for r in reports}
+
+    # Map each report's output table back to the report name that produces it.
+    target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in reports}
+
+    # Build directed edges: dependencies[B] = {A, ...} means B depends on A.
+    dependencies: dict[str, set[str]] = {r["name"]: set() for r in reports}
+    dependents: dict[str, set[str]] = {r["name"]: set() for r in reports}
+
+    for r in reports:
+        source_table = r.get("source", {}).get("table", "")
+        upstream_name = target_to_name.get(source_table)
+        if upstream_name and upstream_name != r["name"]:
+            dependencies[r["name"]].add(upstream_name)
+            dependents[upstream_name].add(r["name"])
+
+    # Kahn's algorithm — BFS topological sort into layers.
+    in_degree: dict[str, int] = {name: len(deps) for name, deps in dependencies.items()}
+    queue: list[str] = [name for name, deg in in_degree.items() if deg == 0]
+    layers: list[list[dict]] = []
+
+    while queue:
+        layer = [name_to_report[name] for name in queue]
+        layers.append(layer)
+        next_queue: list[str] = []
+        for name in queue:
+            for dependent in dependents[name]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    next_queue.append(dependent)
+        queue = next_queue
+
+    # Cycle detection — any report still with in_degree > 0 is part of a cycle.
+    scheduled = sum(len(layer) for layer in layers)
+    if scheduled < len(reports):
+        cycled = sorted(name for name, deg in in_degree.items() if deg > 0)
+        raise ValueError(
+            f"Dependency cycle detected among reports: {', '.join(cycled)}. "
+            f"Check source.table and target_table config for circular references."
+        )
+
+    return layers
+
+
+# ---------------------------------------------------------------------------
 # Transform application — with TRY_CAST gate
 # ---------------------------------------------------------------------------
 
@@ -687,32 +770,76 @@ def run_all_reports(
     pipeline_db: str | None = None,
     full_revalidation: bool = False,
 ) -> list[dict]:
-    """Execute all reports. Supports sequential and parallel execution."""
+    """Execute all reports in dependency order.
+
+    Reports are sorted into execution layers via _build_execution_layers.
+    The dependency rule is: if report B reads from a table that report A
+    produces (matched via _get_target_table), B is placed in a later layer
+    and runs only after A completes.
+
+    Within each layer, reports run concurrently when parallel_reports=True,
+    or sequentially when False. Layers always execute one at a time.
+
+    If a report finishes with status='error', any reports in later layers
+    that directly depend on it are skipped rather than attempted.
+
+    Raises ValueError (from _build_execution_layers) if a dependency cycle
+    is detected before any execution begins.
+    """
     reports = report_registry.all()
+    layers = _build_execution_layers(reports)
 
-    if not parallel_reports:
-        return [
-            run_report(
-                r, check_registry, watermark_store,
-                pipeline_db=pipeline_db,
-                full_revalidation=full_revalidation,
-            )
-            for r in reports
-        ]
+    # Build a lookup so we can check upstream failures before running each report.
+    target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in reports}
 
-    results = []
-    with ThreadPoolExecutor() as executor:
-        futures = {
-            executor.submit(
-                run_report,
-                r,
-                check_registry,
-                watermark_store,
-                pipeline_db=pipeline_db,
-                full_revalidation=full_revalidation,
-            ): r["name"]
-            for r in reports
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
-    return results
+    all_results: list[dict] = []
+    failed_reports: set[str] = set()
+
+    for layer in layers:
+        # Separate reports whose upstream dependency failed from runnable ones.
+        runnable: list[dict] = []
+        for r in layer:
+            source_table = r.get("source", {}).get("table", "")
+            upstream = target_to_name.get(source_table)
+            if upstream and upstream in failed_reports:
+                print(f"  [skip] '{r['name']}' — upstream report '{upstream}' failed")
+                all_results.append({"report": r["name"], "status": "skipped"})
+            else:
+                runnable.append(r)
+
+        if not runnable:
+            continue
+
+        if not parallel_reports:
+            for r in runnable:
+                result = run_report(
+                    r,
+                    check_registry,
+                    watermark_store,
+                    pipeline_db=pipeline_db,
+                    full_revalidation=full_revalidation,
+                )
+                all_results.append(result)
+                if result.get("status") == "error":
+                    failed_reports.add(r["name"])
+        else:
+            with ThreadPoolExecutor() as executor:
+                futures = {
+                    executor.submit(
+                        run_report,
+                        r,
+                        check_registry,
+                        watermark_store,
+                        pipeline_db=pipeline_db,
+                        full_revalidation=full_revalidation,
+                    ): r["name"]
+                    for r in runnable
+                }
+                for future in as_completed(futures):
+                    report_name = futures[future]
+                    result = future.result()
+                    all_results.append(result)
+                    if result.get("status") == "error":
+                        failed_reports.add(report_name)
+
+    return all_results
