@@ -14,33 +14,37 @@ def _find_settings_path() -> Path:
         if candidate.exists():
             return candidate
     return Path("pipeline.yaml")  # fallback — will trigger the defaults path
-    
-    
+
+
 DEFAULT_SETTINGS_PATH = _find_settings_path()
 
 
 # Tables created and managed by the pipeline itself.
 # Excluded from user-facing table lists (e.g. vp new-report, vp table).
-PIPELINE_TABLES: frozenset[str] = frozenset({
-    # State tables — record-level tracking
-    "source_pass",
-    "validation_pass",
-    # Block tables — problem records
-    "source_block",
-    "validation_block",
-    # Ingest history
-    "ingest_state",
-    # Registry tables
-    "check_registry_metadata",
-    "column_type_registry",
-    # Legacy names — kept during migration window so vp db-init --migrate
-    # can detect and rename them. Remove once all DBs are migrated.
-    "flagged_rows",
-    "ingest_log",
-    "report_runs",
-    "validation_flags",
-    "check_params_history",
-})
+PIPELINE_TABLES: frozenset[str] = frozenset(
+    {
+        # State tables — record-level tracking
+        "source_pass",
+        "validation_pass",
+        # Block tables — problem records
+        "source_block",
+        "validation_block",
+        # Ingest history
+        "ingest_state",
+        # Event log
+        "pipeline_events",
+        # Registry tables
+        "check_registry_metadata",
+        "column_type_registry",
+        # Legacy names — kept during migration window so vp db-init --migrate
+        # can detect and rename them. Remove once all DBs are migrated.
+        "flagged_rows",
+        "ingest_log",
+        "report_runs",
+        "validation_flags",
+        "check_params_history",
+    }
+)
 
 NUMERIC_DUCKDB_TYPES = frozenset({
     "DOUBLE", "FLOAT", "REAL",
@@ -71,6 +75,7 @@ _DEFAULTS = {
         "watermark_db": "data/watermarks.db",
         "incoming_dir": "data/incoming/",
         "output_dir": "output/reports/",
+        "log_dir": "logs/",
         "sql_dir": "sql/",
     },
     "multi_select_params": True,

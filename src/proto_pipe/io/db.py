@@ -16,6 +16,81 @@ import duckdb
 from proto_pipe.constants import NULLABLE_EXTENSION_DTYPES
 
 
+################################
+# PIPELINE EVENT FUNCTIONALITY
+################################
+def init_pipeline_events(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the pipeline_events table if it doesn't exist. Safe to call multiple times.
+
+    Structured event log written by CLI commands (vp ingest, vp validate,
+    vp run-all). Used by vp export log to review and archive run history.
+
+    event_type values:
+      ingest_ok: file ingested successfully
+      ingest_failed: file failed to ingest (exception or bad file)
+      validation_passed: report ran, all checks passed
+      validation_failed: report ran, check failures written to validation_block
+      report_error: report run itself crashed (source missing, exception)
+      deliverable_produced: deliverable written to disk successfully
+
+    severity values: info | warn | error
+    """
+    conn.execute("""
+                 CREATE TABLE IF NOT EXISTS pipeline_events (
+                                                                event_type  VARCHAR     NOT NULL,
+                                                                source_name VARCHAR,
+                                                                severity    VARCHAR     NOT NULL,
+                                                                detail      VARCHAR,
+                                                                occurred_at TIMESTAMPTZ NOT NULL
+                 )
+                 """)
+
+
+def write_pipeline_events(
+    pipeline_db: str,
+    events: list[dict],
+) -> None:
+    """Write one or more events to pipeline_events. Fire-and-forget.
+
+    Opens its own short-lived connection, so callers need no connection
+    management. Exceptions are silently swallowed — event writing failures
+    must never crash the pipeline.
+
+    Each event dict must have: event_type, severity.
+    Optional keys: source_name, detail.
+
+    :param pipeline_db: Path to pipeline.db.
+    :param events: List of event dicts to write.
+    """
+    if not events:
+        return
+    try:
+        import duckdb as _duckdb
+
+        conn = _duckdb.connect(pipeline_db)
+        try:
+            now = datetime.now(timezone.utc)
+            for e in events:
+                conn.execute(
+                    """
+                    INSERT INTO pipeline_events
+                        (event_type, source_name, severity, detail, occurred_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        e["event_type"],
+                        e.get("source_name"),
+                        e["severity"],
+                        (e.get("detail") or "")[:1000],
+                        now,
+                    ],
+                )
+        finally:
+            conn.close()
+    except Exception:
+        pass  # event failures are never surfaced to the user
+
+
 # ---------------------------------------------------------------------------
 # Generic table inspection
 # ---------------------------------------------------------------------------
@@ -197,20 +272,6 @@ def init_column_type_registry(conn: duckdb.DuckDBPyConnection) -> None:
             PRIMARY KEY (column_name, source_name)
         )
     """)
-
-
-def init_all_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    """Bootstrap all pipeline-managed tables. Called by vp db-init.
-
-    Safe to call multiple times — all init functions use CREATE IF NOT EXISTS.
-    """
-    init_ingest_state(conn)
-    init_source_pass(conn)
-    init_source_block(conn)
-    init_validation_pass(conn)
-    init_validation_block(conn)
-    init_check_registry_metadata(conn)
-    init_column_type_registry(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -562,3 +623,21 @@ def coerce_for_display(df: "pd.DataFrame") -> "pd.DataFrame":
         if isinstance(result[col].dtype, NULLABLE_EXTENSION_DTYPES):
             result[col] = result[col].astype(object)
     return result
+
+
+################
+# KEY FUNCTIONS
+################
+def init_all_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    """Bootstrap all pipeline-managed tables. Called by vp db-init.
+
+    Safe to call multiple times — all init functions use CREATE IF NOT EXISTS.
+    """
+    init_ingest_state(conn)
+    init_source_pass(conn)
+    init_source_block(conn)
+    init_validation_pass(conn)
+    init_validation_block(conn)
+    init_check_registry_metadata(conn)
+    init_column_type_registry(conn)
+    init_pipeline_events(conn)

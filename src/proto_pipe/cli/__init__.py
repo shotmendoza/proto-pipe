@@ -1,6 +1,8 @@
 """CLI package — assembles all command groups onto the root `cli` group."""
 
 import click
+
+from .commands.export import export_commands
 from .data import data_commands
 from proto_pipe.cli.commands.delete import delete_commands
 from proto_pipe.cli.commands.edit import edit_commands
@@ -25,6 +27,7 @@ setup_commands(cli)
 data_commands(cli)
 validation_commands(cli)
 reports_commands(cli)
+export_commands(cli)
 new_commands(cli)
 edit_commands(cli)
 delete_commands(cli)

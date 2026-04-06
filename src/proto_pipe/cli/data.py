@@ -14,8 +14,8 @@ from ..io.config import config_path_or_override, load_config
 
 
 @click.command()
-@click.option("--incoming-dir",   default=None, help="Override incoming files directory.")
-@click.option("--pipeline-db",    default=None, help="Override pipeline DB path.")
+@click.option("--incoming-dir", default=None, help="Override incoming files directory.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
 @click.option(
     "--mode",
@@ -46,6 +46,7 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     from proto_pipe.io.registry import register_from_config
     from proto_pipe.io.ingest import ingest_directory
     from proto_pipe.checks.registry import check_registry, report_registry
+    from proto_pipe.io.db import write_pipeline_events
 
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -80,7 +81,22 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     )
 
     if failed:
-        click.echo("Run: vp ingest-log --status failed  to see failure reasons (queries ingest_state).")
+        click.echo(
+            "Run: vp ingest-log --status failed  to see failure reasons (queries ingest_state)."
+        )
+
+    # Write pipeline events — one per file processed (skipped files omitted)
+    events = [
+        {
+            "event_type": "ingest_ok" if v["status"] == "ok" else "ingest_failed",
+            "source_name": filename,
+            "severity": "info" if v["status"] == "ok" else "error",
+            "detail": v.get("message", ""),
+        }
+        for filename, v in summary.items()
+        if v["status"] != "skipped"
+    ]
+    write_pipeline_events(p_db, events)
 
 
 # ---------------------------------------------------------------------------

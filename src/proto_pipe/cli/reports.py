@@ -19,13 +19,13 @@ from ..io.config import config_path_or_override, load_config
 @click.option("--date-to", default=None, help="Override date filter to (YYYY-MM-DD).")
 @click.option("--date-col", default=None, help="Column to apply --date-from/--date-to on.")
 def pull_report(
-    deliverable_name,
-    pipeline_db,
-    deliverables_config,
-    output_dir,
-    date_from,
-    date_to,
-    date_col,
+        deliverable_name,
+        pipeline_db,
+        deliverables_config,
+        output_dir,
+        date_from,
+        date_to,
+        date_col,
 ):
     """Query tables and write deliverable output (CSV or Excel).
 
@@ -154,6 +154,7 @@ def run_all(
     from proto_pipe.reports.query import query_table
     from proto_pipe.io.ingest import ingest_directory
     from proto_pipe.reports.views import refresh_views, load_views_config
+    from proto_pipe.io.db import write_pipeline_events
 
     import duckdb
 
@@ -169,7 +170,19 @@ def run_all(
     # Step 1 — Ingest
     click.echo("\n── Ingest ──────────────────────────────────")
     sources_config = load_config(src_cfg)
-    ingest_directory(inc_dir, sources_config["sources"], p_db)
+    ingest_summary = ingest_directory(inc_dir, sources_config["sources"], p_db)
+
+    ingest_events = [
+        {
+            "event_type": "ingest_ok" if v["status"] == "ok" else "ingest_failed",
+            "source_name": filename,
+            "severity": "info" if v["status"] == "ok" else "error",
+            "detail": v.get("message", ""),
+        }
+        for filename, v in ingest_summary.items()
+        if v["status"] != "skipped"
+    ]
+    write_pipeline_events(p_db, ingest_events)
 
     # Step 2 — Validate
     click.echo("\n── Validate ────────────────────────────────")
@@ -177,8 +190,32 @@ def run_all(
     load_custom_checks(check_registry)
     register_from_config(rep_config, check_registry, report_registry)
     watermark_store = WatermarkStore(w_db)
-    # Pass pipeline_db so the runner writes per-row validation flags
-    run_all_reports(report_registry, check_registry, watermark_store, pipeline_db=p_db)
+    validation_results = run_all_reports(
+        report_registry, check_registry, watermark_store, pipeline_db=p_db
+    )
+
+    validation_events = []
+    for r in validation_results:
+        status = r["status"]
+        if status == "error":
+            validation_events.append({
+                "event_type": "report_error",
+                "source_name": r["report"],
+                "severity": "error",
+                "detail": r.get("error", ""),
+            })
+        elif status == "completed":
+            has_failures = any(
+                v.get("status") in ("failed", "error")
+                for v in r.get("results", {}).values()
+            )
+            validation_events.append({
+                "event_type": "validation_failed" if has_failures else "validation_passed",
+                "source_name": r["report"],
+                "severity": "warn" if has_failures else "info",
+                "detail": "",
+            })
+    write_pipeline_events(p_db, validation_events)
 
     # Step 3a — Ingest conflicts (source_block) — hard block deliverables
     conn = duckdb.connect(p_db)
@@ -199,7 +236,7 @@ def run_all(
         click.echo("Re-run with --ignore-flagged to produce the deliverable anyway.")
         return
 
-    # Step 3b — Validation failures (validation_block) — warn only, deliverable still produced
+    # Step 3b — Validation failures (validation_block) — warn only
     val_flag_count = conn.execute(
         "SELECT count(*) FROM validation_block"
     ).fetchone()[0]
@@ -257,6 +294,13 @@ def run_all(
 
         conn.close()
         run_deliverable(d, report_dataframes, out_dir, p_db)
+
+        write_pipeline_events(p_db, [{
+            "event_type": "deliverable_produced",
+            "source_name": deliverable,
+            "severity": "info",
+            "detail": f"output_dir={out_dir}",
+        }])
     else:
         conn.close()
         click.echo("\n  No --deliverable specified. Ingest and validate complete.")
@@ -268,7 +312,7 @@ def run_all(
 
 
 @click.command("refresh-views")
-@click.option("--pipeline-db",  default=None, help="Override pipeline DB path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--views-config", default=None, help="Override views config path.")
 def refresh_views_cmd(pipeline_db, views_config):
     """Drop and recreate all views from views_config.yaml.
@@ -284,7 +328,7 @@ def refresh_views_cmd(pipeline_db, views_config):
 
     from proto_pipe.reports.views import load_views_config, refresh_views
 
-    p_db = config_path_or_override("pipeline_db",  pipeline_db)
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
     v_cfg = config_path_or_override("views_config", views_config)
 
     views = load_views_config(v_cfg)
@@ -310,4 +354,3 @@ def reports_commands(cli):
     cli.add_command(pull_report)
     cli.add_command(run_all)
     cli.add_command(refresh_views_cmd)
-    
