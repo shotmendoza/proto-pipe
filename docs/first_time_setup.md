@@ -118,7 +118,7 @@ Files already ingested are skipped automatically on subsequent runs.
 To see ingest history:
 
 ```bash
-vp view table ingest_log
+vp view table ingest_state
 ```
 
 ---
@@ -180,7 +180,7 @@ vp run-all --deliverable <deliverable-name>
 ```
 
 Runs ingest → validate → pull-report in sequence. Stops before producing
-the deliverable if ingest conflicts exist (rows flagged in `flagged_rows`).
+the deliverable if ingest conflicts exist (rows flagged in `source_block`).
 Pass `--ignore-flagged` to produce the deliverable anyway.
 
 ---
@@ -194,13 +194,13 @@ primary key. Review and correct them:
 # Browse flagged rows in the terminal
 vp flagged --table sales
 
-# Open an enriched editable view (requires textual)
+# Open an enriched editable view
 vp flagged edit --table sales
 
-# Export to CSV, fix, re-import
-vp flagged --table sales --export csv
-# ... edit the CSV ...
-vp flagged retry flagged_sales_2026-04-01.csv --table sales
+# Export flagged rows to incoming_dir, edit, then apply corrections
+vp flagged open sales
+# ... edit the file in incoming_dir ...
+vp flagged retry sales
 ```
 
 See `docs/reviewing_flagged_rows.md` for more detail.

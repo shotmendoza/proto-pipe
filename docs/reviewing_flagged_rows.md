@@ -9,17 +9,17 @@ different correction paths. Understanding which one you're looking at matters.
 
 | Table              | Written by    | Meaning                                                                      | Blocks deliverables? |
 |--------------------|---------------|------------------------------------------------------------------------------|----------------------|
-| `flagged_rows`     | `vp ingest`   | Ingest-time conflicts — duplicate key with changed content, or type mismatch | Yes                  |
-| `validation_flags` | `vp validate` | Business logic check failures                                                | No — warns only      |
+| `source_block`     | `vp ingest`   | Ingest-time conflicts — duplicate key with changed content, or type mismatch | Yes                  |
+| `validation_block` | `vp validate` | Business logic check failures                                                | No — warns only      |
 
-`vp flagged` and its subcommands operate on `flagged_rows`.
-`vp validated` operates on `validation_flags`.
+`vp flagged` and its subcommands operate on `source_block`.
+`vp validated` operates on `validation_block`.
 
 ---
 
-## Ingest conflicts (flagged_rows)
+## Ingest conflicts (source_block)
 
-Rows land in `flagged_rows` during ingest when:
+Rows land in `source_block` during ingest when:
 
 - A file contains a row whose primary key already exists but whose content changed
   (`on_duplicate: flag` is set on the source)
@@ -54,12 +54,12 @@ vp flagged open sales
 ```
 
 This exports the enriched flagged rows (source data + flag context) to
-`output/reports/flagged_sales_YYYY-MM-DD.csv` and opens it in your default
-application. If a flagged export already exists for that table, it opens the
-most recently modified one instead of re-exporting.
+`incoming_dir` as `<pattern>_flagged_<date>.csv` (e.g. `sales_flagged_2026-04-01.csv`)
+and opens it in your default application. The file is named to match your source
+pattern so `vp ingest` can pick it up naturally.
 
 Edit the data columns that are wrong and save the file. Leave any `_` prefixed
-columns (`_flag_id`, `_flag_reason`, `_flagged_at`) as-is — they are stripped
+columns (`_flag_reason`, `_flag_columns`, `_flag_check`) as-is — they are stripped
 automatically before ingest.
 
 ### Step 2 — Apply corrections
@@ -68,17 +68,17 @@ automatically before ingest.
 vp flagged retry sales
 ```
 
-This globs `output/reports/` for the most recently modified `flagged_sales_*.csv`,
+This picks up the most recently modified flagged export from `incoming_dir`,
 runs it through the full ingest cycle with `on_duplicate=upsert` (corrections
-always overwrite), and clears resolved flags from `flagged_rows`.
+always overwrite), and clears resolved flags from `source_block`.
 
 ```
-Applying corrections from: flagged_sales_2026-04-01.csv
+Applying corrections from: sales_flagged_2026-04-01.csv
 [ok] 3 row(s) applied to 'sales'
-[ok] 3 flag(s) cleared from flagged_rows
+[ok] 3 flag(s) cleared from source_block
 ```
 
-The correction is logged in `ingest_log` with `status='correction'` so you
+The correction is logged in `ingest_state` with `status='correction'` so you
 have an audit trail separate from normal ingests.
 
 ### Step 3 — Re-validate
@@ -108,18 +108,11 @@ vp flagged clear --table sales --yes                        # skip confirmation
 vp run-all --deliverable monthly_pack --ignore-flagged
 ```
 
-**Re-scan for conflicts** — manually check an existing table for duplicate
-key conflicts without waiting for a new file:
-
-```bash
-vp check-null-overwrites --table sales
-```
-
 ---
 
-## Validation flags (validation_flags)
+## Validation flags (validation_block)
 
-Check failures from `vp validate` go to `validation_flags`. These warn but
+Check failures from `vp validate` go to `validation_block`. These warn but
 do not block deliverables. The correction path is different — fix at source,
 re-ingest, re-validate.
 
@@ -127,7 +120,7 @@ re-ingest, re-validate.
 vp validated                        # all reports
 vp validated --report sales_validation
 vp validated --table sales
-vp validated --export csv           # export to CSV
+vp validated open                   # export failures and open for editing
 vp export-validation                # export detail + summary to Excel
 ```
 

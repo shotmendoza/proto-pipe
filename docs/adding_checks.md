@@ -35,10 +35,10 @@ def null_premium_check(col: str) -> pd.Series:
 
 ## Check kinds
 
-| Kind        | Return type                   | What happens                                                                |
-|-------------|-------------------------------|-----------------------------------------------------------------------------|
-| `check`     | `pd.Series[bool]`             | Failures written to `validation_flags`. Warns, does not block deliverables. |
-| `transform` | `pd.Series` or `pd.DataFrame` | Written back to the DuckDB table after all checks run.                      |
+| Kind        | Return type                   | What happens                                                                  |
+|-------------|-------------------------------|-------------------------------------------------------------------------------|
+| `check`     | `pd.Series[bool]`             | Failures written to `validation_block`. Warns, does not block deliverables.   |
+| `transform` | `pd.Series` or `pd.DataFrame` | Written back to the DuckDB table after all checks run.                        |
 
 ---
 

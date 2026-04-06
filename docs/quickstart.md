@@ -66,7 +66,7 @@ vp ingest
 Files already ingested are skipped automatically. To see ingest history:
 
 ```bash
-vp view table ingest_log
+vp view table ingest_state
 ```
 
 ---
@@ -249,7 +249,7 @@ See `docs/adding_deliverables.md` for the full reference.
 | Task | Command |
 |---|---|
 | Load source files | `vp ingest` |
-| View ingest history | `vp view table ingest_log` |
+| View ingest history | `vp view table ingest_state` |
 | Browse ingest conflicts | `vp flagged --table <n>` |
 | Open conflicts for editing | `vp flagged open <table>` |
 | Apply corrections | `vp flagged retry <table>` |
