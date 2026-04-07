@@ -361,13 +361,13 @@ class TestMultiSelectParamsSetting:
         assert settings.get("multi_select_params") is True
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestMultiselectGatePreventExpansion:
     """is_multiselect_eligible() gates expansion — non-eligible functions are not expanded.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'CheckParamInspector.is_multiselect_eligible() gates whether a function
        supports multi-column expansion.'
     """
@@ -415,7 +415,7 @@ class TestMultiselectGatePreventExpansion:
         before expanding alias_map. Functions without pd.Series[bool] return are still
         expanded by alias_map before registration fails. Fix needed in io/registry.py:
         check is_multiselect_eligible() before calling _expand_check_with_alias_map.
-        Tracked in CLAUDE.md deferred work. This test must remain failing until fixed.
+        Tracked in Spec deferred work. This test must remain failing until fixed.
         """
         from proto_pipe.io.registry import register_from_config
         from proto_pipe.checks.built_in import BUILT_IN_CHECKS

@@ -826,13 +826,13 @@ class TestCorrectionRoundTrip:
 
 
 # ===========================================================================
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ===========================================================================
 
 class TestAlreadyIngestedCorrectionStatus:
     """already_ingested returns False for correction status.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'ingest_state status values: ok | failed | skipped | correction'
       Only status='ok' blocks re-ingest.
     """
@@ -848,7 +848,7 @@ class TestAlreadyIngestedCorrectionStatus:
 class TestCorrectionTargetsReportTableNotSourceTable:
     """Corrections upsert to the report table, not the source table.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'Only difference: corrections upsert to the report table, not the
        source table. Does not block deliverables.'
     """

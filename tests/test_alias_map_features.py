@@ -850,13 +850,13 @@ def test_new_macro_skips_existing_file(tmp_path):
 
 
 # ===========================================================================
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ===========================================================================
 
 def test_bad_checks_populated_on_failed_registration(capsys):
     """Failed registrations go to _bad_checks, not _checks.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'CheckRegistry._checks holds only vetted contracts.
        CheckRegistry._bad_checks holds {name: reason} for failures.'
     """
@@ -881,7 +881,7 @@ def test_bad_checks_populated_on_failed_registration(capsys):
 def test_cross_source_aliasing_same_check_different_columns():
     """Same check function runs against different column names in separate reports.
 
-    CLAUDE.md guarantee (alias_map purpose 1):
+    Spec guarantee (alias_map purpose 1):
       'Cross-source aliasing — same check reused across sources that name
        the same concept differently. col → endt in van, col → expiry_date in foo.'
     """
@@ -933,7 +933,7 @@ def test_cross_source_aliasing_same_check_different_columns():
 def test_checkparam_inspector_column_params():
     """CheckParamInspector.column_params() identifies str-annotated params.
 
-    CLAUDE.md guarantee (CheckParamInspector canonical pattern):
+    Spec guarantee (CheckParamInspector canonical pattern):
       'column_params() — column selectors: str, "str", pd.Series, "pd.Series",
        or unannotated. Maps to alias_map entries.'
     """
@@ -954,7 +954,7 @@ def test_checkparam_inspector_column_params():
 def test_checkparam_inspector_dataframe_params():
     """CheckParamInspector.dataframe_params() identifies pd.DataFrame params.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'dataframe_params() — pd.DataFrame annotated params. Auto-filled with
        the full table df at runtime.'
     """
@@ -975,7 +975,7 @@ def test_checkparam_inspector_dataframe_params():
 def test_source_table_never_modified_by_report_layer(tmp_path):
     """Transforms write to the report table, never to the source table.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'The source table is never modified by this layer.'
     """
     db_path = str(tmp_path / "pipeline.db")
@@ -1006,7 +1006,7 @@ def test_source_table_never_modified_by_report_layer(tmp_path):
 def test_load_custom_checks_module_registers_decorated_checks(tmp_path):
     """load_custom_checks_module loads a file and registers @custom_check functions.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       '@custom_check(name, kind) decorator stages functions in _DECORATED_CHECKS.
        load_custom_checks_module imports the user module, iterates _DECORATED_CHECKS,
        calls register_custom_check.'
@@ -1036,7 +1036,7 @@ def my_custom_null_check(col: str) -> pd.Series:
 def test_multi_column_expansion_produces_n_results_in_validation_block(tmp_path):
     """Multi-column alias_map expansion produces N result sets in validation_block.
 
-    CLAUDE.md guarantee (alias_map purpose 2):
+    Spec guarantee (alias_map purpose 2):
       'Multi-column expansion — same check runs once per alias_map entry.
        If col maps to 10 columns, the check runs 10 times, producing 10
        result sets in validation_block.'

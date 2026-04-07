@@ -179,13 +179,13 @@ class TestCheckRegistry:
         assert result.mask.sum() == 1
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestCheckSeriesAlignment:
     """All built-in checks return pd.Series with the same index as the input.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'kind=check → returns pd.Series[bool]. True = row passes.'
     The Series must be aligned to the input DataFrame index so that
     failing rows can be correctly identified by position.
@@ -211,7 +211,7 @@ class TestCheckSeriesAlignment:
 class TestCheckSchemaBehavior:
     """check_schema is table-level — all rows get the same pass/fail result.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'kind=check → returns pd.Series[bool].'
     For schema mismatches, the failure is table-wide (the schema either
     matches or it doesn't), so every row must get the same boolean value.
@@ -237,7 +237,7 @@ class TestCheckNullsEdgeCases:
     def test_empty_dataframe_returns_empty_series(self):
         """check_nulls with an empty DataFrame must return empty Series, not raise.
 
-        CLAUDE.md guarantee: checks return pd.Series[bool]. An empty DataFrame
+        Spec guarantee: checks return pd.Series[bool]. An empty DataFrame
         is a valid input — e.g. after watermark filtering produces no rows.
         """
         df = pd.DataFrame({"order_id": [], "price": []})

@@ -299,13 +299,13 @@ class TestExcelExport:
         assert df.empty
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestFlagExportColumns:
     """build_validation_flag_export includes _flag_columns and _flag_check.
 
-    CLAUDE.md guarantee (Pipeline Column Convention):
+    Spec guarantee (Pipeline Column Convention):
       '_flag_reason, _flag_columns, _flag_check — flagged export guide columns,
        present only in source_block/validation_block exports to help the user
        correct records.'

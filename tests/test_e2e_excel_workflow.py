@@ -335,7 +335,7 @@ class TestExcelWorkflow:
 
 
     # -----------------------------------------------------------------------
-    # Guarantees from CLAUDE.md — behavioral contracts not covered above
+    # Guarantees from Spec — behavioral contracts not covered above
     # -----------------------------------------------------------------------
 
     def test_source_pass_populated_after_ingest(
@@ -343,7 +343,7 @@ class TestExcelWorkflow:
     ):
         """source_pass tracks every accepted record's row hash and source file.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'source_pass → tracks every ingested record's row hash and source file.
            Enables flag mode duplicate detection without querying the source
            table directly.'
@@ -366,7 +366,7 @@ class TestExcelWorkflow:
     ):
         """On duplicate_conflict, the original row stays in the source table.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Existing row kept, incoming row blocked.'
         """
         _ingest(infra_db, excel_file, excel_sources_config)
@@ -397,7 +397,7 @@ class TestExcelWorkflow:
     ):
         """Non-conflicting rows in the same file still insert when others conflict.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Duplicate handling runs after type validation, on clean rows only.
            Clean rows proceed. No pandas intermediate.'
         """
@@ -435,7 +435,7 @@ class TestExcelWorkflow:
     ):
         """Every ingest attempt is logged to ingest_state with status='ok'.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'ingest_state — Per-file ingest history: status, rows, errors'
           'ingest_state status values: ok | failed | skipped | correction'
         """
@@ -457,7 +457,7 @@ class TestExcelWorkflow:
     ):
         """A file already in ingest_state with status='ok' is skipped on re-run.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Files already ingested are skipped automatically on subsequent runs.'
         """
         _ingest(infra_db, excel_file, excel_sources_config)
@@ -485,7 +485,7 @@ class TestExcelWorkflow:
     ):
         """validation_block failures warn but do not block deliverable SQL execution.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'validation_block → Check/transform failures — warns, does not block
            deliverables.'
           'Deliverables (Extract): Not blocked by validation_block.'
@@ -515,7 +515,7 @@ class TestExcelWorkflow:
     ):
         """source_block.id = md5(str(pk_value)) — deterministic, not random UUID.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'id = md5(str(pk_value)) — deterministic, computable in DuckDB SQL'
           'Determinism matters. UUID keys, watermarks, flag identity are all
            deterministic.'
@@ -540,7 +540,7 @@ class TestExcelWorkflow:
     ):
         """source_block.bad_columns records the pipe-delimited changed column names.
 
-        CLAUDE.md guarantee (source_block schema):
+        Spec guarantee (source_block schema):
           'bad_columns — pipe-delimited: "amount|region"'
         """
         _ingest(infra_db, excel_file, excel_sources_config)

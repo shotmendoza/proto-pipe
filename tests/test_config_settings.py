@@ -1,6 +1,6 @@
 """Tests for proto_pipe.io.config.load_settings
 
-Covers the behavioral guarantee documented in CLAUDE.md:
+Covers the behavioral guarantee documented in Spec:
   Relative paths in pipeline.yaml resolve against the config file's own
   directory, not CWD. So `vp` works correctly from any subdirectory.
 """
@@ -21,7 +21,7 @@ class TestLoadSettingsRelativePathResolution:
         """Relative paths in pipeline.yaml must resolve against the file's
         own directory, not the process CWD.
 
-        Documented guarantee in CLAUDE.md:
+        Documented guarantee in Spec:
           'Relative paths are resolved against pipeline.yaml's own directory,
            not CWD — so vp works correctly from any subdirectory.'
         """

@@ -3,7 +3,7 @@
 Scans a directory for CSV and Excel files, matches each file to a source
 definition by pattern, and loads the data into DuckDB tables.
 
-Data layer invariants (see CLAUDE.md):
+Data layer invariants (see Spec):
 - ALL data loading goes through DuckDB. Pandas is never used in the data path.
 - CSV files loaded via DuckDB read_csv() with dtype from column_type_registry.
 - Excel files loaded via DuckDB read_xlsx() (spatial extension).

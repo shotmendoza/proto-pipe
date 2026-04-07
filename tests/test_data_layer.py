@@ -486,13 +486,13 @@ class TestValidateRowTypes:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestComputeRowHashGuarantees:
     """compute_row_hash is deterministic — same values always produce the same hash.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'Determinism matters. UUID keys, watermarks, flag identity are all deterministic.'
       'compute_row_hash(row, cols) — md5 of pipe-delimited column values'
     Signature: compute_row_hash(row: dict | pd.Series, cols: list[str]) -> str
@@ -532,7 +532,7 @@ class TestComputeRowHashGuarantees:
     def test_null_value_treated_as_empty_string(self):
         """None values are represented as empty string in the hash.
 
-        CLAUDE.md guarantee (flagging.py docstring):
+        Spec guarantee (flagging.py docstring):
           'NULL / None values are represented as the empty string.'
         """
         row_none = {"van_id": "1042", "endt": None}
@@ -547,7 +547,7 @@ class TestComputeRowHashGuarantees:
 class TestSourcePassDuplicateDetection:
     """flag mode duplicate detection uses source_pass, not the source table directly.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'source_pass → tracks every ingested record's row hash and source file.
        Enables flag mode duplicate detection without querying the source table directly.'
     """

@@ -170,13 +170,13 @@ class TestCustomCheckEndToEnd:
         assert result.passed is True
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestValidateCheckGateAppliesOnModuleLoad:
     """validate_check is the single validation gate — applies even via module load.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'validate_check in checks/registry.py is the single validation gate —
        checks annotation, kind, return type.
        CheckRegistry._checks holds only vetted contracts.'
@@ -208,7 +208,7 @@ class TestValidateCheckGateAppliesOnModuleLoad:
 class TestBuiltInChecksPopulatedAfterLoad:
     """load_custom_checks_module adds to BUILT_IN_CHECKS, not just the registry.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'load_custom_checks_module imports the user module, iterates
        _DECORATED_CHECKS, calls register_custom_check.'
     register_custom_check is documented to add to BUILT_IN_CHECKS so that

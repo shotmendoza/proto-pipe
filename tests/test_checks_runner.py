@@ -393,13 +393,13 @@ class TestRunChecksAndFlag:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestCheckOutcomeIsValidDataclass:
     """CheckOutcome is a frozen dataclass — attribute access, not subscript.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'CheckOutcome — frozen dataclass in checks/result.py alongside CheckResult.
        Callers use attribute access (outcome.status, outcome.result, outcome.error)
        not subscript.'
@@ -427,7 +427,7 @@ class TestCheckOutcomeIsValidDataclass:
     def test_run_checks_values_are_check_outcome_instances(self, registry, context):
         """run_checks must return {name: CheckOutcome}, not plain dicts.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'CheckOutcome — Returned by run_check_safe and propagated through
            run_checks and run_checks_and_flag.'
         """
@@ -445,7 +445,7 @@ class TestCheckOutcomeIsValidDataclass:
     ):
         """run_checks_and_flag propagates CheckOutcome instances.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'CheckOutcome — propagated through run_checks_and_flag.'
         """
         from proto_pipe.checks.result import CheckOutcome
@@ -468,7 +468,7 @@ class TestCheckOutcomeIsValidDataclass:
     def test_valid_status_values(self, registry, context):
         """CheckOutcome.status must be one of the documented valid values.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'status: str ("passed" | "failed" | "unavailable" | "error")'
         """
         VALID_STATUSES = {"passed", "failed", "unavailable", "error"}
@@ -481,7 +481,7 @@ class TestCheckOutcomeIsValidDataclass:
     def test_error_outcome_has_error_string(self, registry, context):
         """CheckOutcome with status='error' must have a non-None error string.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'error: str | None — present when status is error'
         """
         def always_raises(ctx) -> pd.Series:
@@ -497,7 +497,7 @@ class TestCheckOutcomeIsValidDataclass:
     def test_passed_outcome_has_result_none_error(self, registry, context):
         """CheckOutcome with status='passed' must have result set and error=None.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'result: CheckResult | None, error: str | None'
         """
         registry.register("null_check", check_nulls)

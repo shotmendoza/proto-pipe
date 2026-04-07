@@ -355,18 +355,18 @@ class TestIngestFailures:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestIngestGuarantees:
-    """Behavioral guarantees documented in CLAUDE.md."""
+    """Behavioral guarantees documented in Spec."""
 
     def test_failed_file_retried_on_next_run(
         self, incoming_dir, pipeline_db, sources_config, sales_df
     ):
         """Files with status='failed' in ingest_state are retried on next run.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Files that previously failed are retried on every run until they succeed.'
         """
         import duckdb as _duckdb
@@ -398,7 +398,7 @@ class TestIngestGuarantees:
     ):
         """Corrections are logged as status='correction' in ingest_state.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Successful corrections logged as status=correction in ingest_state
            for auditability.'
           'ingest_state status values: ok | failed | skipped | correction'
@@ -438,7 +438,7 @@ class TestIngestGuarantees:
     ):
         """A file with a column not in column_type_registry must fail the file.
 
-        CLAUDE.md guarantee (Critical Design Invariant):
+        Spec guarantee (Critical Design Invariant):
           'New columns (in file but not in registry, and not in existing table)
            → fail the file when column_type_registry has entries for the source.
            Condition in code: if not strip_pipeline_cols and registry_types.'

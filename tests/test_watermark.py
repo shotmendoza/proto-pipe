@@ -61,7 +61,7 @@ class TestWatermarkStore:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestWatermarkGuarantees:
@@ -69,7 +69,7 @@ class TestWatermarkGuarantees:
     def test_watermark_not_advanced_when_checks_fail(self, watermark_db, tmp_path):
         """Watermark must not advance when any check fails.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Watermarks advance only on full success.'
         """
         import duckdb
@@ -115,7 +115,7 @@ class TestWatermarkGuarantees:
     ):
         """Watermark reflects max(timestamp_col) from data, not wall-clock time.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Watermarks use max(timestamp_col) from data, not wall-clock time,
            and only advance when all checks pass.'
         """
@@ -167,7 +167,7 @@ class TestWatermarkGuarantees:
     def test_get_returns_utc_normalized_datetime(self, watermark_store):
         """get() always returns a UTC-aware datetime.
 
-        CLAUDE.md guarantee: UTC consistency for watermark timestamps.
+        Spec guarantee: UTC consistency for watermark timestamps.
         """
         watermark_store.set("report_a", TS_A)
         result = watermark_store.get("report_a")

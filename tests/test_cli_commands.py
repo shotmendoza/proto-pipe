@@ -478,14 +478,14 @@ class TestFlaggedClear:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 
 class TestDeleteSourceClearsState:
     """vp delete source clears source table, ingest_state, source_block, source_pass.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'vp delete source clears: source table, ingest_state, source_block, source_pass.'
     """
 
@@ -588,7 +588,7 @@ class TestDeleteSourceClearsState:
 class TestDeleteReportClearsState:
     """vp delete report clears report table, validation_block, validation_pass.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'vp delete report clears: report table, validation_block, validation_pass.'
     """
 
@@ -673,7 +673,7 @@ class TestDeleteReportClearsState:
 class TestFlaggedClearSourceTableUnchanged:
     """vp flagged clear drops flags without modifying the source table.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'vp flagged clear — drops flags without inserting anything.
        Existing rows in source table unchanged.'
     """

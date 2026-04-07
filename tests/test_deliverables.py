@@ -212,7 +212,7 @@ class TestReportRunsLog:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestDeliverableGuarantees:
@@ -222,7 +222,7 @@ class TestDeliverableGuarantees:
     ):
         """Deliverables are produced even when validation_block has entries.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Deliverables (Extract): Not blocked by validation_block.'
           'validation_block — warns, does not block deliverables.'
         """
@@ -260,7 +260,7 @@ class TestDeliverableGuarantees:
     ):
         """Re-running on the same date overwrites the output file.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Output files are never auto-deleted. Re-running on the same date
            overwrites the file.'
         """
@@ -292,7 +292,7 @@ class TestDeliverableGuarantees:
     ):
         """report_runs records deliverable_name, filename, and output_dir.
 
-        CLAUDE.md (adding_deliverables.md):
+        Spec (adding_deliverables.md):
           'Every run is logged to the report_runs table in pipeline.db.
            Columns: deliverable_name, report_name, filename, output_dir,
            filters_applied, row_count, format, created_at.'

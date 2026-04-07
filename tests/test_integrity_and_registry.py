@@ -681,13 +681,13 @@ class TestFilterUningested:
 
 
 # ---------------------------------------------------------------------------
-# CLAUDE.md behavioral guarantee tests
+# Spec behavioral guarantee tests
 # ---------------------------------------------------------------------------
 
 class TestAlreadyIngestedGuarantee:
     """already_ingested returns True for ok files, False for failed files.
 
-    CLAUDE.md guarantee:
+    Spec guarantee:
       'Files already logged as ok in ingest_state are skipped automatically.'
       'Files that previously failed are retried on every run until they succeed.'
     This is enforced by already_ingested() returning False for failed files.
@@ -712,7 +712,7 @@ class TestAlreadyIngestedGuarantee:
     def test_failed_file_returns_false(self, tmp_path):
         """Failed files must NOT be considered already ingested — they need retry.
 
-        CLAUDE.md guarantee:
+        Spec guarantee:
           'Files that previously failed are retried on every run until they succeed.'
         """
         conn = _make_conn(tmp_path)
@@ -742,7 +742,7 @@ class TestAlreadyIngestedGuarantee:
     def test_correction_status_does_not_block_retry(self, tmp_path):
         """Files logged as 'correction' must not be blocked from re-processing.
 
-        CLAUDE.md guarantee (ingest_state status values):
+        Spec guarantee (ingest_state status values):
           'ok | failed | skipped | correction'
         Only 'ok' should block re-ingest.
         """
