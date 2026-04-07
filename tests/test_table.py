@@ -249,3 +249,138 @@ class TestTableCmd:
         )
         assert result.exit_code == 1
         assert "vp view table" in result.output
+
+
+class TestDisplayRichTable:
+    """_display_rich_table behavioral guarantees.
+
+    Guarantees:
+    - All columns use no_wrap=True — cell content is never folded within
+      the column. overflow='fold' must not be used.
+    - pager is called with styles=True so color is preserved when scrolling.
+    - Data visible in the DB is passed to the display — not silently dropped.
+    """
+
+    @pytest.fixture()
+    def wide_df(self):
+        """DataFrame with enough columns to trigger layout issues at narrow widths."""
+        return pd.DataFrame([
+            {
+                "order_id": "ORD-001",
+                "carrier": "Carrier A",
+                "premium": 5000.00,
+                "inception": "2026-01-01",
+                "expiry": "2027-01-01",
+                "status": "active",
+                "region": "EMEA",
+                "updated_at": "2026-01-15T10:00:00+00:00",
+            },
+            {
+                "order_id": "ORD-002",
+                "carrier": "Carrier B",
+                "premium": 12000.00,
+                "inception": "2026-03-01",
+                "expiry": "2027-03-01",
+                "status": "lapsed",
+                "region": "APAC",
+                "updated_at": "2026-03-01T09:00:00+00:00",
+            },
+        ])
+
+    def _run_captured(self, df, title="Test"):
+        """Run _display_rich_table with Console mocked, return mock instance."""
+        from proto_pipe.cli.commands.table import _display_rich_table
+        from unittest.mock import MagicMock
+
+        with patch("rich.console.Console") as MockConsole:
+            mock_instance = MockConsole.return_value
+            # Make pager a working context manager
+            mock_pager_cm = MagicMock()
+            mock_pager_cm.__enter__ = MagicMock(return_value=None)
+            mock_pager_cm.__exit__ = MagicMock(return_value=False)
+            mock_instance.pager.return_value = mock_pager_cm
+
+            _display_rich_table(df, title)
+
+        return mock_instance
+
+    def test_columns_use_no_wrap_true(self, wide_df):
+        from rich.table import Table as RichTable
+
+        mock_console = self._run_captured(wide_df)
+
+        # Extract the Table object passed to console.print
+        tables = [
+            arg
+            for call in mock_console.print.call_args_list
+            for arg in call[0]
+            if isinstance(arg, RichTable)
+        ]
+        assert tables, "A rich Table must be passed to console.print"
+
+        for col in tables[0].columns:
+            assert col.no_wrap is True, (
+                f"Column '{col.header}' must use no_wrap=True — "
+                "overflow='fold' creates tall narrow columns at narrow terminals"
+            )
+
+    def test_overflow_fold_not_used(self, wide_df):
+        from rich.table import Table as RichTable
+
+        mock_console = self._run_captured(wide_df)
+
+        tables = [
+            arg
+            for call in mock_console.print.call_args_list
+            for arg in call[0]
+            if isinstance(arg, RichTable)
+        ]
+        for col in tables[0].columns:
+            assert col.overflow != "fold", (
+                "overflow='fold' must never be used in _display_rich_table"
+            )
+
+    def test_pager_called_with_styles_true(self, wide_df):
+        mock_console = self._run_captured(wide_df)
+
+        mock_console.pager.assert_called_once()
+        _, kwargs = mock_console.pager.call_args
+        assert kwargs.get("styles") is True, (
+            "pager must be called with styles=True to preserve color when scrolling"
+        )
+
+    def test_all_dataframe_rows_are_added(self, wide_df):
+        """All rows in the DataFrame must be passed to the table — none silently dropped."""
+        from rich.table import Table as RichTable
+
+        mock_console = self._run_captured(wide_df)
+
+        tables = [
+            arg
+            for call in mock_console.print.call_args_list
+            for arg in call[0]
+            if isinstance(arg, RichTable)
+        ]
+        assert tables
+        assert tables[0].row_count == len(wide_df), (
+            "All DataFrame rows must appear in the rendered table"
+        )
+
+    def test_all_dataframe_columns_are_present(self, wide_df):
+        """All columns in the DataFrame must appear as table columns."""
+        from rich.table import Table as RichTable
+
+        mock_console = self._run_captured(wide_df)
+
+        tables = [
+            arg
+            for call in mock_console.print.call_args_list
+            for arg in call[0]
+            if isinstance(arg, RichTable)
+        ]
+        assert tables
+        rendered_headers = [str(col.header) for col in tables[0].columns]
+        for df_col in wide_df.columns:
+            assert str(df_col) in rendered_headers, (
+                f"Column '{df_col}' must appear in the rendered table"
+            )

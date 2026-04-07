@@ -1546,3 +1546,117 @@ class TestDeleteImpactQueriesAcrossSchemas:
         assert counts["table 'empty_source'"] == 0, (
             "Empty table must return 0 rows, not an error"
         )
+
+
+class TestIngestProgressReporter:
+    """IngestProgressReporter.on_file_done behavioral guarantees.
+
+    Guarantees:
+    - Uses self._progress.console.print for all output — never click.echo.
+      click.echo conflicts with the active rich progress context and would
+      be overwritten by the spinner.
+    - ok: prints filename and row count; includes flagged count when nonzero.
+    - failed: prints filename and error message.
+    - skipped: prints filename.
+    - Counters (_ok, _failed, _skipped) are incremented correctly.
+    """
+
+    def _make_reporter(self):
+        """Return a reporter with _progress mocked — no real terminal needed."""
+        from proto_pipe.cli.prompts import IngestProgressReporter
+        from unittest.mock import MagicMock
+
+        reporter = IngestProgressReporter()
+        reporter._progress = MagicMock()
+        reporter._task = MagicMock()
+        return reporter
+
+    def test_ok_uses_console_print_not_click_echo(self):
+        reporter = self._make_reporter()
+
+        with patch("click.echo") as mock_echo:
+            reporter.on_file_done(
+                "sales_2026.csv", {"status": "ok", "rows": 100, "flagged": 0}
+            )
+
+        assert reporter._progress.console.print.called, (
+            "on_file_done must use self._progress.console.print, not click.echo"
+        )
+        assert not mock_echo.called, (
+            "click.echo must not be called inside on_file_done — "
+            "it conflicts with the active rich progress bar"
+        )
+
+    def test_ok_output_contains_filename(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done(
+            "sales_2026.csv", {"status": "ok", "rows": 1000, "flagged": 0}
+        )
+
+        printed = str(reporter._progress.console.print.call_args)
+        assert "sales_2026.csv" in printed
+
+    def test_ok_output_contains_row_count(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done(
+            "sales_2026.csv", {"status": "ok", "rows": 1000, "flagged": 0}
+        )
+
+        printed = str(reporter._progress.console.print.call_args)
+        assert "1000" in printed, "Row count must appear in the ok result line"
+
+    def test_ok_output_contains_flagged_count_when_nonzero(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done(
+            "sales_2026.csv", {"status": "ok", "rows": 500, "flagged": 3}
+        )
+
+        printed = str(reporter._progress.console.print.call_args)
+        assert "3" in printed, (
+            "Flagged count must appear in output when nonzero so user knows to check source_block"
+        )
+
+    def test_ok_output_omits_flagged_when_zero(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done(
+            "sales_2026.csv", {"status": "ok", "rows": 500, "flagged": 0}
+        )
+
+        printed = str(reporter._progress.console.print.call_args)
+        assert "blocked" not in printed, (
+            "Flagged/blocked count must not appear in output when zero"
+        )
+
+    def test_failed_uses_console_print(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done(
+            "bad.csv", {"status": "failed", "rows": 0, "message": "type mismatch"}
+        )
+
+        assert reporter._progress.console.print.called
+        printed = str(reporter._progress.console.print.call_args)
+        assert "bad.csv" in printed
+        assert "type mismatch" in printed
+
+    def test_skipped_uses_console_print(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done("already_loaded.csv", {"status": "skipped"})
+
+        assert reporter._progress.console.print.called
+        printed = str(reporter._progress.console.print.call_args)
+        assert "already_loaded.csv" in printed
+
+    def test_ok_increments_ok_counter(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done("f.csv", {"status": "ok", "rows": 10, "flagged": 0})
+        assert reporter._ok == 1
+
+    def test_failed_increments_failed_counter(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done("f.csv", {"status": "failed", "rows": 0, "message": "err"})
+        assert reporter._failed == 1
+
+    def test_skipped_increments_skipped_counter(self):
+        reporter = self._make_reporter()
+        reporter.on_file_done("f.csv", {"status": "skipped"})
+        assert reporter._skipped == 1

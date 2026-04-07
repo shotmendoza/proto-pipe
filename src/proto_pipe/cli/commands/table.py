@@ -30,13 +30,13 @@ def _display_rich_table(df, title: str) -> None:
     )
 
     for col in df.columns:
-        table.add_column(str(col), overflow="fold")
+        table.add_column(str(col), no_wrap=True)
 
     rows = df.astype(object).fillna("").astype(str).values.tolist()
     for row in rows:
         table.add_row(*row)
 
-    with console.pager():
+    with console.pager(styles=True):
         console.print(table)
         console.print(f"[dim]{len(df)} row(s) shown[/dim]")
 

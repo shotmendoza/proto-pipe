@@ -68,6 +68,7 @@ def _try_strptime(value: str, fmt: str) -> bool:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _safe_sample_label(sample, col: str) -> str:
     """Return a sanitised " sample: <value>" label for questionary choice display.
 
@@ -87,7 +88,7 @@ def _safe_sample_label(sample, col: str) -> str:
     # Strip newlines and control characters
     raw = " ".join(raw.splitlines()).strip()
     # Escape Rich markup brackets so questionary renders them literally
-    raw = raw.replace("[", "\[").replace("]", "\]")
+    raw = raw.replace("[", "\\[").replace("]", "\\]")
     # Truncate to keep the line readable
     if len(raw) > 30:
         raw = raw[:27] + "..."
@@ -1029,9 +1030,19 @@ class IngestProgressReporter:
     def on_file_done(self, filename: str, result: dict) -> None:
         """Called by ingest_directory after each file completes."""
         status = result.get("status", "")
+        rows = result.get("rows") or 0
+        flagged = result.get("flagged") or 0
+        message = result.get("message") or ""
+
         if status == "ok":
             self._ok += 1
+            parts = [f"{rows} row(s) loaded"]
+            if flagged:
+                parts.append(f"{flagged} blocked")
+            self._progress.console.print(f"  [ok] {filename} ({', '.join(parts)})")
         elif status == "failed":
             self._failed += 1
+            self._progress.console.print(f"  [error] {filename}: {message}")
         elif status == "skipped":
             self._skipped += 1
+            self._progress.console.print(f"  [skip] {filename}")
