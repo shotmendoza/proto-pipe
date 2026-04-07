@@ -41,7 +41,7 @@ def pull_report(
     import duckdb
 
     from proto_pipe.reports.runner import run_deliverable
-    from proto_pipe.reports.query import query_table
+    from proto_pipe.pipelines.query import query_table
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     del_cfg = config_path_or_override("deliverables_config", deliverables_config)
@@ -151,7 +151,7 @@ def run_all(
     from proto_pipe.io.config import load_config
     from proto_pipe.reports.runner import run_all_reports
     from proto_pipe.reports.runner import run_deliverable
-    from proto_pipe.reports.query import query_table
+    from proto_pipe.pipelines.query import query_table
     from proto_pipe.io.ingest import ingest_directory
     from proto_pipe.reports.views import refresh_views, load_views_config
     from proto_pipe.io.db import write_pipeline_events

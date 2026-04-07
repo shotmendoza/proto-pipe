@@ -225,58 +225,190 @@ class TestDeleteDeliverable:
 
 
 class TestViewTable:
-    def test_shows_rows(self, tmp_path, db_with_pipeline_tables):
+    """vp view table behavioral guarantees.
+
+    Guarantees:
+    - --export csv writes an auto-named file to output_dir
+    - --export custom prompts via prompt_custom_export_path, writes to given path
+    - --export custom with cancelled prompt falls back to rich display, no error
+    - 'term' is no longer a valid --export value — Click rejects it
+    - pk_col is resolved from sources_config for tables with a matching source entry
+    - Pipeline tables (no source entry) display without error, pk_col is None
+    """
+
+    @pytest.fixture()
+    def view_db(self, tmp_path) -> str:
+        db_path = str(tmp_path / "pipeline.db")
+        with duckdb.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE sales " "(order_id VARCHAR, price DOUBLE, region VARCHAR)"
+            )
+            conn.execute("INSERT INTO sales VALUES ('ORD-001', 99.99, 'EMEA')")
+            conn.execute("INSERT INTO sales VALUES ('ORD-002', 250.00, 'APAC')")
+            from proto_pipe.io.db import init_all_pipeline_tables
+
+            init_all_pipeline_tables(conn)
+        return db_path
+
+    @pytest.fixture()
+    def view_src_cfg(self, tmp_path) -> Path:
+        path = tmp_path / "sources_config.yaml"
+        config = SourceConfig(path)
+        config.add(
+            {
+                "name": "sales",
+                "target_table": "sales",
+                "patterns": ["sales_*.csv"],
+                "primary_key": "order_id",
+                "on_duplicate": "flag",
+            }
+        )
+        return path
+
+    def _cfg(self, pipeline_db, src_cfg_path):
+        return lambda key, override=None: {
+            "pipeline_db": pipeline_db,
+            "sources_config": str(src_cfg_path),
+        }.get(key, override or key)
+
+    def test_export_csv_writes_auto_named_file(self, view_db, view_src_cfg, tmp_path):
         from proto_pipe.cli.commands.view import view_table
 
-        runner = CliRunner()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
         with (
             patch(
                 "proto_pipe.cli.commands.view.config_path_or_override",
-                return_value=db_with_pipeline_tables,
-            ),
-            patch("proto_pipe.cli.commands.view._show_or_export"),
-            patch(
-                "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, db_with_pipeline_tables),
-            ),
-        ):
-            result = runner.invoke(view_table, ["sales"])
-
-        assert result.exit_code == 0, result.output
-
-    def test_unknown_table_shows_error(self, tmp_path, db_with_pipeline_tables):
-        from proto_pipe.cli.commands.view import view_table
-
-        runner = CliRunner()
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                return_value=db_with_pipeline_tables,
+                side_effect=self._cfg(view_db, view_src_cfg),
             ),
             patch(
                 "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, db_with_pipeline_tables),
+                return_value=_settings(tmp_path, view_db),
             ),
         ):
-            result = runner.invoke(view_table, ["nonexistent"])
+            result = CliRunner().invoke(view_table, ["sales", "--export", "csv"])
 
         assert result.exit_code == 0
-        assert "error" in result.output.lower() or "not found" in result.output.lower()
+        csv_files = list(output_dir.glob("*.csv"))
+        assert len(csv_files) == 1, "Expected exactly one auto-named CSV in output_dir"
 
-    def test_no_tables_shows_message(self, tmp_path, pipeline_db):
+    def test_export_custom_writes_to_given_path(self, view_db, view_src_cfg, tmp_path):
         from proto_pipe.cli.commands.view import view_table
 
-        duckdb.connect(pipeline_db).close()  # empty DB
+        custom_path = tmp_path / "custom_export.csv"
 
-        runner = CliRunner()
+        with (
+            patch(
+                "proto_pipe.cli.commands.view.config_path_or_override",
+                side_effect=self._cfg(view_db, view_src_cfg),
+            ),
+            patch(
+                "proto_pipe.io.config.load_settings",
+                return_value=_settings(tmp_path, view_db),
+            ),
+            patch(
+                "proto_pipe.cli.prompts.prompt_custom_export_path",
+                return_value=custom_path,
+            ),
+        ):
+            result = CliRunner().invoke(view_table, ["sales", "--export", "custom"])
+
+        assert result.exit_code == 0
+        assert custom_path.exists(), "Custom export path must be written"
+
+    def test_export_custom_cancelled_falls_back_to_display(
+        self, view_db, view_src_cfg, tmp_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        with (
+            patch(
+                "proto_pipe.cli.commands.view.config_path_or_override",
+                side_effect=self._cfg(view_db, view_src_cfg),
+            ),
+            patch(
+                "proto_pipe.io.config.load_settings",
+                return_value=_settings(tmp_path, view_db),
+            ),
+            patch(
+                "proto_pipe.cli.prompts.prompt_custom_export_path",
+                return_value=None,
+            ),
+            patch("proto_pipe.cli.commands.view.get_reviewer") as mock_reviewer,
+        ):
+            mock_reviewer.return_value.show = lambda *a, **kw: None
+            result = CliRunner().invoke(view_table, ["sales", "--export", "custom"])
+
+        assert result.exit_code == 0
+
+    def test_term_is_invalid_export_choice(self, view_db, view_src_cfg, tmp_path):
+        from proto_pipe.cli.commands.view import view_table
+
         with patch(
             "proto_pipe.cli.commands.view.config_path_or_override",
-            return_value=pipeline_db,
+            side_effect=self._cfg(view_db, view_src_cfg),
         ):
-            result = runner.invoke(view_table, [])
+            result = CliRunner().invoke(view_table, ["sales", "--export", "term"])
+
+        assert result.exit_code != 0, "'term' must be rejected as an invalid choice"
+
+    def test_pk_col_resolved_for_source_table(self, view_db, view_src_cfg, tmp_path):
+        from proto_pipe.cli.commands.view import view_table
+
+        captured: dict = {}
+
+        def capture(df, title, export, pk_col=None):
+            captured["pk_col"] = pk_col
+
+        with (
+            patch(
+                "proto_pipe.cli.commands.view.config_path_or_override",
+                side_effect=self._cfg(view_db, view_src_cfg),
+            ),
+            patch(
+                "proto_pipe.io.config.load_settings",
+                return_value=_settings(tmp_path, view_db),
+            ),
+            patch(
+                "proto_pipe.cli.commands.view._show_or_export",
+                side_effect=capture,
+            ),
+        ):
+            CliRunner().invoke(view_table, ["sales"])
+
+        assert (
+            captured.get("pk_col") == "order_id"
+        ), "pk_col must be resolved from sources_config and passed to the reviewer"
+
+    def test_pipeline_table_has_no_pk_col(self, view_db, view_src_cfg, tmp_path):
+        from proto_pipe.cli.commands.view import view_table
+
+        captured: dict = {}
+
+        def capture(df, title, export, pk_col=None):
+            captured["pk_col"] = pk_col
+
+        with (
+            patch(
+                "proto_pipe.cli.commands.view.config_path_or_override",
+                side_effect=self._cfg(view_db, view_src_cfg),
+            ),
+            patch(
+                "proto_pipe.io.config.load_settings",
+                return_value=_settings(tmp_path, view_db),
+            ),
+            patch(
+                "proto_pipe.cli.commands.view._show_or_export",
+                side_effect=capture,
+            ),
+        ):
+            result = CliRunner().invoke(view_table, ["source_block"])
 
         assert result.exit_code == 0
-        assert "no tables" in result.output.lower()
+        assert (
+            captured.get("pk_col") is None
+        ), "Pipeline tables have no source config entry — pk_col must be None, not an error"
 
 
 class TestViewSource:
@@ -717,4 +849,700 @@ class TestFlaggedClearSourceTableUnchanged:
         assert after_count == before_count, (
             "vp flagged clear must not modify the source table — "
             "existing rows must remain unchanged"
+        )
+
+
+class TestPromptCustomExportPath:
+    """prompt_custom_export_path behavioral guarantees.
+
+    Guarantees:
+    - Returns None when the user cancels (empty input)
+    - Returns a resolved Path when a path is provided
+    - Prints the pipeline warning before asking for the path
+    """
+
+    def test_returns_none_when_cancelled(self):
+        from proto_pipe.cli.prompts import prompt_custom_export_path
+
+        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
+            mock_q.text.return_value.ask.return_value = None
+            result = prompt_custom_export_path()
+
+        assert result is None
+
+    def test_returns_resolved_path_when_given(self, tmp_path):
+        from proto_pipe.cli.prompts import prompt_custom_export_path
+
+        expected = (tmp_path / "export.csv").resolve()
+
+        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
+            mock_q.text.return_value.ask.return_value = str(tmp_path / "export.csv")
+            result = prompt_custom_export_path()
+
+        assert result == expected
+
+    def test_warning_mentions_vp_ingest(self, capsys):
+        from proto_pipe.cli.prompts import prompt_custom_export_path
+
+        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
+            mock_q.text.return_value.ask.return_value = None
+            prompt_custom_export_path()
+
+        captured = capsys.readouterr()
+        assert (
+            "vp ingest" in captured.out
+        ), "Warning must mention vp ingest so users understand why the path matters"
+
+    def test_warning_mentions_output_dir(self, capsys):
+        from proto_pipe.cli.prompts import prompt_custom_export_path
+
+        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
+            mock_q.text.return_value.ask.return_value = None
+            prompt_custom_export_path()
+
+        captured = capsys.readouterr()
+        assert (
+            "output_dir" in captured.out
+        ), "Warning must mention output_dir as the correct export destination"
+
+
+class TestViewLog:
+    """vp view log behavioral guarantees.
+
+    Guarantees:
+    - Displays events without error when events exist
+    - --severity filters to matching severity only
+    - --since filters to events on or after the given date
+    - Malformed --since value shows a clear error message, does not crash
+    - No events matched shows a message, does not display an empty table
+    - --clear is not a valid option — Click rejects it
+    - Events are passed to _show_or_export in most-recent-first order
+    """
+
+    @pytest.fixture()
+    def log_db(self, tmp_path) -> str:
+        from datetime import datetime, timezone
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        db_path = str(tmp_path / "pipeline.db")
+        with duckdb.connect(db_path) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute(
+                """
+                INSERT INTO pipeline_events
+                    (event_type, source_name, severity, detail, occurred_at)
+                VALUES
+                    ('ingest_ok',          'sales',       'info',  '',         ?),
+                    ('validation_failed',  'daily_sales', 'warn',  '',         ?),
+                    ('ingest_failed',      'inventory',   'error', 'bad file', ?)
+                """,
+                [
+                    datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    datetime(2026, 2, 1, tzinfo=timezone.utc),
+                    datetime(2026, 3, 1, tzinfo=timezone.utc),
+                ],
+            )
+        return db_path
+
+    def _cfg(self, pipeline_db):
+        return lambda key, override=None: {"pipeline_db": pipeline_db}.get(
+            key, override or key
+        )
+
+    def test_displays_events_without_error(self, log_db):
+        from proto_pipe.cli.commands.view import view_log
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(log_db),
+        ), patch("proto_pipe.cli.commands.view._show_or_export"):
+            result = CliRunner().invoke(view_log, [])
+
+        assert result.exit_code == 0
+
+    def test_severity_filter_passes_only_matching_rows(self, log_db):
+        from proto_pipe.cli.commands.view import view_log
+
+        captured: dict = {}
+
+        def capture(df, title, export, pk_col=None):
+            captured["df"] = df
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(log_db),
+        ), patch(
+            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
+        ):
+            CliRunner().invoke(view_log, ["--severity", "error"])
+
+        assert "df" in captured, "No events were passed to _show_or_export"
+        assert list(captured["df"]["severity"].unique()) == ["error"], (
+            "--severity error must only return error events"
+        )
+
+    def test_since_filter_excludes_earlier_events(self, log_db):
+        from proto_pipe.cli.commands.view import view_log
+
+        captured: dict = {}
+
+        def capture(df, title, export, pk_col=None):
+            captured["df"] = df
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(log_db),
+        ), patch(
+            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
+        ):
+            CliRunner().invoke(view_log, ["--since", "2026-02-01"])
+
+        assert "df" in captured
+        assert len(captured["df"]) == 2, (
+            "--since 2026-02-01 must exclude the January event"
+        )
+
+    def test_malformed_since_shows_error(self, log_db):
+        from proto_pipe.cli.commands.view import view_log
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(log_db),
+        ):
+            result = CliRunner().invoke(view_log, ["--since", "not-a-date"])
+
+        assert result.exit_code == 0
+        assert "[error]" in result.output
+        assert "--since" in result.output
+
+    def test_no_events_shows_message_not_empty_table(self, tmp_path):
+        from proto_pipe.cli.commands.view import view_log
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        db_path = str(tmp_path / "empty.db")
+        with duckdb.connect(db_path) as conn:
+            init_all_pipeline_tables(conn)
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=lambda key, override=None: db_path,
+        ), patch(
+            "proto_pipe.cli.commands.view._show_or_export"
+        ) as mock_show:
+            result = CliRunner().invoke(view_log, [])
+
+        assert result.exit_code == 0
+        assert not mock_show.called, (
+            "_show_or_export must not be called when there are no matching events"
+        )
+        assert "no events" in result.output.lower()
+
+    def test_clear_is_not_a_valid_option(self, log_db):
+        from proto_pipe.cli.commands.view import view_log
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(log_db),
+        ):
+            result = CliRunner().invoke(view_log, ["--clear"])
+
+        assert result.exit_code != 0, "--clear must be rejected as an unknown option"
+
+    def test_events_passed_in_most_recent_first_order(self, log_db):
+        from proto_pipe.cli.commands.view import view_log
+
+        captured: dict = {}
+
+        def capture(df, title, export, pk_col=None):
+            captured["df"] = df
+
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(log_db),
+        ), patch(
+            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
+        ):
+            CliRunner().invoke(view_log, [])
+
+        assert "df" in captured
+        dates = captured["df"]["occurred_at"].tolist()
+        assert dates == sorted(dates, reverse=True), (
+            "Events must be passed to _show_or_export in most-recent-first order"
+        )
+
+
+class TestQueryPipelineEvents:
+    """query_pipeline_events behavioral guarantees.
+
+    Guarantees:
+    - Returns all events when no filters are applied
+    - severity filter returns matching rows only
+    - since filter excludes events before the given date
+    - order_desc=True returns most recent first (DESC)
+    - order_desc=False returns chronological order (ASC)
+    - Raises ValueError for a malformed since date
+    - Combined severity + since filters both apply
+    """
+
+    @pytest.fixture()
+    def conn_with_events(self, tmp_path):
+        from datetime import datetime, timezone
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        db_path = str(tmp_path / "pipeline.db")
+        conn = duckdb.connect(db_path)
+        init_all_pipeline_tables(conn)
+        conn.execute(
+            """
+            INSERT INTO pipeline_events
+                (event_type, source_name, severity, detail, occurred_at)
+            VALUES
+                ('ingest_ok',         'sales',       'info',  '',         ?),
+                ('validation_failed', 'daily_sales', 'warn',  '',         ?),
+                ('ingest_failed',     'inventory',   'error', 'bad file', ?)
+            """,
+            [
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 2, 1, tzinfo=timezone.utc),
+                datetime(2026, 3, 1, tzinfo=timezone.utc),
+            ],
+        )
+        yield conn
+        conn.close()
+
+    def test_returns_all_events_with_no_filters(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        df = query_pipeline_events(conn_with_events, severity=None, since=None)
+        assert len(df) == 3
+
+    def test_severity_filter_returns_matching_only(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        df = query_pipeline_events(conn_with_events, severity="error", since=None)
+        assert len(df) == 1
+        assert df.iloc[0]["severity"] == "error"
+
+    def test_since_filter_excludes_earlier_events(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        df = query_pipeline_events(conn_with_events, severity=None, since="2026-02-01")
+        assert len(df) == 2, "Events before 2026-02-01 must be excluded"
+
+    def test_order_desc_true_returns_most_recent_first(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        df = query_pipeline_events(
+            conn_with_events, severity=None, since=None, order_desc=True
+        )
+        dates = df["occurred_at"].tolist()
+        assert dates == sorted(dates, reverse=True), (
+            "order_desc=True must return most recent first"
+        )
+
+    def test_order_desc_false_returns_chronological(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        df = query_pipeline_events(
+            conn_with_events, severity=None, since=None, order_desc=False
+        )
+        dates = df["occurred_at"].tolist()
+        assert dates == sorted(dates), (
+            "order_desc=False must return chronological order"
+        )
+
+    def test_malformed_since_raises_value_error(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        with pytest.raises(ValueError):
+            query_pipeline_events(
+                conn_with_events, severity=None, since="not-a-date"
+            )
+
+    def test_combined_severity_and_since_filters(self, conn_with_events):
+        from proto_pipe.pipelines.query import query_pipeline_events
+
+        df = query_pipeline_events(
+            conn_with_events, severity="warn", since="2026-02-01"
+        )
+        assert len(df) == 1
+        assert df.iloc[0]["severity"] == "warn", (
+            "Combined filters must apply both severity and since constraints"
+        )
+
+
+from datetime import datetime, timezone
+
+
+class TestPromptDeleteImpact:
+    """prompt_delete_impact behavioral guarantees.
+
+    Guarantees:
+    - Returns True immediately when yes=True, prints nothing
+    - Returns True when user confirms
+    - Returns False when user cancels
+    - Displays 'This will remove:' header before rows
+    - Each row shows label, count (comma-formatted), and unit
+    """
+
+    SAMPLE_ROWS = [
+        ("table 'sales'", 1234, "rows"),
+        ("ingest_state", 15, "entries"),
+        ("source_block", 3, "open flags"),
+        ("source_pass", 1234, "entries"),
+    ]
+
+    def test_yes_returns_true_without_output(self, capsys):
+        from proto_pipe.cli.prompts import prompt_delete_impact
+
+        result = prompt_delete_impact(self.SAMPLE_ROWS, yes=True)
+
+        assert result is True
+        captured = capsys.readouterr()
+        assert captured.out == "", "yes=True must print nothing"
+
+    def test_confirmed_returns_true(self):
+        from proto_pipe.cli.prompts import prompt_delete_impact
+
+        with patch("proto_pipe.cli.prompts.click.confirm"):
+            result = prompt_delete_impact(self.SAMPLE_ROWS, yes=False)
+
+        assert result is True
+
+    def test_cancelled_returns_false(self):
+        from proto_pipe.cli.prompts import prompt_delete_impact
+        import click as _click
+
+        with patch(
+            "proto_pipe.cli.prompts.click.confirm",
+            side_effect=_click.Abort(),
+        ):
+            result = prompt_delete_impact(self.SAMPLE_ROWS, yes=False)
+
+        assert result is False
+
+    def test_shows_this_will_remove_header(self, capsys):
+        from proto_pipe.cli.prompts import prompt_delete_impact
+        import click as _click
+
+        with patch(
+            "proto_pipe.cli.prompts.click.confirm",
+            side_effect=_click.Abort(),
+        ):
+            prompt_delete_impact(self.SAMPLE_ROWS, yes=False)
+
+        captured = capsys.readouterr()
+        assert "This will remove:" in captured.out
+
+    def test_shows_all_row_labels(self, capsys):
+        from proto_pipe.cli.prompts import prompt_delete_impact
+        import click as _click
+
+        with patch(
+            "proto_pipe.cli.prompts.click.confirm",
+            side_effect=_click.Abort(),
+        ):
+            prompt_delete_impact(self.SAMPLE_ROWS, yes=False)
+
+        captured = capsys.readouterr()
+        assert "table 'sales'" in captured.out
+        assert "ingest_state" in captured.out
+        assert "source_block" in captured.out
+        assert "source_pass" in captured.out
+
+    def test_count_is_comma_formatted(self, capsys):
+        from proto_pipe.cli.prompts import prompt_delete_impact
+        import click as _click
+
+        with patch(
+            "proto_pipe.cli.prompts.click.confirm",
+            side_effect=_click.Abort(),
+        ):
+            prompt_delete_impact(self.SAMPLE_ROWS, yes=False)
+
+        captured = capsys.readouterr()
+        assert "1,234" in captured.out, "Counts >= 1000 must be comma-formatted"
+
+
+class TestDeleteImpactQueries:
+    """query_delete_*_impact behavioral guarantees.
+
+    Guarantees:
+    - Returns correct counts for each affected table
+    - Returns 0 for missing tables — no error on fresh/partial DB
+    - Returns list of (label, count, unit) tuples
+    """
+
+    @pytest.fixture()
+    def impact_db(self, tmp_path) -> str:
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        db_path = str(tmp_path / "pipeline.db")
+        now = datetime.now(timezone.utc)
+        with duckdb.connect(db_path) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute(
+                "CREATE TABLE sales (order_id VARCHAR, price DOUBLE)"
+            )
+            conn.execute("INSERT INTO sales VALUES ('ORD-001', 99.99)")
+            conn.execute("INSERT INTO sales VALUES ('ORD-002', 250.00)")
+            conn.execute(
+                "INSERT INTO ingest_state "
+                "(id, filename, table_name, status, rows, message, ingested_at) "
+                "VALUES ('s1', 'f.csv', 'sales', 'ok', 2, NULL, ?)",
+                [now],
+            )
+            conn.execute(
+                "INSERT INTO source_block (id, table_name, check_name, "
+                "pk_value, reason, flagged_at) VALUES "
+                "('b1', 'sales', 'type_conflict', 'ORD-001', 'bad', ?)",
+                [now],
+            )
+            conn.execute(
+                "INSERT INTO source_pass (pk_value, table_name, row_hash, "
+                "source_file, ingested_at) VALUES "
+                "('ORD-001', 'sales', 'h1', 'f.csv', ?)",
+                [now],
+            )
+            conn.execute(
+                "INSERT INTO validation_block (id, table_name, report_name, "
+                "check_name, pk_value, reason, flagged_at) VALUES "
+                "('vb1', 'sales', 'daily_sales_validation', "
+                "'range_check', 'ORD-001', 'bad', ?)",
+                [now],
+            )
+            conn.execute(
+                "INSERT INTO validation_pass (pk_value, table_name, report_name, "
+                "row_hash, check_set_hash, status, validated_at) VALUES "
+                "('ORD-001', 'sales', 'daily_sales_validation', "
+                "'h1', 'ch1', 'passed', ?)",
+                [now],
+            )
+        return db_path
+
+    def test_source_impact_returns_correct_counts(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_source_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_source_impact(conn, "sales")
+
+        counts = {label: count for label, count, unit in rows}
+        assert counts["table 'sales'"] == 2
+        assert counts["ingest_state"] == 1
+        assert counts["source_block"] == 1
+        assert counts["source_pass"] == 1
+
+    def test_source_impact_returns_zero_for_missing_table(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_source_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_source_impact(conn, "nonexistent_table")
+
+        counts = {label: count for label, count, unit in rows}
+        assert all(v == 0 for v in counts.values()), (
+            "Missing tables must return 0, not raise an error"
+        )
+
+    def test_source_impact_returns_tuple_list(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_source_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_source_impact(conn, "sales")
+
+        assert isinstance(rows, list)
+        assert all(len(r) == 3 for r in rows), "Each row must be (label, count, unit)"
+
+    def test_report_impact_returns_correct_counts(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_report_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_report_impact(
+                conn, "daily_sales_validation", "sales"
+            )
+
+        counts = {label: count for label, count, unit in rows}
+        assert counts["table 'sales'"] == 2
+        assert counts["validation_block"] == 1
+        assert counts["validation_pass"] == 1
+
+    def test_report_impact_returns_zero_for_missing_table(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_report_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_report_impact(
+                conn, "nonexistent_report", "nonexistent_table"
+            )
+
+        counts = {label: count for label, count, unit in rows}
+        assert all(v == 0 for v in counts.values())
+
+    def test_table_impact_returns_row_count(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_table_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_table_impact(conn, "sales")
+
+        assert len(rows) == 1
+        label, count, unit = rows[0]
+        assert count == 2
+        assert unit == "rows"
+
+    def test_table_impact_returns_zero_for_missing_table(self, impact_db):
+        from proto_pipe.pipelines.query import query_delete_table_impact
+
+        with duckdb.connect(impact_db) as conn:
+            rows = query_delete_table_impact(conn, "nonexistent")
+
+        _, count, _ = rows[0]
+        assert count == 0
+
+
+class TestDeleteImpactQueriesAcrossSchemas:
+    """query_delete_*_impact works regardless of source table column structure.
+
+    Guarantees:
+    - Impact counts are correct when the source table has a different schema
+      (different column names, more columns, fewer columns)
+    - Impact counts are correct when report name differs from table name
+    - Returns 0 for a table that exists but has zero rows (not just missing tables)
+    """
+
+    @pytest.fixture()
+    def multi_schema_db(self, tmp_path) -> str:
+        """DB with two source tables that have completely different schemas."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        db_path = str(tmp_path / "pipeline.db")
+        now = datetime.now(timezone.utc)
+        with duckdb.connect(db_path) as conn:
+            init_all_pipeline_tables(conn)
+
+            # Source 1: insurance-style schema
+            conn.execute(
+                "CREATE TABLE policies "
+                "(policy_ref VARCHAR, carrier VARCHAR, premium DOUBLE, "
+                "inception_date DATE, expiry_date DATE, status VARCHAR)"
+            )
+            conn.execute(
+                "INSERT INTO policies VALUES "
+                "('POL-001', 'Carrier A', 5000.00, '2026-01-01', '2027-01-01', 'active')"
+            )
+            conn.execute(
+                "INSERT INTO policies VALUES "
+                "('POL-002', 'Carrier B', 12000.00, '2026-03-01', '2027-03-01', 'active')"
+            )
+            conn.execute(
+                "INSERT INTO policies VALUES "
+                "('POL-003', 'Carrier A', 750.00, '2026-06-01', '2027-06-01', 'lapsed')"
+            )
+
+            # Source 2: completely different schema — flat claims data
+            conn.execute(
+                "CREATE TABLE claims "
+                "(claim_id INTEGER, loss_date DATE, paid_amount DOUBLE)"
+            )
+            conn.execute(
+                "INSERT INTO claims VALUES (1, '2026-02-15', 3200.00)"
+            )
+
+            # Flags for policies
+            conn.execute(
+                "INSERT INTO source_block (id, table_name, check_name, "
+                "pk_value, reason, flagged_at) VALUES "
+                "('bp1', 'policies', 'type_conflict', 'POL-001', 'bad type', ?), "
+                "('bp2', 'policies', 'type_conflict', 'POL-002', 'bad type', ?)",
+                [now, now],
+            )
+            conn.execute(
+                "INSERT INTO source_pass (pk_value, table_name, row_hash, "
+                "source_file, ingested_at) VALUES "
+                "('POL-003', 'policies', 'h1', 'policies.csv', ?)",
+                [now],
+            )
+
+            # Flags for claims
+            conn.execute(
+                "INSERT INTO source_block (id, table_name, check_name, "
+                "pk_value, reason, flagged_at) VALUES "
+                "('bc1', 'claims', 'type_conflict', '1', 'bad type', ?)",
+                [now],
+            )
+
+            # Validation state: report name differs from table name
+            conn.execute(
+                "INSERT INTO validation_block (id, table_name, report_name, "
+                "check_name, pk_value, reason, flagged_at) VALUES "
+                "('vb1', 'policies', 'policy_validation_q1', "
+                "'range_check', 'POL-001', 'premium out of range', ?), "
+                "('vb2', 'policies', 'policy_validation_q1', "
+                "'range_check', 'POL-002', 'premium out of range', ?)",
+                [now, now],
+            )
+            conn.execute(
+                "INSERT INTO validation_pass (pk_value, table_name, report_name, "
+                "row_hash, check_set_hash, status, validated_at) VALUES "
+                "('POL-003', 'policies', 'policy_validation_q1', "
+                "'h1', 'ch1', 'passed', ?)",
+                [now],
+            )
+
+        return db_path
+
+    def test_source_impact_correct_for_wide_schema_table(self, multi_schema_db):
+        """Source table with 6 columns — count query must not care about schema."""
+        from proto_pipe.pipelines.query import query_delete_source_impact
+
+        with duckdb.connect(multi_schema_db) as conn:
+            rows = query_delete_source_impact(conn, "policies")
+
+        counts = {label: count for label, count, unit in rows}
+        assert counts["table 'policies'"] == 3, (
+            "Row count must reflect actual rows regardless of column structure"
+        )
+        assert counts["source_block"] == 2
+        assert counts["source_pass"] == 1
+
+    def test_source_impact_correct_for_narrow_schema_table(self, multi_schema_db):
+        """Source table with 3 columns — count query must not care about schema."""
+        from proto_pipe.pipelines.query import query_delete_source_impact
+
+        with duckdb.connect(multi_schema_db) as conn:
+            rows = query_delete_source_impact(conn, "claims")
+
+        counts = {label: count for label, count, unit in rows}
+        assert counts["table 'claims'"] == 1
+        assert counts["source_block"] == 1
+        assert counts["source_pass"] == 0
+
+    def test_report_impact_correct_when_report_name_differs_from_table(
+        self, multi_schema_db
+    ):
+        """Report name 'policy_validation_q1' is different from table 'policies'."""
+        from proto_pipe.pipelines.query import query_delete_report_impact
+
+        with duckdb.connect(multi_schema_db) as conn:
+            rows = query_delete_report_impact(
+                conn, "policy_validation_q1", "policies"
+            )
+
+        counts = {label: count for label, count, unit in rows}
+        assert counts["table 'policies'"] == 3
+        assert counts["validation_block"] == 2, (
+            "validation_block count must be scoped to report_name, not table_name"
+        )
+        assert counts["validation_pass"] == 1
+
+    def test_source_impact_returns_zero_rows_for_empty_table(self, multi_schema_db):
+        """A table that exists but has zero rows must return 0, not an error."""
+        from proto_pipe.pipelines.query import query_delete_source_impact
+
+        with duckdb.connect(multi_schema_db) as conn:
+            conn.execute(
+                "CREATE TABLE empty_source (ref VARCHAR, amount DOUBLE)"
+            )
+            rows = query_delete_source_impact(conn, "empty_source")
+
+        counts = {label: count for label, count, unit in rows}
+        assert counts["table 'empty_source'"] == 0, (
+            "Empty table must return 0 rows, not an error"
         )

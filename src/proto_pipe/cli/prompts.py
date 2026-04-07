@@ -18,6 +18,28 @@ import questionary
 from proto_pipe.constants import DUCKDB_TYPES, DATE_FORMATS
 
 
+def prompt_custom_export_path() -> "Path | None":
+    """Prompt for a custom CSV export path with a pipeline warning.
+
+    Shows a warning that custom paths are not picked up by vp ingest or
+    vp flagged retry, then asks for a full output path from the user.
+
+    Returns a resolved Path, or None if the user cancels.
+    """
+    from pathlib import Path
+
+    click.echo(
+        "\n  [warn] Custom paths won't be picked up by vp ingest or vp flagged retry. "
+        "Use csv to export to output_dir so the pipeline can find the file automatically."
+    )
+    raw = questionary.text(
+        "Full export path (including filename, e.g. /tmp/my_export.csv):"
+    ).ask()
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
 def _infer_duckdb_type(series) -> str:
     """Return the DuckDB type string inferred from a pandas Series dtype."""
     import pandas as pd
@@ -70,6 +92,40 @@ def _safe_sample_label(sample, col: str) -> str:
     if len(raw) > 30:
         raw = raw[:27] + "..."
     return f" sample: {raw}"
+
+
+def prompt_delete_impact(
+    rows: list[tuple[str, int, str]],
+    yes: bool = False,
+) -> bool:
+    """Display an impact summary and prompt for confirmation before a delete.
+
+    Shows what will be removed and asks the user to confirm. When yes=True,
+    skips both the summary and the prompt and returns True immediately
+    (scripting path).
+
+    :param rows: List of (label, count, unit) tuples, e.g.:
+                 [("table 'sales'", 1234, "rows"),
+                  ("ingest_state",  15,   "entries"),
+                  ("source_block",  3,    "open flags"),
+                  ("source_pass",   1234, "entries")]
+    :param yes: If True, skip summary and prompt — return True immediately.
+    :returns: True if the user confirmed or yes=True, False if cancelled.
+    """
+    if yes:
+        return True
+
+    click.echo("\n  This will remove:")
+    for label, count, unit in rows:
+        click.echo(f"    {label:<28} {count:,} {unit}")
+    click.echo()
+
+    try:
+        click.confirm("  Continue?", abort=True)
+        return True
+    except click.Abort:
+        click.echo("\n  Cancelled.")
+        return False
 
 
 # ---------------------------------------------------------------------------

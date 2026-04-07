@@ -17,7 +17,7 @@ from proto_pipe.io.ingest import ingest_directory
 from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
-from proto_pipe.reports.query import query_table
+from proto_pipe.pipelines.query import query_table
 from proto_pipe.reports.runner import run_deliverable, run_all_reports
 
 

@@ -29,7 +29,7 @@ from proto_pipe.io.data import load_from_duckdb
 from proto_pipe.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from proto_pipe.pipelines.watermark import WatermarkStore, _watermark_lock
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckParamInspector
-from proto_pipe.reports.query import _log_run, init_report_runs_table
+from proto_pipe.pipelines.query import _log_run, init_report_runs_table
 
 
 # ---------------------------------------------------------------------------

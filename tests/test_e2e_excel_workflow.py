@@ -20,7 +20,7 @@ from proto_pipe.io.ingest import init_db, ingest_directory
 from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
-from proto_pipe.reports.query import execute_sql_file
+from proto_pipe.pipelines.query import execute_sql_file
 from proto_pipe.reports.runner import run_all_reports
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ def excel_reports_config(pipeline_db) -> dict:
 def infra_db(pipeline_db) -> str:
     """Pipeline DB with all infrastructure tables created."""
     from proto_pipe.io.db import init_all_pipeline_tables
-    from proto_pipe.reports.query import init_report_runs_table
+    from proto_pipe.pipelines.query import init_report_runs_table
     init_db(pipeline_db)
     conn = duckdb.connect(pipeline_db)
     init_all_pipeline_tables(conn)
@@ -502,7 +502,7 @@ class TestExcelWorkflow:
         sql_path.write_text("SELECT order_id, price FROM sales ORDER BY order_id")
 
         conn = duckdb.connect(infra_db)
-        from proto_pipe.reports.query import execute_sql_file
+        from proto_pipe.pipelines.query import execute_sql_file
         df = execute_sql_file(conn, str(sql_path))
         conn.close()
 

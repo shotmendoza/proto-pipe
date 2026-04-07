@@ -340,3 +340,144 @@ def execute_sql_file(
         )
 
     return conn.execute(sql).df()
+
+
+def query_pipeline_events(
+    conn,
+    severity: str | None,
+    since: str | None,
+    order_desc: bool = True,
+) -> "pd.DataFrame":
+    """Query pipeline_events with optional severity and since filters.
+
+    :param since: Date string in YYYY-MM-DD format.
+    :param severity: Severity level filter.
+    :param conn: Database connection.
+    :param order_desc: True = most recent first (view use case).
+                       False = chronological (export/archive use case).
+    :raises ValueError: if since is not in YYYY-MM-DD format.
+    """
+    import pandas as pd
+
+    query = "SELECT * FROM pipeline_events WHERE 1=1"
+    params: list = []
+
+    if severity:
+        query += " AND severity = ?"
+        params.append(severity)
+
+    if since:
+        since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        query += " AND occurred_at >= ?"
+        params.append(since_dt)
+
+    query += " ORDER BY occurred_at " + ("DESC" if order_desc else "ASC")
+    return conn.execute(query, params).df()
+
+
+def _safe_count(conn, query: str, params: list | None = None) -> int:
+    """Execute a COUNT query, returning 0 if the table does not exist.
+
+    Used for impact summaries before destructive operations — a missing
+    table (fresh DB, pre-migration) should show 0, not raise an error.
+    """
+    try:
+        return conn.execute(query, params or []).fetchone()[0]
+    except Exception:
+        return 0
+
+
+def query_delete_source_impact(
+    conn, table_name: str
+) -> list[tuple[str, int, str]]:
+    """Return row counts for all tables affected by vp delete source.
+
+    Returns a list of (label, count, unit) tuples ready for
+    prompt_delete_impact. Missing tables return 0, not an error.
+    """
+    return [
+        (
+            f"table '{table_name}'",
+            _safe_count(conn, f'SELECT count(*) FROM "{table_name}"'),
+            "rows",
+        ),
+        (
+            "ingest_state",
+            _safe_count(
+                conn,
+                "SELECT count(*) FROM ingest_state WHERE table_name = ?",
+                [table_name],
+            ),
+            "entries",
+        ),
+        (
+            "source_block",
+            _safe_count(
+                conn,
+                "SELECT count(*) FROM source_block WHERE table_name = ?",
+                [table_name],
+            ),
+            "open flags",
+        ),
+        (
+            "source_pass",
+            _safe_count(
+                conn,
+                "SELECT count(*) FROM source_pass WHERE table_name = ?",
+                [table_name],
+            ),
+            "entries",
+        ),
+    ]
+
+
+def query_delete_report_impact(
+    conn, report_name: str, target_table: str
+) -> list[tuple[str, int, str]]:
+    """Return row counts for all tables affected by vp delete report.
+
+    Returns a list of (label, count, unit) tuples ready for
+    prompt_delete_impact. Missing tables return 0, not an error.
+    """
+    return [
+        (
+            f"table '{target_table}'",
+            _safe_count(conn, f'SELECT count(*) FROM "{target_table}"'),
+            "rows",
+        ),
+        (
+            "validation_block",
+            _safe_count(
+                conn,
+                "SELECT count(*) FROM validation_block WHERE report_name = ?",
+                [report_name],
+            ),
+            "entries",
+        ),
+        (
+            "validation_pass",
+            _safe_count(
+                conn,
+                "SELECT count(*) FROM validation_pass WHERE report_name = ?",
+                [report_name],
+            ),
+            "entries",
+        ),
+    ]
+
+
+def query_delete_table_impact(
+    conn, table_name: str
+) -> list[tuple[str, int, str]]:
+    """Return row count for a table affected by vp delete table.
+
+    Returns a list of (label, count, unit) tuples ready for
+    prompt_delete_impact. Missing table returns 0, not an error.
+    """
+    return [
+        (
+            f"table '{table_name}'",
+            _safe_count(conn, f'SELECT count(*) FROM "{table_name}"'),
+            "rows",
+        ),
+    ]

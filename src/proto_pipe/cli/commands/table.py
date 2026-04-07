@@ -274,125 +274,16 @@ def get_reviewer(edit: bool = False) -> ReviewInterface:
 @click.option("--limit", default=None, show_default=True, help="Max rows to display.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 def table_cmd(table_name, edit, export, limit, pipeline_db):
-    """View, edit, or export any pipeline table.
+    """[Removed] Use vp view table or vp edit table instead."""
+    import sys
 
-    \b
-    Examples:
-      vp table # select table interactively
-      vp table sales # view sales table
-      vp table source_block --edit # edit blocked rows inline
-      vp table ingest_state --export ingest_state.csv
-    """
-    import questionary
-
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    conn = duckdb.connect(p_db)
-
-    try:
-        all_tables = get_all_tables(conn)
-
-        if not all_tables:
-            click.echo("  No tables found in the pipeline DB. Run: vp ingest")
-            return
-
-        # If no table specified, show selection menu
-        if not table_name:
-            # Split into user tables and infrastructure tables for clarity
-            user_tables = [t for t in all_tables if t not in PIPELINE_TABLES]
-            infra_tables = [t for t in all_tables if t in PIPELINE_TABLES]
-
-            choices = []
-            if user_tables:
-                choices.append(questionary.Separator("── Data Tables ──"))
-                choices.extend(user_tables)
-            if infra_tables:
-                choices.append(questionary.Separator("── Pipeline Tables ──"))
-                choices.extend(infra_tables)
-
-            table_name = questionary.select(
-                "Which table would you like to view?",
-                choices=choices,
-            ).ask()
-
-            if not table_name:
-                click.echo("Cancelled.")
-                return
-
-        # Verify table exists
-        if table_name not in all_tables:
-            click.echo(f"[error] Table '{table_name}' not found.")
-            click.echo(f"Available: {', '.join(all_tables)}")
-            return
-
-        df = _get_table_df(conn, table_name, limit or 100)
-
-        if df.empty:
-            click.echo(f"'{table_name}' is empty.")
-            return
-
-        # Export path
-        if export:
-            # Fetch without limit for export
-            export_df = conn.execute(
-                f'SELECT * FROM "{table_name}"'
-                + (f" LIMIT {limit}" if limit is not None else "")
-            ).df()
-            # Resolve path — if no directory given, use output_dir from settings
-            export_path = Path(export)
-            if not export_path.is_absolute() and export_path.parent == Path("."):
-                try:
-                    out_dir = load_settings()["paths"]["output_dir"]
-                    export_path = Path(out_dir) / export_path
-                except Exception:
-                    pass
-            export_path.parent.mkdir(parents=True, exist_ok=True)
-            export_df.to_csv(export_path, index=False)
-            click.echo(f"[ok] {len(export_df)} row(s) exported to {export_path}")
-            return
-
-        # Get primary key for this table if it's a user table
-
-        settings = load_settings()
-        pk_col = None
-        try:
-            src_cfg = settings["paths"]["sources_config"]
-            sources = load_config(src_cfg).get("sources", [])
-            source = next((s for s in sources if s["target_table"] == table_name), None)
-            if source:
-                pk_col = source.get("primary_key")
-        except Exception:
-            pass
-
-        reviewer = get_reviewer(edit=edit)
-
-        if edit:
-            edited_df = reviewer.edit(
-                df, title=f"{table_name} ({len(df)} rows)", pk_col=pk_col
-            )
-            if edited_df is not None and not edited_df.equals(df):
-                from proto_pipe.reports.corrections import import_corrections
-                import tempfile
-                import os
-
-                with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
-                    corrections_path = f.name
-                try:
-                    edited_df.to_csv(corrections_path, index=False)
-                    if pk_col:
-                        import_corrections(conn, table_name, corrections_path, pk_col)
-                        click.echo(f"  [ok] Changes saved to '{table_name}'")
-                    else:
-                        click.echo(
-                            f"[warn] No primary key found for '{table_name}'"
-                            f" — changes not saved."
-                        )
-                finally:
-                    os.unlink(corrections_path)
-        else:
-            reviewer.show(df, title=f"{table_name} ({len(df)} rows)", pk_col=pk_col)
-
-    finally:
-        conn.close()
+    click.echo(
+        "[error] 'vp table' has been removed.\n"
+        "        To view a table:      vp view table\n"
+        "        To edit a table:      vp edit table\n"
+        "        To edit flagged rows: vp flagged edit"
+    )
+    sys.exit(1)
 
 
 def table_commands(cli: click.Group) -> None:

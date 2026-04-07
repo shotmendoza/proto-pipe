@@ -12,7 +12,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.reports.query import (
+from proto_pipe.pipelines.query import (
     build_filter_clause,
     query_table,
     _merge_filters,

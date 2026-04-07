@@ -208,75 +208,44 @@ class TestTextualReview:
 # table_cmd (CLI integration)
 # ---------------------------------------------------------------------------
 
+
 class TestTableCmd:
-    def test_displays_table_by_name(self, db_with_sales, tmp_path):
-        """vp table sales displays the table."""
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales
-        ):
-            result = runner.invoke(table_cmd, ["sales"], env={"PAGER": "cat"})
-        assert result.exit_code == 0
+    """vp table is hard deprecated — exits non-zero, no DB access.
 
-    def test_unknown_table_shows_error(self, db_with_sales):
-        """vp table nonexistent shows error message."""
-        runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
-            result = runner.invoke(table_cmd, ["nonexistent"], env={"PAGER": "cat"})
-        assert result.exit_code == 0
-        assert "error" in result.output.lower() or "not found" in result.output.lower()
+    Behavioral guarantees:
+    - Exits with a non-zero code
+    - Error message names all three replacements: vp view table,
+      vp edit table, vp flagged edit
+    - Does not execute any DB query or display logic
+    """
 
-    def test_empty_table_shows_message(self, empty_db):
-        """vp table on an empty table shows empty message."""
+    def test_exits_with_nonzero_code(self):
         runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=empty_db):
-            result = runner.invoke(table_cmd, ["sales"], env={"PAGER": "cat"})
-        assert result.exit_code == 0
-        assert "empty" in result.output.lower()
+        result = runner.invoke(table_cmd, ["sales"])
+        assert result.exit_code == 1
 
-    def test_export_writes_csv(self, db_with_sales, tmp_path):
-        """vp table sales --export out.csv writes a CSV file."""
-        export_path = str(tmp_path / "out.csv")
+    def test_error_mentions_vp_view_table(self):
         runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
-            result = runner.invoke(table_cmd, ["sales", "--export", export_path], env={"PAGER": "cat"})
-        assert result.exit_code == 0
-        assert Path(export_path).exists()
-        df = pd.read_csv(export_path)
-        assert len(df) == 3
-        assert "order_id" in df.columns
+        result = runner.invoke(table_cmd, ["sales"])
+        assert "vp view table" in result.output
 
-    def test_export_correct_row_count(self, db_with_sales, tmp_path):
-        """Exported CSV has the correct number of rows."""
-        export_path = str(tmp_path / "out.csv")
+    def test_error_mentions_vp_edit_table(self):
         runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
-            runner.invoke(table_cmd, ["sales", "--export", export_path], env={"PAGER": "cat"})
-        df = pd.read_csv(export_path)
-        assert len(df) == 3
+        result = runner.invoke(table_cmd, ["sales"])
+        assert "vp edit table" in result.output
 
-    def test_limit_restricts_rows(self, db_with_sales, tmp_path):
-        """--limit restricts the number of rows displayed."""
-        export_path = str(tmp_path / "out.csv")
+    def test_error_mentions_vp_flagged_edit(self):
         runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
-            runner.invoke(table_cmd, ["sales", "--export", export_path, "--limit", "2"], env={"PAGER": "cat"})
-        df = pd.read_csv(export_path)
-        assert len(df) == 2
+        result = runner.invoke(table_cmd, ["sales"])
+        assert "vp flagged edit" in result.output
 
-    def test_infrastructure_tables_accessible(self, db_with_sales):
-        """Pipeline infrastructure tables like flagged_rows can be viewed."""
+    def test_does_not_query_db(self, tmp_path):
+        """Exits before any DB connection — nonexistent DB path causes no
+        different behaviour, proving no DB access occurs."""
         runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
-            result = runner.invoke(table_cmd, ["source_block"], env={"PAGER": "cat"})
-        assert result.exit_code == 0
-
-    def test_no_tables_in_db(self, tmp_path):
-        """Empty DB shows appropriate message."""
-        db_path = str(tmp_path / "empty.db")
-        duckdb.connect(db_path).close()
-        runner = CliRunner()
-        with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_path):
-            result = runner.invoke(table_cmd, [], env={"PAGER": "cat"})
-        assert result.exit_code == 0
-        assert "no tables" in result.output.lower()
+        result = runner.invoke(
+            table_cmd,
+            ["--pipeline-db", str(tmp_path / "nonexistent.db"), "sales"],
+        )
+        assert result.exit_code == 1
+        assert "vp view table" in result.output

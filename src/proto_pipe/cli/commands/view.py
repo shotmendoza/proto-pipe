@@ -17,7 +17,10 @@ from proto_pipe.io.db import get_all_tables
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _show_or_export(df, title: str, export: str | None, pk_col: str | None = None) -> None:
+
+def _show_or_export(
+    df, title: str, export: str | None, pk_col: str | None = None
+) -> None:
     """Route a DataFrame to the reviewer or export it depending on --export flag."""
     if export == "csv":
         from proto_pipe.io.config import load_settings
@@ -31,6 +34,18 @@ def _show_or_export(df, title: str, export: str | None, pk_col: str | None = Non
         output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_path, index=False)
         click.echo(f"[ok] {len(df)} row(s) exported to: {output_path}")
+    elif export == "custom":
+        from proto_pipe.cli.prompts import prompt_custom_export_path
+
+        custom_path = prompt_custom_export_path()
+        if custom_path:
+            custom_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(custom_path, index=False)
+            click.echo(f"[ok] {len(df)} row(s) exported to: {custom_path}")
+        else:
+            # User cancelled the path prompt — fall back to rich display
+            reviewer = get_reviewer(edit=False)
+            reviewer.show(df, title=title, pk_col=pk_col)
     else:
         reviewer = get_reviewer(edit=False)
         reviewer.show(df, title=title, pk_col=pk_col)
@@ -105,74 +120,26 @@ def view_cmd():
 
 
 # ---------------------------------------------------------------------------
-# vp view source
-# ---------------------------------------------------------------------------
-
-@view_cmd.command("source")
-@click.argument("table_name", required=False)
-@click.option("--table", default=None, help="Source table name.")
-@click.option("--export", default=None, type=click.Choice(["csv", "term"]))
-@click.option("--limit", default=500, show_default=True, help="Max rows to display.")
-@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-@click.option("--sources-config", default=None, help="Override sources config path.")
-def view_source(table_name, table, export, limit, pipeline_db, sources_config):
-    """View ingested rows for a source table.
-
-    Adds a _status column showing whether each row is flagged or clean.
-
-    \b
-    Examples:
-      vp view source
-      vp view source sales
-      vp view source --table sales --export csv
-    """
-    from proto_pipe.io.config import SourceConfig
-
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    src_cfg = config_path_or_override("sources_config", sources_config)
-
-    config = SourceConfig(src_cfg)
-    source_tables = [s["target_table"] for s in config.all()]
-
-    name = _resolve_name(
-        table_name, table, source_tables,
-        "Which source table would you like to view?"
-    )
-    if not name:
-        click.echo("No sources configured. Run: vp new source")
-        return
-
-    source = config.get_by_table(name)
-    if not source:
-        click.echo(f"[error] No source found for table '{name}'")
-        return
-
-    pk_col = source.get("primary_key")
-
-    conn = duckdb.connect(p_db)
-    try:
-        df = _with_status_column(conn, name, pk_col, limit)
-        if df.empty:
-            click.echo(f"'{name}' is empty. Run: vp ingest")
-            return
-        _show_or_export(df, f"source: {name} ({len(df)} rows)", export, pk_col)
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
 # vp view report
 # ---------------------------------------------------------------------------
+
 
 @view_cmd.command("report")
 @click.argument("report_name", required=False)
 @click.option("--report", default=None, help="Report name.")
-@click.option("--export", default=None, type=click.Choice(["csv", "term"]))
+@click.option(
+    "--export",
+    default=None,
+    type=click.Choice(["csv", "custom"]),
+    help="csv: auto-named file in output_dir. custom: prompted full path.",
+)
 @click.option("--limit", default=500, show_default=True, help="Max rows to display.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--reports-config", default=None, help="Override reports config path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
-def view_report(report_name, report, export, limit, pipeline_db, reports_config, sources_config):
+def view_report(
+    report_name, report, export, limit, pipeline_db, reports_config, sources_config
+):
     """View the source table a report runs against.
 
     Shows ingested data with a _status column (flagged / ingested).
@@ -182,6 +149,7 @@ def view_report(report_name, report, export, limit, pipeline_db, reports_config,
       vp view report
       vp view report daily_sales_validation
       vp view report --report daily_sales_validation --export csv
+      vp view report --report daily_sales_validation --export custom
     """
     from proto_pipe.io.config import ReportConfig, SourceConfig
 
@@ -191,8 +159,7 @@ def view_report(report_name, report, export, limit, pipeline_db, reports_config,
 
     config = ReportConfig(rep_cfg)
     name = _resolve_name(
-        report_name, report, config.names(),
-        "Which report would you like to view?"
+        report_name, report, config.names(), "Which report would you like to view?"
     )
     if not name:
         click.echo("No reports configured. Run: vp new report")
@@ -308,82 +275,63 @@ def view_deliverable(
 
 
 # ---------------------------------------------------------------------------
-# vp view table
+# vp view source
 # ---------------------------------------------------------------------------
 
-@view_cmd.command("table")
+
+@view_cmd.command("source")
 @click.argument("table_name", required=False)
-@click.option("--table", default=None, help="Table name (alternative to argument).")
-@click.option("--export", default=None, type=click.Choice(["csv", "term"]))
+@click.option("--table", default=None, help="Source table name.")
+@click.option(
+    "--export",
+    default=None,
+    type=click.Choice(["csv", "custom"]),
+    help="csv: auto-named file in output_dir. custom: prompted full path.",
+)
 @click.option("--limit", default=500, show_default=True, help="Max rows to display.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-def view_table(table_name, table, export, limit, pipeline_db):
-    """View any pipeline table with rich display.
+@click.option("--sources-config", default=None, help="Override sources config path.")
+def view_source(table_name, table, export, limit, pipeline_db, sources_config):
+    """View ingested rows for a source table.
+
+    Adds a _status column showing whether each row is flagged or clean.
 
     \b
     Examples:
-      vp view table
-      vp view table sales
-      vp view table ingest_state
-      vp view table --table sales --export csv
+      vp view source
+      vp view source sales
+      vp view source --table sales --export csv
+      vp view source --table sales --export custom
     """
-    from proto_pipe.io.config import SourceConfig, load_settings
+    from proto_pipe.io.config import SourceConfig
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
-    name = table_name or table
+    src_cfg = config_path_or_override("sources_config", sources_config)
+
+    config = SourceConfig(src_cfg)
+    source_tables = [s["target_table"] for s in config.all()]
+
+    name = _resolve_name(
+        table_name, table, source_tables, "Which source table would you like to view?"
+    )
+    if not name:
+        click.echo("No sources configured. Run: vp new source")
+        return
+
+    source = config.get_by_table(name)
+    if not source:
+        click.echo(f"[error] No source found for table '{name}'")
+        return
+
+    pk_col = source.get("primary_key")
 
     conn = duckdb.connect(p_db)
     try:
-        all_tables = get_all_tables(conn)
-
-        if not all_tables:
-            click.echo("No tables found in the pipeline DB. Run: vp ingest")
-            return
-
-        if not name:
-            user_tables = [t for t in all_tables if t not in PIPELINE_TABLES]
-            infra_tables = [t for t in all_tables if t in PIPELINE_TABLES]
-
-            choices = []
-            if user_tables:
-                choices.append(questionary.Separator("── Data Tables ──"))
-                choices.extend(user_tables)
-            if infra_tables:
-                choices.append(questionary.Separator("── Pipeline Tables ──"))
-                choices.extend(infra_tables)
-
-            name = questionary.select(
-                "Which table would you like to view?",
-                choices=choices,
-            ).ask()
-            if not name:
-                click.echo("Cancelled.")
-                return
-
-        if name not in all_tables:
-            click.echo(f"[error] Table '{name}' not found.")
-            click.echo(f"Available: {', '.join(all_tables)}")
-            return
-
-        df = conn.execute(f'SELECT * FROM "{name}" LIMIT {limit}').df()
+        df = _with_status_column(conn, name, pk_col, limit)
         if df.empty:
-            click.echo(f"'{name}' is empty.")
+            click.echo(f"'{name}' is empty. Run: vp ingest")
             return
-
-        pk_col = None
-        if name not in PIPELINE_TABLES:
-            try:
-                settings = load_settings()
-                src_cfg = settings["paths"]["sources_config"]
-                src_config = SourceConfig(src_cfg)
-                source = src_config.get_by_table(name)
-                if source:
-                    pk_col = source.get("primary_key")
-            except Exception:
-                pass
-
-        _show_or_export(df, f"{name} ({len(df)} rows)", export, pk_col)
-
+        _show_or_export(df, f"source: {name} ({len(df)} rows)", export, pk_col)
     finally:
         conn.close()
 
@@ -618,6 +566,150 @@ def view_lineage(
             _render_report(rname, indent=1, filter_report=report, filter_deliverable=deliverable)
 
         click.echo()
+
+
+# ---------------------------------------------------------------------------
+# vp view table
+# ---------------------------------------------------------------------------
+@view_cmd.command("table")
+@click.argument("table_name", required=False)
+@click.option("--table", default=None, help="Table name (alternative to argument).")
+@click.option(
+    "--export",
+    default=None,
+    type=click.Choice(["csv", "custom"]),
+    help="csv: auto-named file in output_dir. custom: prompted full path.",
+)
+@click.option("--limit", default=500, show_default=True, help="Max rows to display.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def view_table(table_name, table, export, limit, pipeline_db):
+    """View any pipeline table with rich display.
+
+    \b
+    Examples:
+      vp view table
+      vp view table sales
+      vp view table ingest_state
+      vp view table --table sales --export csv
+      vp view table --table sales --export custom
+    """
+    from proto_pipe.io.config import SourceConfig, load_settings
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    name = table_name or table
+
+    conn = duckdb.connect(p_db)
+    try:
+        all_tables = get_all_tables(conn)
+
+        if not all_tables:
+            click.echo("No tables found in the pipeline DB. Run: vp ingest")
+            return
+
+        if not name:
+            user_tables = [t for t in all_tables if t not in PIPELINE_TABLES]
+            infra_tables = [t for t in all_tables if t in PIPELINE_TABLES]
+
+            choices = []
+            if user_tables:
+                choices.append(questionary.Separator("── Data Tables ──"))
+                choices.extend(user_tables)
+            if infra_tables:
+                choices.append(questionary.Separator("── Pipeline Tables ──"))
+                choices.extend(infra_tables)
+
+            name = questionary.select(
+                "Which table would you like to view?",
+                choices=choices,
+            ).ask()
+            if not name:
+                click.echo("Cancelled.")
+                return
+
+        if name not in all_tables:
+            click.echo(f"[error] Table '{name}' not found.")
+            click.echo(f"Available: {', '.join(all_tables)}")
+            return
+
+        df = conn.execute(f'SELECT * FROM "{name}" LIMIT {limit}').df()
+        if df.empty:
+            click.echo(f"'{name}' is empty.")
+            return
+
+        pk_col = None
+        if name not in PIPELINE_TABLES:
+            try:
+                settings = load_settings()
+                src_cfg = settings["paths"]["sources_config"]
+                src_config = SourceConfig(src_cfg)
+                source = src_config.get_by_table(name)
+                if source:
+                    pk_col = source.get("primary_key")
+            except Exception:
+                pass
+
+        _show_or_export(df, f"{name} ({len(df)} rows)", export, pk_col)
+
+    finally:
+        conn.close()
+
+
+@view_cmd.command("log")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option(
+    "--severity",
+    default=None,
+    type=click.Choice(["info", "warn", "error"]),
+    help="Filter to events of this severity.",
+)
+@click.option(
+    "--since",
+    default=None,
+    help="Show events on or after this date (YYYY-MM-DD).",
+)
+@click.option(
+    "--export",
+    default=None,
+    type=click.Choice(["csv", "custom"]),
+    help="csv: auto-named file in output_dir. custom: prompted full path.",
+)
+def view_log(pipeline_db, severity, since, export):
+    """Display pipeline_events inline, most recent first.
+
+    Use --severity and --since to filter. Use --export to write to a
+    file instead of displaying in the terminal.
+
+    \b
+    Examples:
+      vp view log
+      vp view log --severity error
+      vp view log --since 2026-01-01
+      vp view log --severity warn --since 2026-03-01
+      vp view log --export csv
+    """
+    import duckdb
+    from proto_pipe.cli.commands.export import query_pipeline_events
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    conn = duckdb.connect(p_db)
+    try:
+        try:
+            df = query_pipeline_events(conn, severity, since, order_desc=True)
+        except ValueError:
+            click.echo(f"[error] --since must be in YYYY-MM-DD format, got: {since}")
+            return
+
+        if df.empty:
+            click.echo("[info] No events matched the given filters.")
+            return
+
+        # Strip timezone for display compat
+        for col in df.select_dtypes(include=["datetimetz"]).columns:
+            df[col] = df[col].dt.tz_localize(None)
+
+        _show_or_export(df, f"pipeline_events ({len(df)} events)", export)
+    finally:
+        conn.close()
 
 
 def view_commands(cli: click.Group) -> None:

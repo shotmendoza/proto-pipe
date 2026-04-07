@@ -24,7 +24,9 @@ def delete_cmd():
 
 
 @delete_cmd.command("source")
-@click.option("--table", default=None, help="Source table name to delete (skips multi-select).")
+@click.option(
+    "--table", default=None, help="Source table name to delete (skips multi-select)."
+)
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--sources-config", default=None, help="Override sources config path.")
@@ -43,6 +45,8 @@ def delete_source(table, yes, pipeline_db, sources_config):
     """
     from proto_pipe.io.config import SourceConfig
     from proto_pipe.io.db import table_exists
+    from proto_pipe.pipelines.query import query_delete_source_impact
+    from proto_pipe.cli.prompts import prompt_delete_impact
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -54,7 +58,6 @@ def delete_source(table, yes, pipeline_db, sources_config):
         click.echo("No sources configured.")
         return
 
-    # --table bypasses multi-select for scripted use
     if table:
         source = config.get_by_table(table)
         if not source:
@@ -71,25 +74,24 @@ def delete_source(table, yes, pipeline_db, sources_config):
             return
         selected = [config.get(n) for n in names]
 
-    # Show summary and confirm
+    # Show selected source names
     click.echo()
     for source in selected:
         click.echo(f"  {source['name']:<28} table: {source['target_table']}")
 
-    if not yes:
-        try:
-            click.confirm(
-                f"\nDelete {len(selected)} source(s)? "
-                f"This will drop their DB tables, clear ingest_state, source_block, and source_pass. "
-                f"This cannot be undone.",
-                abort=True,
-            )
-        except click.Abort:
-            click.echo("\n  Cancelled.")
-            return
-
+    # Connect before confirmation — needed for impact counts
     conn = duckdb.connect(p_db)
     try:
+        # Build and show impact summary, prompt for confirmation
+        all_impact_rows = []
+        for source in selected:
+            all_impact_rows.extend(
+                query_delete_source_impact(conn, source["target_table"])
+            )
+
+        if not prompt_delete_impact(all_impact_rows, yes=yes):
+            return
+
         for source in selected:
             name = source["name"]
             target_table = source["target_table"]
@@ -106,7 +108,9 @@ def delete_source(table, yes, pipeline_db, sources_config):
                     [target_table],
                 ).fetchall()
                 if deleted_log:
-                    click.echo(f"  [ok] Cleared {len(deleted_log)} ingest_state entry/entries")
+                    click.echo(
+                        f"  [ok] Cleared {len(deleted_log)} ingest_state entry/entries"
+                    )
 
                 deleted_flags = conn.execute(
                     "DELETE FROM source_block WHERE table_name = ? RETURNING id",
@@ -118,9 +122,12 @@ def delete_source(table, yes, pipeline_db, sources_config):
                     )
 
                 from proto_pipe.io.db import clear_source_pass_for_table
+
                 cleared_pass = clear_source_pass_for_table(conn, target_table)
                 if cleared_pass:
-                    click.echo(f"  [ok] Cleared {cleared_pass} source_pass entry/entries")
+                    click.echo(
+                        f"  [ok] Cleared {cleared_pass} source_pass entry/entries"
+                    )
 
                 config.remove(name)
                 click.echo(f"  [ok] Removed '{name}' from sources_config.yaml")
@@ -137,12 +144,13 @@ def delete_source(table, yes, pipeline_db, sources_config):
 @delete_cmd.command("report")
 @click.option("--report", default=None, help="Report name to delete.")
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--reports-config", default=None, help="Override reports config path.")
-def delete_report(report, yes, reports_config):
+def delete_report(report, yes, pipeline_db, reports_config):
     """Remove a report configuration.
 
-    Only removes the config entry — does not affect the source table
-    or any validation flags.
+    Drops the report table, removes the config entry, clears
+    validation_block and validation_pass entries.
 
     \b
     Examples:
@@ -150,8 +158,12 @@ def delete_report(report, yes, reports_config):
       vp delete report --report daily_sales_validation
     """
     from proto_pipe.io.config import ReportConfig
+    from proto_pipe.io.db import table_exists, clear_validation_pass_for_report
+    from proto_pipe.pipelines.query import query_delete_report_impact
+    from proto_pipe.cli.prompts import prompt_delete_impact
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
     config = ReportConfig(rep_cfg)
 
     if not report:
@@ -174,50 +186,46 @@ def delete_report(report, yes, reports_config):
 
     target_table = existing.get("target_table", report)
 
+    # Connect before confirmation — needed for impact counts
+    conn = duckdb.connect(p_db)
     try:
-        if not yes:
-            click.confirm(
-                f"Delete report '{report}'? This will drop the report table '{target_table}', "
-                f"clear validation_block and validation_pass. Cannot be undone.",
-                abort=True,
-            )
+        impact = query_delete_report_impact(conn, report, target_table)
 
-        p_db = config_path_or_override("pipeline_db")
-        conn = duckdb.connect(p_db)
+        if not prompt_delete_impact(impact, yes=yes):
+            return
+
+        if table_exists(conn, target_table):
+            conn.execute(f'DROP TABLE "{target_table}"')
+            click.echo(f"  [ok] Dropped report table '{target_table}'")
+        else:
+            click.echo(f"  [skip] Report table '{target_table}' not found in DB")
+
         try:
-            from proto_pipe.io.db import table_exists, clear_validation_pass_for_report
+            cleared_block = conn.execute(
+                "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
+                [report],
+            ).fetchall()
+            if cleared_block:
+                click.echo(
+                    f"  [ok] Cleared {len(cleared_block)} validation_block entry/entries"
+                )
+        except Exception:
+            pass
 
-            if table_exists(conn, target_table):
-                conn.execute(f'DROP TABLE "{target_table}"')
-                click.echo(f"  [ok] Dropped report table '{target_table}'")
-            else:
-                click.echo(f"  [skip] Report table '{target_table}' not found in DB")
+        try:
+            cleared_pass = clear_validation_pass_for_report(conn, report)
+            if cleared_pass:
+                click.echo(
+                    f"  [ok] Cleared {cleared_pass} validation_pass entry/entries"
+                )
+        except Exception:
+            pass
 
-            try:
-                cleared_block = conn.execute(
-                    "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
-                    [report],
-                ).fetchall()
-                if cleared_block:
-                    click.echo(f"  [ok] Cleared {len(cleared_block)} validation_block entry/entries")
-            except Exception:
-                pass  # table may not exist on older DBs pre-migration
+    finally:
+        conn.close()
 
-            try:
-                cleared_pass = clear_validation_pass_for_report(conn, report)
-                if cleared_pass:
-                    click.echo(f"  [ok] Cleared {cleared_pass} validation_pass entry/entries")
-            except Exception:
-                pass  # table may not exist on older DBs pre-migration
-
-        finally:
-            conn.close()
-
-        config.remove(report)
-        click.echo(f"[ok] Report '{report}' removed from reports_config.yaml")
-
-    except click.Abort:
-        click.echo("\n  Cancelled.")
+    config.remove(report)
+    click.echo(f"[ok] Report '{report}' removed from reports_config.yaml")
 
 
 @delete_cmd.command("deliverable")
@@ -294,6 +302,8 @@ def delete_table(table_name, table, yes, pipeline_db):
       vp delete table sales
       vp delete table --table sales --yes
     """
+    from proto_pipe.pipelines.query import query_delete_table_impact
+    from proto_pipe.cli.prompts import prompt_delete_impact
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     name = table_name or table
@@ -325,22 +335,17 @@ def delete_table(table_name, table, yes, pipeline_db):
             )
             return
 
-        try:
-            if not yes:
-                click.confirm(
-                    f"Drop table '{name}'? This cannot be undone.",
-                    abort=True,
-                )
+        impact = query_delete_table_impact(conn, name)
 
-            conn.execute(f'DROP TABLE "{name}"')
-            click.echo(f"[ok] Table '{name}' dropped.")
-            click.echo(
-                f"  Note: sources_config.yaml was not updated. "
-                f"Run 'vp delete source --table {name}' to remove the config entry too."
-            )
+        if not prompt_delete_impact(impact, yes=yes):
+            return
 
-        except click.Abort:
-            click.echo("\n  Cancelled.")
+        conn.execute(f'DROP TABLE "{name}"')
+        click.echo(f"[ok] Table '{name}' dropped.")
+        click.echo(
+            f"  Note: sources_config.yaml was not updated. "
+            f"Run 'vp delete source --table {name}' to remove the config entry too."
+        )
 
     finally:
         conn.close()
@@ -348,4 +353,3 @@ def delete_table(table_name, table, yes, pipeline_db):
 
 def delete_commands(cli: click.Group) -> None:
     cli.add_command(delete_cmd)
-    

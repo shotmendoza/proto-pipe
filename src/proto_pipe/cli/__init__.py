@@ -9,6 +9,7 @@ from proto_pipe.cli.commands.edit import edit_commands
 from .flagged import flagged_commands
 from proto_pipe.cli.commands.funcs import funcs_commands
 from proto_pipe.cli.commands.new import new_commands
+from proto_pipe.cli.commands.refresh import refresh_commands
 from .quickstart import setup_commands
 from .reports import reports_commands
 from .scaffold import scaffold_commands
@@ -31,6 +32,7 @@ export_commands(cli)
 new_commands(cli)
 edit_commands(cli)
 delete_commands(cli)
+refresh_commands(cli)
 view_commands(cli)
 flagged_commands(cli)
 funcs_commands(cli)

@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 import click
 
 from proto_pipe.io.config import config_path_or_override
+from proto_pipe.pipelines.query import query_pipeline_events
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +187,10 @@ def export_validation(report, output, pipeline_db, sources_config):
 # vp export log
 # ---------------------------------------------------------------------------
 
+
 @export.command("log")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-@click.option("--output",      default=None, help="Override output path (.csv).")
+@click.option("--output", default=None, help="Override output path (.csv).")
 @click.option(
     "--severity",
     default=None,
@@ -234,26 +236,11 @@ def export_log(pipeline_db, output, severity, since, clear):
 
     conn = duckdb.connect(p_db)
     try:
-        query = "SELECT * FROM pipeline_events WHERE 1=1"
-        params: list = []
-
-        if severity:
-            query += " AND severity = ?"
-            params.append(severity)
-
-        if since:
-            try:
-                since_dt = datetime.strptime(since, "%Y-%m-%d").replace(
-                    tzinfo=timezone.utc
-                )
-                query += " AND occurred_at >= ?"
-                params.append(since_dt)
-            except ValueError:
-                click.echo(f"[error] --since must be in YYYY-MM-DD format, got: {since}")
-                return
-
-        query += " ORDER BY occurred_at"
-        df = conn.execute(query, params).df()
+        try:
+            df = query_pipeline_events(conn, severity, since, order_desc=False)
+        except ValueError:
+            click.echo(f"[error] --since must be in YYYY-MM-DD format, got: {since}")
+            return
 
         if df.empty:
             click.echo("[info] No events matched the given filters — nothing exported.")
@@ -275,6 +262,9 @@ def export_log(pipeline_db, output, severity, since, clear):
                 delete_query += " AND severity = ?"
                 delete_params.append(severity)
             if since:
+                since_dt = datetime.strptime(since, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
                 delete_query += " AND occurred_at >= ?"
                 delete_params.append(since_dt)
 
