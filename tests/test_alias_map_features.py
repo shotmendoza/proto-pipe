@@ -619,16 +619,11 @@ def test_run_report_transforms_run_after_checks(tmp_path):
 
     init_db(db_path)
     conn = duckdb.connect(db_path)
-    for ddl in [
-        """CREATE TABLE IF NOT EXISTS flagged_rows (
-            id VARCHAR PRIMARY KEY, table_name VARCHAR, check_name VARCHAR,
-            reason VARCHAR, flagged_at TIMESTAMPTZ)""",
-        """CREATE TABLE IF NOT EXISTS validation_flags (
-            id VARCHAR PRIMARY KEY, report_name VARCHAR, table_name VARCHAR,
-            check_name VARCHAR, pk_value VARCHAR, reason VARCHAR,
-            args VARCHAR, flagged_at TIMESTAMPTZ)""",
-    ]:
-        conn.execute(ddl)
+    from proto_pipe.io.db import init_all_pipeline_tables
+    conn_all = duckdb.connect(db_path)
+    init_all_pipeline_tables(conn_all)
+    conn_all.close()
+    conn = duckdb.connect(db_path)
     df = pd.DataFrame({
         "id": ["R1", "R2"],
         "status": ["Issuance", "Renewal"],
@@ -852,3 +847,244 @@ def test_new_macro_skips_existing_file(tmp_path):
     assert result.exit_code == 0
     assert "skip" in result.output
     assert existing.read_text() == "-- existing content"
+
+
+# ===========================================================================
+# CLAUDE.md behavioral guarantee tests
+# ===========================================================================
+
+def test_bad_checks_populated_on_failed_registration(capsys):
+    """Failed registrations go to _bad_checks, not _checks.
+
+    CLAUDE.md guarantee:
+      'CheckRegistry._checks holds only vetted contracts.
+       CheckRegistry._bad_checks holds {name: reason} for failures.'
+    """
+    reg = CheckRegistry()
+
+    def bad_check(ctx):  # no return annotation — fails validation
+        return ctx["df"]
+
+    register_custom_check("_bad_check_test", bad_check, reg, kind="check")
+
+    assert "_bad_check_test" not in reg._checks, (
+        "Failed check must not be in _checks"
+    )
+    assert "_bad_check_test" in reg._bad_checks, (
+        "Failed check must be recorded in _bad_checks"
+    )
+    assert reg._bad_checks["_bad_check_test"], (
+        "_bad_checks must record a reason string"
+    )
+
+
+def test_cross_source_aliasing_same_check_different_columns():
+    """Same check function runs against different column names in separate reports.
+
+    CLAUDE.md guarantee (alias_map purpose 1):
+      'Cross-source aliasing — same check reused across sources that name
+       the same concept differently. col → endt in van, col → expiry_date in foo.'
+    """
+    config = {
+        "templates": {},
+        "reports": [
+            {
+                "name": "van_report",
+                "source": {"type": "duckdb", "path": "", "table": "van"},
+                "alias_map": [{"param": "col", "column": "endt"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "range_check", "params": {"min_val": 0, "max_val": 1000}}],
+            },
+            {
+                "name": "foo_report",
+                "source": {"type": "duckdb", "path": "", "table": "foo"},
+                "alias_map": [{"param": "col", "column": "expiry_date_val"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "range_check", "params": {"min_val": 0, "max_val": 1000}}],
+            },
+        ],
+    }
+    reg = _fresh_registry()
+    rep_reg = ReportRegistry()
+    register_from_config(config, reg, rep_reg)
+
+    van = rep_reg.get("van_report")
+    foo = rep_reg.get("foo_report")
+
+    assert len(van["resolved_checks"]) == 1
+    assert len(foo["resolved_checks"]) == 1
+
+    # The two reports must produce different registered check names
+    assert van["resolved_checks"][0] != foo["resolved_checks"][0], (
+        "Cross-source aliasing must produce distinct registered check instances"
+    )
+
+    # Each check must actually target the right column
+    df_van = pd.DataFrame({"endt": [500.0]})
+    df_foo = pd.DataFrame({"expiry_date_val": [500.0]})
+
+    result_van = reg.run(van["resolved_checks"][0], {"df": df_van})
+    result_foo = reg.run(foo["resolved_checks"][0], {"df": df_foo})
+
+    assert result_van.passed is True, "van check must pass against 'endt' column"
+    assert result_foo.passed is True, "foo check must pass against 'expiry_date_val' column"
+
+
+def test_checkparam_inspector_column_params():
+    """CheckParamInspector.column_params() identifies str-annotated params.
+
+    CLAUDE.md guarantee (CheckParamInspector canonical pattern):
+      'column_params() — column selectors: str, "str", pd.Series, "pd.Series",
+       or unannotated. Maps to alias_map entries.'
+    """
+    from proto_pipe.checks.registry import CheckParamInspector
+
+    def check_with_col(col: str, threshold: float) -> pd.Series:
+        pass
+
+    inspector = CheckParamInspector(check_with_col)
+    col_params = inspector.column_params()
+    scalar_params = inspector.scalar_params()
+
+    assert "col" in col_params, "str-annotated param must be a column_param"
+    assert "threshold" in scalar_params, "float-annotated param must be a scalar_param"
+    assert "threshold" not in col_params, "scalar param must not appear in column_params"
+
+
+def test_checkparam_inspector_dataframe_params():
+    """CheckParamInspector.dataframe_params() identifies pd.DataFrame params.
+
+    CLAUDE.md guarantee:
+      'dataframe_params() — pd.DataFrame annotated params. Auto-filled with
+       the full table df at runtime.'
+    """
+    from proto_pipe.checks.registry import CheckParamInspector
+
+    def check_with_df(col: str, df: pd.DataFrame) -> pd.Series:
+        pass
+
+    inspector = CheckParamInspector(check_with_df)
+    assert "df" in inspector.dataframe_params(), (
+        "pd.DataFrame-annotated param must be identified as a dataframe_param"
+    )
+    assert "df" not in inspector.column_params(), (
+        "DataFrame param must not appear in column_params"
+    )
+
+
+def test_source_table_never_modified_by_report_layer(tmp_path):
+    """Transforms write to the report table, never to the source table.
+
+    CLAUDE.md guarantee:
+      'The source table is never modified by this layer.'
+    """
+    db_path = str(tmp_path / "pipeline.db")
+    df = pd.DataFrame({
+        "id": ["R1", "R2"],
+        "status": ["Issuance", "Renewal"],
+        "_ingested_at": pd.Timestamp("2026-01-01", tz="UTC"),
+    })
+    _setup_table(db_path, "sales", df)
+
+    reg = CheckRegistry()
+
+    def normalize(context: dict) -> pd.Series:
+        s = context["df"]["status"].replace({"Issuance": "Reinstatement"})
+        s.name = "status"
+        return s
+
+    reg.register("normalize", normalize, kind="transform")
+    _apply_transforms(["normalize"], reg, df, "sales_report", db_path)
+
+    # source table 'sales' must be unchanged
+    source_df = _read_table(db_path, "sales")
+    assert list(source_df["status"]) == ["Issuance", "Renewal"], (
+        "Source table must never be modified by the report/transform layer"
+    )
+
+
+def test_load_custom_checks_module_registers_decorated_checks(tmp_path):
+    """load_custom_checks_module loads a file and registers @custom_check functions.
+
+    CLAUDE.md guarantee:
+      '@custom_check(name, kind) decorator stages functions in _DECORATED_CHECKS.
+       load_custom_checks_module imports the user module, iterates _DECORATED_CHECKS,
+       calls register_custom_check.'
+    """
+    from proto_pipe.checks.helpers import load_custom_checks_module
+
+    module_path = tmp_path / "my_checks.py"
+    module_path.write_text("""
+import pandas as pd
+from proto_pipe.checks.helpers import custom_check
+
+@custom_check("my_custom_null_check", kind="check")
+def my_custom_null_check(col: str) -> pd.Series:
+    def _run(ctx):
+        return ctx["df"][col].notna()
+    return _run
+""")
+
+    reg = CheckRegistry()
+    load_custom_checks_module(str(module_path), reg)
+
+    assert "my_custom_null_check" in reg.available(), (
+        "load_custom_checks_module must register @custom_check decorated functions"
+    )
+
+
+def test_multi_column_expansion_produces_n_results_in_validation_block(tmp_path):
+    """Multi-column alias_map expansion produces N result sets in validation_block.
+
+    CLAUDE.md guarantee (alias_map purpose 2):
+      'Multi-column expansion — same check runs once per alias_map entry.
+       If col maps to 10 columns, the check runs 10 times, producing 10
+       result sets in validation_block.'
+    """
+    from proto_pipe.io.db import init_all_pipeline_tables
+    from proto_pipe.checks.runner import run_checks_and_flag
+    import functools
+
+    db_path = str(tmp_path / "pipeline.db")
+    conn = duckdb.connect(db_path)
+    init_all_pipeline_tables(conn)
+    conn.close()
+
+    reg = _fresh_registry()
+
+    # Register two expanded checks (one per column) with failing data
+    df = pd.DataFrame({
+        "col_a": [-1.0],   # fails range check
+        "col_b": [-2.0],   # fails range check
+        "order_id": ["ORD-001"],
+    })
+
+    from proto_pipe.checks.built_in import check_range
+    reg.register(
+        "range_col_a",
+        functools.partial(check_range, col="col_a", min_val=0, max_val=100),
+    )
+    reg.register(
+        "range_col_b",
+        functools.partial(check_range, col="col_b", min_val=0, max_val=100),
+    )
+
+    run_checks_and_flag(
+        check_names=["range_col_a", "range_col_b"],
+        registry=reg,
+        context={"df": df},
+        pipeline_db=db_path,
+        report_name="test_report",
+        table_name="sales",
+        pk_col="order_id",
+    )
+
+    conn = duckdb.connect(db_path)
+    count = conn.execute(
+        "SELECT count(*) FROM validation_block WHERE report_name = 'test_report'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert count == 2, (
+        f"Two expanded checks must each produce one result in validation_block, got {count}"
+    )
