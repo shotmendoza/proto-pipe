@@ -324,7 +324,7 @@ def view_table(table_name, table, export, limit, pipeline_db):
     Examples:
       vp view table
       vp view table sales
-      vp view table ingest_log
+      vp view table ingest_state
       vp view table --table sales --export csv
     """
     from proto_pipe.io.config import SourceConfig, load_settings
@@ -410,8 +410,8 @@ def view_lineage(
     from the pipeline DB. Timestamps show when each node was last processed.
 
     Use filters to trace a specific branch:
-      --source      trace forward from a source table
-      --report      show a report and everything upstream and downstream
+      --source trace forward from a source table
+      --report shows a report and everything upstream and downstream
       --deliverable trace backward from a deliverable to its roots
 
     No filter shows the full graph.
@@ -426,7 +426,7 @@ def view_lineage(
     from proto_pipe.io.config import SourceConfig, ReportConfig, DeliverableConfig
     from proto_pipe.reports.runner import _get_target_table
 
-    p_db    = config_path_or_override("pipeline_db",         pipeline_db)
+    p_db = config_path_or_override("pipeline_db",         pipeline_db)
     src_cfg = config_path_or_override("sources_config",      sources_config)
     rep_cfg = config_path_or_override("reports_config",      reports_config)
     del_cfg = config_path_or_override("deliverables_config", deliverables_config)
@@ -436,8 +436,8 @@ def view_lineage(
     rep_config = ReportConfig(rep_cfg)
     del_config = DeliverableConfig(del_cfg)
 
-    all_sources     = src_config.all()
-    all_reports     = rep_config.all()
+    all_sources = src_config.all()
+    all_reports = rep_config.all()
     all_deliverables = del_config.all()
 
     # ── Load timestamps from pipeline DB ────────────────────────────────────
