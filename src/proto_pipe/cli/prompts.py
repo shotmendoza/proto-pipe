@@ -91,10 +91,12 @@ class SourceConfigPrompter:
         sample_df=None,
         registry_hints: dict | None = None,
         existing_source: dict | None = None,
+        existing_sources_lookup: dict[str, dict] | None = None,
     ) -> None:
         self._sample = sample_df
         self._registry_hints = registry_hints or {}
         self._existing = existing_source or {}
+        self._existing_lookup = existing_sources_lookup or {}
         # When no sample is available (table not ingested yet), fall back to
         # registry hint keys so selectors still work during edit.
         if sample_df is not None:
@@ -178,16 +180,36 @@ class SourceConfigPrompter:
 
         if name in existing_names and name != self._existing.get("name"):
             overwrite = questionary.confirm(
-                f"Source '{name}' already exists. Edit it?"
+                f"Source '{name}' already exists. Edit it? "
+                f"(patterns, PK, and other settings will be pre-filled)"
             ).ask()
             if not overwrite:
                 return None
+            # Load the existing source so all subsequent prompts pre-fill correctly.
+            # prompt_pattern() will append the new suggested pattern to the existing list.
+            if name in self._existing_lookup:
+                self._existing = self._existing_lookup[name]
 
         return name
 
     def prompt_pattern(self, suggested: str) -> list[str] | None:
-        """Prompt for file pattern(s). Returns None if cancelled."""
-        default = ", ".join(self._existing.get("patterns", [suggested]))
+        """Prompt for file pattern(s). Returns None if cancelled.
+
+        When editing an existing source, pre-fills with existing patterns and
+        appends the new suggested pattern (if not already present) so the user
+        confirms the combined list in one step.
+        """
+        existing_patterns = self._existing.get("patterns", [])
+        if existing_patterns:
+            # Append the new suggested pattern if it isn't already covered.
+            if suggested and suggested not in existing_patterns:
+                default_list = existing_patterns + [suggested]
+            else:
+                default_list = list(existing_patterns)
+        else:
+            default_list = [suggested] if suggested else []
+
+        default = ", ".join(default_list)
         pattern_input = questionary.text(
             "File pattern(s) — the naming convention used for these files, comma separated"
             " (e.g. sales_*.csv, Sales_*.xlsx).\n  Use * as a wildcard to match dates or"

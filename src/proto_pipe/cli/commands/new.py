@@ -78,7 +78,7 @@ def new_source(sources_config, incoming_dir):
             click.echo(
                 f"\n[error] All {len(all_files)} file(s) in '{inc_dir}' are already"
                 f" covered by an existing source.\n"
-                f"  Run \'vp edit source\' to update an existing source,"
+                f"  Run 'vp edit source' to update an existing source,"
                 f" or add a new file first."
             )
         return
@@ -111,20 +111,31 @@ def new_source(sources_config, incoming_dir):
                     f" union_by_name=true) LIMIT 1000"
                 ).df()
                 from proto_pipe.io.db import coerce_for_display
+
                 sample = coerce_for_display(sample)
         except Exception as e:
             click.echo(f"  [warn] Could not read files for schema preview: {e}")
 
     registry_hints: dict = {}
     if sample is not None:
-        file_cols = [c for c in sample.columns if not c.startswith("_")]
+        # Strip blank/whitespace-only column names — these are CSV artefacts
+        # (trailing commas, empty header cells) and must never be registered.
+        file_cols = [c for c in sample.columns if not c.startswith("_") and c.strip()]
         try:
             with duckdb.connect(pipeline_db) as conn:
                 registry_hints = get_registry_hints(conn, file_cols)
         except Exception:
             pass
 
-    prompter = SourceConfigPrompter(sample_df=sample, registry_hints=registry_hints)
+    # Build lookup so the prompter can pre-fill when the user picks an
+    # existing source name (e.g. to add a new pattern).
+    existing_lookup = {s["name"]: s for s in config.all()}
+
+    prompter = SourceConfigPrompter(
+        sample_df=sample,
+        registry_hints=registry_hints,
+        existing_sources_lookup=existing_lookup,
+    )
 
     if not prompter.run(config.names(), suggested):
         click.echo("Cancelled.")

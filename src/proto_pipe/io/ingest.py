@@ -805,7 +805,23 @@ def ingest_single_file(
         return {"status": "failed", "message": message}
 
     # ── Step 2: Registry type lookup + unknown column check ───────────────
-    user_cols = [c for c in file_cols if not c.startswith("_")]
+    # Strip blank/whitespace-only column names before all further checks.
+    # These are CSV artefacts (trailing commas, empty header cells) and are
+    # never registered in column_type_registry. Without this strip they
+    # incorrectly trigger the unknown column error on every ingest.
+    user_cols = [
+        c for c in file_cols
+        if not c.startswith("_") and c.strip()
+    ]
+
+    if not user_cols and file_cols:
+        # All non-_ columns were blank-named — almost certainly a malformed file.
+        blank_count = len([c for c in file_cols if not c.startswith("_")])
+        print(
+            f"  [warn] '{path.name}': {blank_count} column(s) with blank names"
+            f" stripped — check for trailing commas in the CSV header."
+        )
+
     registry_types = get_registry_types(conn, user_cols)
 
     # Unknown column check — only for normal ingest, not correction path.
