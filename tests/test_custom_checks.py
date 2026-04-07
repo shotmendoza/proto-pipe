@@ -168,3 +168,73 @@ class TestCustomCheckEndToEnd:
         result = check_registry.run("e2e_custom_check", {"df": df})
         assert isinstance(result, CheckResult)
         assert result.passed is True
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestValidateCheckGateAppliesOnModuleLoad:
+    """validate_check is the single validation gate — applies even via module load.
+
+    CLAUDE.md guarantee:
+      'validate_check in checks/registry.py is the single validation gate —
+       checks annotation, kind, return type.
+       CheckRegistry._checks holds only vetted contracts.'
+    """
+
+    def test_bad_annotation_in_module_not_registered(self, tmp_path, check_registry):
+        """A function with no return annotation loaded from a module must not
+        be registered into _checks, even though @custom_check was applied."""
+        module_path = tmp_path / "bad_annotation_checks.py"
+        _write_module(module_path,
+            "from proto_pipe.checks.helpers import custom_check\n"
+            "\n"
+            "@custom_check('bad_annotation_check', kind='check')\n"
+            "def bad_fn(context):  # no return annotation\n"
+            "    return context['df']\n"
+        )
+
+        load_custom_checks_module(str(module_path), check_registry)
+
+        assert "bad_annotation_check" not in check_registry._checks, (
+            "validate_check gate must reject bad-annotation functions even when "
+            "loaded from a module file"
+        )
+        assert "bad_annotation_check" in check_registry._bad_checks, (
+            "Rejected check must appear in _bad_checks with a reason"
+        )
+
+
+class TestBuiltInChecksPopulatedAfterLoad:
+    """load_custom_checks_module adds to BUILT_IN_CHECKS, not just the registry.
+
+    CLAUDE.md guarantee:
+      'load_custom_checks_module imports the user module, iterates
+       _DECORATED_CHECKS, calls register_custom_check.'
+    register_custom_check is documented to add to BUILT_IN_CHECKS so that
+    the check persists across registry instances.
+    """
+
+    def test_built_in_checks_populated_after_module_load(self, tmp_path, check_registry):
+        from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+
+        module_path = tmp_path / "persistent_checks.py"
+        _write_module(module_path,
+            "from proto_pipe.checks.helpers import custom_check\n"
+            "import pandas as pd\n"
+            "\n"
+            "@custom_check('persistent_check')\n"
+            "def my_check(context, col: str = 'price') -> pd.Series:\n"
+            "    return context['df'][col] >= 0\n"
+        )
+
+        original_keys = set(BUILT_IN_CHECKS.keys())
+        load_custom_checks_module(str(module_path), check_registry)
+
+        assert "persistent_check" in BUILT_IN_CHECKS, (
+            "load_custom_checks_module must add the check to BUILT_IN_CHECKS, "
+            "not just the registry instance, so it persists across registry instances"
+        )
+
+        # Cleanup
+        BUILT_IN_CHECKS.pop("persistent_check", None)

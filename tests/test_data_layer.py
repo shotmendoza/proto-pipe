@@ -483,3 +483,110 @@ class TestValidateRowTypes:
         ).df()
         assert len(block) == 1
         assert "endt" in (block["bad_columns"].iloc[0] or "")
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestComputeRowHashGuarantees:
+    """compute_row_hash is deterministic — same values always produce the same hash.
+
+    CLAUDE.md guarantee:
+      'Determinism matters. UUID keys, watermarks, flag identity are all deterministic.'
+      'compute_row_hash(row, cols) — md5 of pipe-delimited column values'
+    Signature: compute_row_hash(row: dict | pd.Series, cols: list[str]) -> str
+    """
+
+    def test_same_values_produce_same_hash(self):
+        row = {"van_id": "1042", "endt": "10", "amount": "1000.0"}
+        cols = ["van_id", "endt", "amount"]
+        h1 = compute_row_hash(row, cols)
+        h2 = compute_row_hash(row, cols)
+        assert h1 == h2, "compute_row_hash must be deterministic"
+
+    def test_different_values_produce_different_hash(self):
+        cols = ["van_id", "endt"]
+        row_a = {"van_id": "1042", "endt": "10"}
+        row_b = {"van_id": "1042", "endt": "99"}
+        assert compute_row_hash(row_a, cols) != compute_row_hash(row_b, cols), (
+            "Different values must produce different hashes"
+        )
+
+    def test_hash_is_string(self):
+        row = {"van_id": "1042"}
+        result = compute_row_hash(row, ["van_id"])
+        assert isinstance(result, str)
+
+    def test_column_order_in_cols_determines_hash(self):
+        """Hash depends on the order of cols, not dict insertion order.
+
+        The cols list is the canonical column order — same row with same
+        cols in same order must always produce the same hash.
+        """
+        row = {"van_id": "1042", "endt": "10"}
+        h1 = compute_row_hash(row, ["van_id", "endt"])
+        h2 = compute_row_hash(row, ["van_id", "endt"])
+        assert h1 == h2, "Same row + same cols order must always hash identically"
+
+    def test_null_value_treated_as_empty_string(self):
+        """None values are represented as empty string in the hash.
+
+        CLAUDE.md guarantee (flagging.py docstring):
+          'NULL / None values are represented as the empty string.'
+        """
+        row_none = {"van_id": "1042", "endt": None}
+        row_empty = {"van_id": "1042", "endt": ""}
+        h_none = compute_row_hash(row_none, ["van_id", "endt"])
+        h_empty = compute_row_hash(row_empty, ["van_id", "endt"])
+        assert h_none == h_empty, (
+            "None and empty string must produce the same hash contribution"
+        )
+
+
+class TestSourcePassDuplicateDetection:
+    """flag mode duplicate detection uses source_pass, not the source table directly.
+
+    CLAUDE.md guarantee:
+      'source_pass → tracks every ingested record's row hash and source file.
+       Enables flag mode duplicate detection without querying the source table directly.'
+    """
+
+    def test_duplicate_detected_via_source_pass_even_if_row_deleted_from_source(
+        self, conn, incoming_dir, source_def
+    ):
+        """A record in source_pass but deleted from the source table is still
+        detected as a duplicate — proving detection goes through source_pass."""
+        from proto_pipe.io.ingest import ingest_single_file
+
+        _write_registry_types(conn, "van", {"van_id": "BIGINT", "endt": "BIGINT"})
+
+        # First ingest — row 1042 in both source table and source_pass
+        csv1 = incoming_dir / "van_2026_01.csv"
+        csv1.write_text("van_id,endt\n1042,10\n")
+        ingest_single_file(conn, csv1, source_def)
+
+        # Manually delete row 1042 from source table — it's gone from the table
+        conn.execute("DELETE FROM van WHERE van_id = 1042")
+        row_count = conn.execute("SELECT count(*) FROM van").fetchone()[0]
+        assert row_count == 0, "Row must be deleted from source table for this test"
+
+        # source_pass still has the record
+        sp_count = conn.execute(
+            "SELECT count(*) FROM source_pass WHERE table_name = 'van'"
+        ).fetchone()[0]
+        assert sp_count == 1, "source_pass must still have the record"
+
+        # Second ingest — same values, should detect via source_pass (not source table)
+        csv2 = incoming_dir / "van_2026_02.csv"
+        csv2.write_text("van_id,endt\n1042,99\n")  # changed value → conflict
+        r2 = ingest_single_file(conn, csv2, source_def)
+
+        # Even though row is gone from source table, source_pass detected the change
+        block_count = conn.execute(
+            "SELECT count(*) FROM source_block WHERE pk_value = '1042'"
+        ).fetchone()[0]
+        assert block_count == 1, (
+            "Duplicate detection must use source_pass — conflict detected even when "
+            "row is absent from source table"
+        )

@@ -359,3 +359,88 @@ class TestMultiSelectParamsSetting:
         from proto_pipe.io.config import load_settings
         settings = load_settings()
         assert settings.get("multi_select_params") is True
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestMultiselectGatePreventExpansion:
+    """is_multiselect_eligible() gates expansion — non-eligible functions are not expanded.
+
+    CLAUDE.md guarantee:
+      'CheckParamInspector.is_multiselect_eligible() gates whether a function
+       supports multi-column expansion.'
+    """
+
+    def test_non_eligible_function_not_expanded_via_register_from_config(self):
+        """A function without str column params must not expand even with alias_map.
+
+        check_no_params has no column params → is_multiselect_eligible()=False
+        → alias_map must be ignored, single registration produced.
+        """
+        from proto_pipe.io.registry import register_from_config
+        from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+
+        BUILT_IN_CHECKS["no_params_check"] = check_no_params
+        try:
+            reg, rep_reg = CheckRegistry(), ReportRegistry()
+            config = {
+                "templates": {},
+                "reports": [{
+                    "name": "test_report",
+                    "source": {"type": "duckdb", "path": "", "table": "t"},
+                    "alias_map": [
+                        {"param": "col", "column": "Coverage A"},
+                        {"param": "col", "column": "Coverage B"},
+                        {"param": "col", "column": "Coverage C"},
+                    ],
+                    "options": {"parallel": False},
+                    "checks": [{"name": "no_params_check"}],
+                }],
+            }
+            register_from_config(config, reg, rep_reg)
+            resolved = rep_reg.get("test_report")["resolved_checks"]
+
+            assert len(resolved) == 1, (
+                f"Non-eligible function must not expand — expected 1 check, got {len(resolved)}. "
+                f"is_multiselect_eligible() must gate expansion in register_from_config."
+            )
+        finally:
+            BUILT_IN_CHECKS.pop("no_params_check", None)
+
+    def test_non_series_return_not_expanded(self):
+        """Function without pd.Series[bool] return must not expand.
+
+        KNOWN CODE BUG: register_from_config does not call is_multiselect_eligible()
+        before expanding alias_map. Functions without pd.Series[bool] return are still
+        expanded by alias_map before registration fails. Fix needed in io/registry.py:
+        check is_multiselect_eligible() before calling _expand_check_with_alias_map.
+        Tracked in CLAUDE.md deferred work. This test must remain failing until fixed.
+        """
+        from proto_pipe.io.registry import register_from_config
+        from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+
+        BUILT_IN_CHECKS["dict_return_check"] = check_dict_return
+        try:
+            reg, rep_reg = CheckRegistry(), ReportRegistry()
+            config = {
+                "templates": {},
+                "reports": [{
+                    "name": "test_report",
+                    "source": {"type": "duckdb", "path": "", "table": "t"},
+                    "alias_map": [
+                        {"param": "col", "column": "A"},
+                        {"param": "col", "column": "B"},
+                    ],
+                    "options": {"parallel": False},
+                    "checks": [{"name": "dict_return_check", "params": {"col": "price"}}],
+                }],
+            }
+            register_from_config(config, reg, rep_reg)
+            resolved = rep_reg.get("test_report")["resolved_checks"]
+
+            assert len(resolved) == 1, (
+                "Function without pd.Series[bool] return must not be expanded by alias_map"
+            )
+        finally:
+            BUILT_IN_CHECKS.pop("dict_return_check", None)

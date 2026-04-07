@@ -209,3 +209,108 @@ class TestReportRunsLog:
         row = conn.execute("SELECT format FROM report_runs LIMIT 1").fetchone()
         conn.close()
         assert row[0] == "xlsx"
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestDeliverableGuarantees:
+
+    def test_deliverable_not_blocked_by_validation_block(
+        self, tmp_path, pipeline_db, sales_df, inventory_df, deliverables_config
+    ):
+        """Deliverables are produced even when validation_block has entries.
+
+        CLAUDE.md guarantee:
+          'Deliverables (Extract): Not blocked by validation_block.'
+          'validation_block — warns, does not block deliverables.'
+        """
+        from proto_pipe.io.db import init_all_pipeline_tables
+        import duckdb as _duckdb
+
+        # Write validation failures into validation_block
+        conn = _duckdb.connect(pipeline_db)
+        init_all_pipeline_tables(conn)
+        conn.execute("""
+            INSERT INTO validation_block
+                (id, table_name, report_name, check_name, pk_value, reason, flagged_at)
+            VALUES ('abc123', 'sales', 'daily_sales_validation',
+                    'range_check', 'ORD-001', 'price out of range',
+                    TIMESTAMPTZ '2026-04-01T00:00:00+00:00')
+        """)
+        conn.close()
+
+        deliverable = deliverables_config["deliverables"][0]
+        dfs = {
+            "daily_sales_validation": sales_df,
+            "inventory_validation": inventory_df,
+        }
+        # Must not raise and must produce output
+        run_deliverable(deliverable, dfs, str(tmp_path), pipeline_db, run_date="2026-03-26")
+
+        out_dir = Path(deliverable["output_dir"])
+        files = list(out_dir.glob("*.xlsx"))
+        assert len(files) == 1, (
+            "Deliverable must be produced even when validation_block has entries"
+        )
+
+    def test_rerun_same_date_overwrites_file(
+        self, tmp_path, pipeline_db, sales_df, inventory_df, deliverables_config
+    ):
+        """Re-running on the same date overwrites the output file.
+
+        CLAUDE.md guarantee:
+          'Output files are never auto-deleted. Re-running on the same date
+           overwrites the file.'
+        """
+        deliverable = deliverables_config["deliverables"][0]
+        dfs = {
+            "daily_sales_validation": sales_df,
+            "inventory_validation": inventory_df,
+        }
+
+        run_deliverable(deliverable, dfs, str(tmp_path), pipeline_db, run_date="2026-03-26")
+        out_dir = Path(deliverable["output_dir"])
+        first_files = list(out_dir.glob("*.xlsx"))
+        assert len(first_files) == 1
+        mtime_first = first_files[0].stat().st_mtime
+
+        import time
+        time.sleep(0.05)  # ensure mtime can differ
+
+        run_deliverable(deliverable, dfs, str(tmp_path), pipeline_db, run_date="2026-03-26")
+        second_files = list(out_dir.glob("*.xlsx"))
+
+        assert len(second_files) == 1, "Re-run must not create a second file"
+        assert second_files[0].stat().st_mtime > mtime_first, (
+            "Re-run on same date must overwrite the existing file"
+        )
+
+    def test_report_runs_records_deliverable_name_and_filename(
+        self, tmp_path, pipeline_db, sales_df, inventory_df, deliverables_config
+    ):
+        """report_runs records deliverable_name, filename, and output_dir.
+
+        CLAUDE.md (adding_deliverables.md):
+          'Every run is logged to the report_runs table in pipeline.db.
+           Columns: deliverable_name, report_name, filename, output_dir,
+           filters_applied, row_count, format, created_at.'
+        """
+        deliverable = deliverables_config["deliverables"][0]
+        dfs = {
+            "daily_sales_validation": sales_df,
+            "inventory_validation": inventory_df,
+        }
+        run_deliverable(deliverable, dfs, str(tmp_path), pipeline_db, run_date="2026-03-26")
+
+        conn = duckdb.connect(pipeline_db)
+        row = conn.execute(
+            "SELECT deliverable_name, filename, output_dir FROM report_runs LIMIT 1"
+        ).fetchone()
+        conn.close()
+
+        assert row is not None
+        assert row[0] is not None, "deliverable_name must be recorded in report_runs"
+        assert row[1] is not None, "filename must be recorded in report_runs"
+        assert row[2] is not None, "output_dir must be recorded in report_runs"

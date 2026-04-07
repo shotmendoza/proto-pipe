@@ -297,3 +297,65 @@ class TestExcelExport:
     def test_raises_when_no_flags(self, conn, report_table, tmp_path):
         df = build_validation_flag_export(conn, report_table, "no_flags", "order_id")
         assert df.empty
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestFlagExportColumns:
+    """build_validation_flag_export includes _flag_columns and _flag_check.
+
+    CLAUDE.md guarantee (Pipeline Column Convention):
+      '_flag_reason, _flag_columns, _flag_check — flagged export guide columns,
+       present only in source_block/validation_block exports to help the user
+       correct records.'
+    """
+
+    def test_flag_columns_present_in_export(self, conn, report_table):
+        """_flag_columns must be present in the export."""
+        flags = [FlagRecord(
+            id="placeholder",
+            table_name=report_table,
+            report_name="sales_validation",
+            check_name="range_check",
+            pk_value="ORD-002",
+            reason="price out of range",
+            bad_columns="price",
+        )]
+        write_validation_flags(conn, flags)
+        df = build_validation_flag_export(conn, report_table, "sales_validation", "order_id")
+        assert "_flag_columns" in df.columns, (
+            "_flag_columns must be present in validation flag export"
+        )
+
+    def test_flag_check_present_in_export(self, conn, report_table):
+        """_flag_check must be present in the export."""
+        flags = [FlagRecord(
+            id="placeholder",
+            table_name=report_table,
+            report_name="sales_validation",
+            check_name="range_check",
+            pk_value="ORD-002",
+            reason="price out of range",
+            bad_columns="price",
+        )]
+        write_validation_flags(conn, flags)
+        df = build_validation_flag_export(conn, report_table, "sales_validation", "order_id")
+        assert "_flag_check" in df.columns, (
+            "_flag_check must be present in validation flag export"
+        )
+
+    def test_flag_check_value_matches_check_name(self, conn, report_table):
+        """_flag_check value must match the check_name used when flagging."""
+        flags = [FlagRecord(
+            id="placeholder",
+            table_name=report_table,
+            report_name="sales_validation",
+            check_name="range_check",
+            pk_value="ORD-002",
+            reason="price out of range",
+            bad_columns="price",
+        )]
+        write_validation_flags(conn, flags)
+        df = build_validation_flag_export(conn, report_table, "sales_validation", "order_id")
+        assert df["_flag_check"].iloc[0] == "range_check"

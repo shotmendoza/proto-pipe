@@ -352,3 +352,135 @@ class TestIngestFailures:
         ).fetchone()[0]
         conn.close()
         assert null_count == 0
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestIngestGuarantees:
+    """Behavioral guarantees documented in CLAUDE.md."""
+
+    def test_failed_file_retried_on_next_run(
+        self, incoming_dir, pipeline_db, sources_config, sales_df
+    ):
+        """Files with status='failed' in ingest_state are retried on next run.
+
+        CLAUDE.md guarantee:
+          'Files that previously failed are retried on every run until they succeed.'
+        """
+        import duckdb as _duckdb
+        from proto_pipe.io.db import log_ingest_state, ensure_pipeline_tables
+
+        # Manually log a file as failed — simulating a previous bad run
+        conn = _duckdb.connect(pipeline_db)
+        ensure_pipeline_tables(conn)
+        log_ingest_state(conn, "sales_2026-03.csv", "sales", "failed",
+                         message="simulated failure")
+        conn.close()
+
+        # Write the actual file
+        path = incoming_dir / "sales_2026-03.csv"
+        sales_df.to_csv(path, index=False)
+
+        # Next run must retry the failed file, not skip it
+        summary = ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        assert "sales_2026-03.csv" in summary, (
+            "Failed file must appear in summary — it must be retried, not skipped"
+        )
+        assert summary["sales_2026-03.csv"]["status"] == "ok", (
+            "Previously-failed file must be retried and succeed when the file is valid"
+        )
+
+    def test_correction_logged_as_correction_in_ingest_state(
+        self, incoming_dir, pipeline_db, sources_config, sales_df
+    ):
+        """Corrections are logged as status='correction' in ingest_state.
+
+        CLAUDE.md guarantee:
+          'Successful corrections logged as status=correction in ingest_state
+           for auditability.'
+          'ingest_state status values: ok | failed | skipped | correction'
+        """
+        import duckdb as _duckdb
+        from proto_pipe.io.ingest import ingest_single_file
+
+        # Initial ingest
+        path = incoming_dir / "sales_2026-03.csv"
+        sales_df.to_csv(path, index=False)
+        ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        # Re-ingest as correction
+        conn = _duckdb.connect(pipeline_db)
+        try:
+            result = ingest_single_file(
+                conn, path, sources_config["sources"][0],
+                on_duplicate_override="upsert",
+                log_status_override="correction",
+                strip_pipeline_cols=True,
+            )
+        finally:
+            conn.close()
+
+        conn = _duckdb.connect(pipeline_db)
+        correction_count = conn.execute(
+            "SELECT count(*) FROM ingest_state WHERE status = 'correction'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert correction_count >= 1, (
+            "Corrections must be logged as status='correction' in ingest_state"
+        )
+
+    def test_unknown_column_fails_file(
+        self, incoming_dir, pipeline_db, sources_config, sales_df
+    ):
+        """A file with a column not in column_type_registry must fail the file.
+
+        CLAUDE.md guarantee (Critical Design Invariant):
+          'New columns (in file but not in registry, and not in existing table)
+           → fail the file when column_type_registry has entries for the source.
+           Condition in code: if not strip_pipeline_cols and registry_types.'
+        """
+        import duckdb as _duckdb
+        from proto_pipe.io.db import write_registry_types
+
+        # Seed column_type_registry with the known sales columns so the
+        # unknown column check activates on next ingest.
+        # Note: ensure_pipeline_tables is called automatically by ingest_single_file
+        # but we need the tables before writing registry types here.
+        conn = _duckdb.connect(pipeline_db)
+        from proto_pipe.io.db import ensure_pipeline_tables
+        ensure_pipeline_tables(conn)
+        write_registry_types(conn, "sales", {
+            "order_id":    "VARCHAR",
+            "customer_id": "VARCHAR",
+            "price":       "DOUBLE",
+            "quantity":    "BIGINT",
+            "region":      "VARCHAR",
+            "order_date":  "VARCHAR",
+            "updated_at":  "VARCHAR",
+        })
+        conn.close()
+
+        # First ingest with known columns — establishes the table
+        path = incoming_dir / "sales_2026-03.csv"
+        sales_df.to_csv(path, index=False)
+        ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        # Second file introduces a column not in the registry
+        df_with_unknown = sales_df.copy()
+        df_with_unknown["mystery_column"] = "unknown"
+        path2 = incoming_dir / "sales_2026-04.csv"
+        df_with_unknown.to_csv(path2, index=False)
+
+        summary = ingest_directory(str(incoming_dir), sources_config["sources"], pipeline_db)
+
+        assert summary["sales_2026-04.csv"]["status"] == "failed", (
+            "File with unknown column must fail — user must confirm type first via "
+            "vp edit column-type"
+        )
+        assert "mystery_column" in summary["sales_2026-04.csv"].get("message", ""), (
+            "Failure message must name the unknown column"
+        )

@@ -390,3 +390,119 @@ class TestRunChecksAndFlag:
 
         assert "null_check" in results
         assert results["null_check"].status in ("passed", "failed", "error", "unavailable")
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestCheckOutcomeIsValidDataclass:
+    """CheckOutcome is a frozen dataclass — attribute access, not subscript.
+
+    CLAUDE.md guarantee:
+      'CheckOutcome — frozen dataclass in checks/result.py alongside CheckResult.
+       Callers use attribute access (outcome.status, outcome.result, outcome.error)
+       not subscript.'
+    """
+
+    def test_outcome_is_frozen_cannot_be_mutated(self, registry, context):
+        from dataclasses import FrozenInstanceError
+        registry.register("null_check", check_nulls)
+        outcome = run_check_safe(registry, "null_check", context)
+
+        with pytest.raises((FrozenInstanceError, AttributeError)):
+            outcome.status = "mutated"
+
+    def test_outcome_uses_attribute_access_not_subscript(self, registry, context):
+        registry.register("null_check", check_nulls)
+        outcome = run_check_safe(registry, "null_check", context)
+
+        # Attribute access must work
+        assert outcome.status is not None
+
+        # Subscript access must not work
+        with pytest.raises(TypeError):
+            _ = outcome["status"]
+
+    def test_run_checks_values_are_check_outcome_instances(self, registry, context):
+        """run_checks must return {name: CheckOutcome}, not plain dicts.
+
+        CLAUDE.md guarantee:
+          'CheckOutcome — Returned by run_check_safe and propagated through
+           run_checks and run_checks_and_flag.'
+        """
+        from proto_pipe.checks.result import CheckOutcome
+        registry.register("null_check", check_nulls)
+
+        results = run_checks(["null_check"], registry, context)
+
+        assert isinstance(results["null_check"], CheckOutcome), (
+            "run_checks must return CheckOutcome instances, not plain dicts"
+        )
+
+    def test_run_checks_and_flag_returns_check_outcome_instances(
+        self, registry, pipeline_db, sample_df
+    ):
+        """run_checks_and_flag propagates CheckOutcome instances.
+
+        CLAUDE.md guarantee:
+          'CheckOutcome — propagated through run_checks_and_flag.'
+        """
+        from proto_pipe.checks.result import CheckOutcome
+        registry.register("null_check", check_nulls)
+
+        results = run_checks_and_flag(
+            check_names=["null_check"],
+            registry=registry,
+            context={"df": sample_df},
+            pipeline_db=pipeline_db,
+            report_name="r",
+            table_name="sales",
+            pk_col="order_id",
+        )
+
+        assert isinstance(results["null_check"], CheckOutcome), (
+            "run_checks_and_flag must propagate CheckOutcome instances"
+        )
+
+    def test_valid_status_values(self, registry, context):
+        """CheckOutcome.status must be one of the documented valid values.
+
+        CLAUDE.md guarantee:
+          'status: str ("passed" | "failed" | "unavailable" | "error")'
+        """
+        VALID_STATUSES = {"passed", "failed", "unavailable", "error"}
+        registry.register("null_check", check_nulls)
+        outcome = run_check_safe(registry, "null_check", context)
+        assert outcome.status in VALID_STATUSES, (
+            f"CheckOutcome.status must be one of {VALID_STATUSES}, got '{outcome.status}'"
+        )
+
+    def test_error_outcome_has_error_string(self, registry, context):
+        """CheckOutcome with status='error' must have a non-None error string.
+
+        CLAUDE.md guarantee:
+          'error: str | None — present when status is error'
+        """
+        def always_raises(ctx) -> pd.Series:
+            raise ValueError("deliberate")
+
+        registry.register("broken", always_raises)
+        outcome = run_check_safe(registry, "broken", context)
+
+        assert outcome.status == "error"
+        assert outcome.error is not None
+        assert isinstance(outcome.error, str)
+
+    def test_passed_outcome_has_result_none_error(self, registry, context):
+        """CheckOutcome with status='passed' must have result set and error=None.
+
+        CLAUDE.md guarantee:
+          'result: CheckResult | None, error: str | None'
+        """
+        registry.register("null_check", check_nulls)
+        outcome = run_check_safe(registry, "null_check", context)
+
+        assert outcome.status == "passed"
+        assert outcome.result is not None
+        assert outcome.error is None

@@ -45,27 +45,8 @@ def db_with_sales(tmp_path, sample_df) -> str:
     db_path = str(tmp_path / "pipeline.db")
     conn = duckdb.connect(db_path)
     conn.execute("CREATE TABLE sales AS SELECT * FROM sample_df")
-    conn.execute("""
-        CREATE TABLE flagged_rows (
-            id VARCHAR PRIMARY KEY,
-            table_name VARCHAR NOT NULL,
-            check_name VARCHAR,
-            reason VARCHAR,
-            flagged_at TIMESTAMPTZ NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE ingest_log (
-            id VARCHAR PRIMARY KEY,
-            filename VARCHAR NOT NULL,
-            table_name VARCHAR,
-            status VARCHAR NOT NULL,
-            rows INTEGER,
-            new_cols VARCHAR,
-            message VARCHAR,
-            ingested_at TIMESTAMPTZ NOT NULL
-        )
-    """)
+    from proto_pipe.io.db import init_all_pipeline_tables
+    init_all_pipeline_tables(conn)
     conn.close()
     return db_path
 
@@ -90,8 +71,8 @@ class TestGetAllTables:
         tables = get_all_tables(conn)
         conn.close()
         assert "sales" in tables
-        assert "flagged_rows" in tables
-        assert "ingest_log" in tables
+        assert "source_block" in tables
+        assert "ingest_state" in tables
 
     def test_empty_db_returns_empty_list(self, tmp_path):
         db_path = str(tmp_path / "empty.db")
@@ -287,7 +268,7 @@ class TestTableCmd:
         """Pipeline infrastructure tables like flagged_rows can be viewed."""
         runner = CliRunner()
         with patch("proto_pipe.cli.commands.table.config_path_or_override", return_value=db_with_sales):
-            result = runner.invoke(table_cmd, ["flagged_rows"], env={"PAGER": "cat"})
+            result = runner.invoke(table_cmd, ["source_block"], env={"PAGER": "cat"})
         assert result.exit_code == 0
 
     def test_no_tables_in_db(self, tmp_path):

@@ -740,6 +740,9 @@ def ingest_single_file(
     :return: {status, table, rows, new_cols, flagged, skipped} or
              {status: 'failed', message} on failure.
     """
+    from proto_pipe.io.db import ensure_pipeline_tables
+    ensure_pipeline_tables(conn)
+
     table = source["target_table"]
     primary_key = source.get("primary_key")
     on_duplicate = on_duplicate_override or source.get(
@@ -1106,4 +1109,3 @@ def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
                 print(f"  [macro] Loaded '{sql_file.name}'")
         except Exception as e:
             print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")
-            

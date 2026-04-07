@@ -25,7 +25,7 @@ from proto_pipe.io.migration import (
     IntegrityResult,
 )
 from proto_pipe.pipelines.flagging import FlagRecord, write_source_flags
-from proto_pipe.io.db import init_all_pipeline_tables, init_ingest_state, flag_id_for as _fid
+from proto_pipe.io.db import init_all_pipeline_tables, ensure_pipeline_tables, init_ingest_state, flag_id_for as _fid
 from proto_pipe.checks.registry import CheckRegistry, CheckContract, CheckAudit, validate_check
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ def _make_conn(tmp_path, db_name="test.db"):
 
 def _init_flagged_rows(conn):
     """Bootstrap source_block (was flagged_rows). Safe to call multiple times."""
-    init_all_pipeline_tables(conn)
+    ensure_pipeline_tables(conn)
 
 
 def _valid_check_func(context: dict) -> pd.Series:
@@ -678,4 +678,85 @@ class TestFilterUningested:
         conn.close()
         result = _filter_uningested([], pipeline_db)
         assert result == []
-        
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestAlreadyIngestedGuarantee:
+    """already_ingested returns True for ok files, False for failed files.
+
+    CLAUDE.md guarantee:
+      'Files already logged as ok in ingest_state are skipped automatically.'
+      'Files that previously failed are retried on every run until they succeed.'
+    This is enforced by already_ingested() returning False for failed files.
+    """
+
+    def test_ok_file_returns_true(self, tmp_path):
+        pipeline_db = str(tmp_path / "pipeline.db")
+        conn = _make_conn(tmp_path)
+        ensure_pipeline_tables(conn)
+        conn.execute("""
+            INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
+            VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'ok',
+                    current_timestamp)
+        """)
+
+        from proto_pipe.io.db import already_ingested
+        assert already_ingested(conn, "sales_jan.csv") is True, (
+            "already_ingested must return True for files with status='ok'"
+        )
+        conn.close()
+
+    def test_failed_file_returns_false(self, tmp_path):
+        """Failed files must NOT be considered already ingested — they need retry.
+
+        CLAUDE.md guarantee:
+          'Files that previously failed are retried on every run until they succeed.'
+        """
+        conn = _make_conn(tmp_path)
+        ensure_pipeline_tables(conn)
+        conn.execute("""
+            INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
+            VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'failed',
+                    current_timestamp)
+        """)
+
+        from proto_pipe.io.db import already_ingested
+        assert already_ingested(conn, "sales_jan.csv") is False, (
+            "already_ingested must return False for files with status='failed' "
+            "— failed files must be retried on every run"
+        )
+        conn.close()
+
+    def test_unknown_file_returns_false(self, tmp_path):
+        """A file with no ingest_state entry must not be considered already ingested."""
+        conn = _make_conn(tmp_path)
+        ensure_pipeline_tables(conn)
+
+        from proto_pipe.io.db import already_ingested
+        assert already_ingested(conn, "never_seen.csv") is False
+        conn.close()
+
+    def test_correction_status_does_not_block_retry(self, tmp_path):
+        """Files logged as 'correction' must not be blocked from re-processing.
+
+        CLAUDE.md guarantee (ingest_state status values):
+          'ok | failed | skipped | correction'
+        Only 'ok' should block re-ingest.
+        """
+        conn = _make_conn(tmp_path)
+        ensure_pipeline_tables(conn)
+        conn.execute("""
+            INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
+            VALUES (gen_random_uuid()::VARCHAR, 'sales_jan.csv', 'sales', 'correction',
+                    current_timestamp)
+        """)
+
+        from proto_pipe.io.db import already_ingested
+        assert already_ingested(conn, "sales_jan.csv") is False, (
+            "Files with status='correction' must not be blocked from re-processing — "
+            "only status='ok' blocks re-ingest"
+        )
+        conn.close()

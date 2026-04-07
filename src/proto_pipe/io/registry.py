@@ -105,6 +105,15 @@ def _expand_check_with_alias_map(
         raise ValueError(f"No built-in check named '{func_name}'")
 
     inspector = CheckParamInspector(func)
+
+    if not inspector.is_multiselect_eligible():
+        # Function does not return pd.Series[bool] — not eligible for multi-column
+        # expansion. Register as a single check regardless of alias_map contents.
+        check_name = _build_check_keys(func_name, params)
+        if check_name not in check_registry.available():
+            _register_check(check_name, func_name, params, check_registry)
+        return [check_name]
+
     col_params = inspector.column_params()
 
     # Which of this check's column params are covered by alias_map?

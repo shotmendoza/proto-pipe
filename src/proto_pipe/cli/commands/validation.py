@@ -1,8 +1,7 @@
-"""Validation commands — validate, checks, export-validation."""
+"""Validation commands — validate."""
 
 import click
 
-from proto_pipe.checks.helpers import load_custom_checks
 from proto_pipe.io.config import config_path_or_override, load_config
 
 
@@ -154,38 +153,8 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
 
 
 # ---------------------------------------------------------------------------
-# checks
-# ---------------------------------------------------------------------------
-
-@click.command()
-def checks():
-    """List all available built-in checks and their parameters.
-
-    \b
-    Example:
-      vp checks
-    """
-    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-
-    descriptions = {
-        "null_check":      ("No params required",           "Checks all columns for null values"),
-        "range_check":     ("col, min_val, max_val",        "Checks a column's values fall within a range"),
-        "schema_check":    ("expected_cols (list)",         "Checks the table has the expected columns"),
-        "duplicate_check": ("subset (list, optional)",      "Checks for duplicate rows"),
-    }
-
-    click.echo("\nBuilt-in checks:\n")
-    for name in BUILT_IN_CHECKS:
-        params, desc = descriptions.get(name, ("", ""))
-        click.echo(f"  {name}")
-        click.echo(f"    params: {params}")
-        click.echo(f"    {desc}\n")
-
-
-# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
 def validation_commands(cli):
     cli.add_command(validate)
-    cli.add_command(checks)

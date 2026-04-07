@@ -177,3 +177,70 @@ class TestCheckRegistry:
         assert result.passed is False
         assert result.mask is not None
         assert result.mask.sum() == 1
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests
+# ---------------------------------------------------------------------------
+
+class TestCheckSeriesAlignment:
+    """All built-in checks return pd.Series with the same index as the input.
+
+    CLAUDE.md guarantee:
+      'kind=check → returns pd.Series[bool]. True = row passes.'
+    The Series must be aligned to the input DataFrame index so that
+    failing rows can be correctly identified by position.
+    """
+
+    def test_check_nulls_index_matches_input(self, sales_df_with_nulls):
+        result = check_nulls({"df": sales_df_with_nulls})
+        assert list(result.index) == list(sales_df_with_nulls.index)
+
+    def test_check_range_index_matches_input(self, sales_df_out_of_range):
+        result = check_range({"df": sales_df_out_of_range}, col="price", min_val=0, max_val=500)
+        assert list(result.index) == list(sales_df_out_of_range.index)
+
+    def test_check_duplicates_index_matches_input(self, sales_df_with_duplicates):
+        result = check_duplicates({"df": sales_df_with_duplicates})
+        assert list(result.index) == list(sales_df_with_duplicates.index)
+
+    def test_check_schema_index_matches_input(self, sales_df):
+        result = check_schema({"df": sales_df}, expected_cols=list(sales_df.columns))
+        assert list(result.index) == list(sales_df.index)
+
+
+class TestCheckSchemaBehavior:
+    """check_schema is table-level — all rows get the same pass/fail result.
+
+    CLAUDE.md guarantee:
+      'kind=check → returns pd.Series[bool].'
+    For schema mismatches, the failure is table-wide (the schema either
+    matches or it doesn't), so every row must get the same boolean value.
+    """
+
+    def test_schema_mismatch_is_uniform_all_fail(self, sales_df):
+        result = check_schema(
+            {"df": sales_df},
+            expected_cols=list(sales_df.columns) + ["missing_col"],
+        )
+        assert len(result.unique()) == 1, (
+            "Schema check must return a uniform Series — all rows pass or all fail"
+        )
+        assert not result.iloc[0]
+
+    def test_schema_match_is_uniform_all_pass(self, sales_df):
+        result = check_schema({"df": sales_df}, expected_cols=list(sales_df.columns))
+        assert len(result.unique()) == 1
+        assert result.iloc[0]
+
+
+class TestCheckNullsEdgeCases:
+    def test_empty_dataframe_returns_empty_series(self):
+        """check_nulls with an empty DataFrame must return empty Series, not raise.
+
+        CLAUDE.md guarantee: checks return pd.Series[bool]. An empty DataFrame
+        is a valid input — e.g. after watermark filtering produces no rows.
+        """
+        df = pd.DataFrame({"order_id": [], "price": []})
+        result = check_nulls({"df": df})
+        assert isinstance(result, pd.Series)
+        assert len(result) == 0

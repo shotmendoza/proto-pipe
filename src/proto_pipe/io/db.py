@@ -628,6 +628,22 @@ def coerce_for_display(df: "pd.DataFrame") -> "pd.DataFrame":
 ################
 # KEY FUNCTIONS
 ################
+
+def ensure_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    """Ensure all pipeline-managed tables exist on this connection.
+
+    Lightweight guard -- checks for ingest_state as a proxy for full
+    initialisation and calls init_all_pipeline_tables only when missing.
+    Safe to call at the top of any function that writes to pipeline tables.
+
+    Covers two failure modes:
+    1. Fresh DB opened without vp db-init being run first.
+    2. vp db-init --migrate on an old DB where tables are partially missing.
+    """
+    if not table_exists(conn, "ingest_state"):
+        init_all_pipeline_tables(conn)
+
+
 def init_all_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """Bootstrap all pipeline-managed tables. Called by vp db-init.
 
