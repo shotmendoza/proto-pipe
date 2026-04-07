@@ -145,7 +145,7 @@ class TextualReview(ReviewInterface):
                     else:
                         table.add_column(str(col), key=col, width=None)
 
-                rows = df.fillna("").astype(str).values.tolist()
+                rows = df.astype(object).fillna("").astype(str).values.tolist()
                 for row in rows:
                     table.add_row(*row)
 
