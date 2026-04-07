@@ -96,8 +96,8 @@ def _safe_sample_label(sample, col: str) -> str:
 
 
 def prompt_delete_impact(
-    rows: list[tuple[str, int, str]],
-    yes: bool = False,
+        rows: list[tuple[str, int, str]],
+        yes: bool = False,
 ) -> bool:
     """Display an impact summary and prompt for confirmation before a delete.
 
@@ -143,12 +143,13 @@ class SourceConfigPrompter:
     :param registry_hints:  {column: {source_name: declared_type}} for conflict display.
     :param existing_source: Existing source dict when editing, None when creating.
     """
+
     def __init__(
-        self,
-        sample_df=None,
-        registry_hints: dict | None = None,
-        existing_source: dict | None = None,
-        existing_sources_lookup: dict[str, dict] | None = None,
+            self,
+            sample_df=None,
+            registry_hints: dict | None = None,
+            existing_source: dict | None = None,
+            existing_sources_lookup: dict[str, dict] | None = None,
     ) -> None:
         self._sample = sample_df
         self._registry_hints = registry_hints or {}
@@ -498,7 +499,7 @@ class SourceConfigPrompter:
 
     @staticmethod
     def prompt_file_group(
-        file_groups: "dict[str, list[str]]",
+            file_groups: "dict[str, list[str]]",
     ) -> "tuple[str | None, str | None]":
         """Show a pattern-grouped file picker.
 
@@ -512,14 +513,14 @@ class SourceConfigPrompter:
             subsequent prompt_pattern step. None if the user cancelled (ESC).
         """
         choices = [
-            questionary.Choice(
-                title=f"{pattern}  ({len(files)} file{'s' if len(files) != 1 else ''})",
-                value=pattern,
-            )
-            for pattern, files in sorted(
+                      questionary.Choice(
+                          title=f"{pattern}  ({len(files)} file{'s' if len(files) != 1 else ''})",
+                          value=pattern,
+                      )
+                      for pattern, files in sorted(
                 file_groups.items(), key=lambda x: (-len(x[1]), x[0])
             )
-        ] + ["None of these — define manually"]
+                  ] + ["None of these — define manually"]
 
         selected = questionary.select(
             "Which file pattern are you configuring a source for?",
@@ -535,6 +536,28 @@ class SourceConfigPrompter:
         matched_files = file_groups[selected]
         return matched_files[0], selected
 
+
+def _make_col_choices(
+        cols: list[str],
+        registry_types: dict[str, str],
+        precheck: "set[str] | None" = None,
+) -> "list[questionary.Choice]":
+    """Build questionary.Choice objects for column selection prompts.
+
+    Each choice displays 'column_name (TYPE)' as the title and returns the
+    column name as the value. Columns in precheck are pre-selected (used for
+    checkbox prompts). Auto-populate fires only on exact name match — the
+    caller sets precheck based on param_name == col, no fuzzy matching.
+    """
+    precheck = precheck or set()
+    return [
+        questionary.Choice(
+            title=f"{col} ({registry_types[col]})" if col in registry_types else col,
+            value=col,
+            checked=col in precheck,
+        )
+        for col in cols
+    ]
 
 # ---------------------------------------------------------------------------
 # ReportConfigPrompter
@@ -554,11 +577,11 @@ class ReportConfigPrompter:
     """
 
     def __init__(
-        self,
-        check_registry,
-        p_db: str,
-        multi_select: bool = True,
-        existing_report: dict | None = None,
+            self,
+            check_registry,
+            p_db: str,
+            multi_select: bool = True,
+            existing_report: dict | None = None,
     ) -> None:
         self._registry = check_registry
         self._p_db = p_db
@@ -575,17 +598,17 @@ class ReportConfigPrompter:
     # ---------------------------------------------------------------------------
 
     def run(
-        self,
-        available_tables: list[str],
-        existing_names: list[str],
-        conn,
+            self,
+            available_tables: list[str],
+            existing_names: list[str],
+            conn,
     ) -> bool:
         """Run the full report configuration flow.
 
         Stores results in self.name, self.table, self.check_entries, self.alias_map.
         Returns True on completion, False if cancelled.
         """
-        from proto_pipe.cli.scaffold import _get_table_columns
+        from proto_pipe.cli.scaffold import get_table_columns
 
         self.name = ""
         self.table = ""
@@ -618,13 +641,10 @@ class ReportConfigPrompter:
                 step = STEP_CHECKS
 
             elif step == STEP_CHECKS:
-                from proto_pipe.io.db import get_registry_types
-                table_cols = sorted(_get_table_columns(self._p_db, state["table"]))
-                registry_types = get_registry_types(conn, columns=table_cols)
+                table_cols = sorted(get_table_columns(self._p_db, state["table"]))
                 selected, go_back = self.prompt_checks(
                     table_cols=table_cols,
                     alias_map=state.get("alias_map", []),
-                    registry_types=registry_types,
                     preselected=existing_check_names,
                 )
                 if go_back:
@@ -687,11 +707,11 @@ class ReportConfigPrompter:
         return name
 
     def prompt_checks(
-        self,
-        table_cols: list[str],
-        alias_map: list[dict],
-        registry_types: dict[str, str],
-        preselected: list[str] | None = None,
+            self,
+            table_cols: list[str],
+            alias_map: list[dict],
+            registry_types: dict[str, str],
+            preselected: list[str] | None = None,
     ) -> tuple[list[str] | None, bool]:
         """Show available columns, then two sequential prompts — transforms then checks.
 
@@ -712,7 +732,7 @@ class ReportConfigPrompter:
         else:
             click.echo(
                 "\n  [warn] No column types registered for this source"
-                " — run `vp new source` first"
+                " \u2014 run `vp new source` first"
             )
 
         # -- Kind split (consuming existing public methods, not metadata) -----
@@ -755,32 +775,31 @@ class ReportConfigPrompter:
         return selected, False
 
     def _prompt_kind_group(
-        self,
-        names: list[str],
-        label: str,
-        table_cols: list[str],
-        alias_param_to_cols: dict[str, list[str]],
-        preselected: list[str],
+            self,
+            names: list[str],
+            label: str,
+            table_cols: list[str],
+            alias_param_to_cols: dict[str, list[str]],
+            preselected: list[str],
     ) -> tuple[list[str] | None, bool]:
         """Render metadata summary and checkbox for one kind group.
 
         Prints name, first docstring sentence, and param lines for each
-        function before showing the checkbox — same display as the previous
-        flat prompt, now per-kind. Returns (selected_names, go_back).
+        function before showing the checkbox. Returns (selected_names, go_back).
         go_back is True when the user pressed ESC (questionary returns None).
         """
         from proto_pipe.cli.scaffold import (
-            _get_original_func,
-            _get_check_first_sentence,
-            _build_check_param_lines,
+            get_original_func,
+            get_check_first_sentence,
+            build_check_param_lines,
         )
 
         click.echo()
         choices = []
         for check_name in names:
-            original = _get_original_func(check_name, self._registry)
-            first_sentence = _get_check_first_sentence(original) if original else ""
-            param_lines = _build_check_param_lines(
+            original = get_original_func(check_name, self._registry)
+            first_sentence = get_check_first_sentence(original) if original else ""
+            param_lines = build_check_param_lines(
                 check_name, self._registry, table_cols, alias_param_to_cols
             )
 
@@ -815,26 +834,224 @@ class ReportConfigPrompter:
         return selected, False
 
     def prompt_params(
-        self,
-        selected_checks: list[str],
-        table: str,
-        conn,
-        report_name: str,
-        existing_alias_map: list[dict] | None = None,
+            self,
+            selected_checks: list[str],
+            table: str,
+            conn,
+            report_name: str,
+            existing_alias_map: list[dict] | None = None,
     ) -> tuple[list[dict], list[dict], bool]:
-        """Fill params for selected checks. Delegates to _fill_params."""
-        from proto_pipe.cli.scaffold import _fill_params
-
-        return _fill_params(
+        """Fill params for selected checks. Delegates to self._fill_params."""
+        return self._fill_params(
             selected_checks=selected_checks,
             table=table,
-            p_db=self._p_db,
-            check_registry=self._registry,
-            multi_select=self._multi_select,
             conn=conn,
             report_name=report_name,
             existing_alias_map=existing_alias_map,
         )
+
+    def _fill_params(
+            self,
+            selected_checks: list[str],
+            table: str,
+            conn: "duckdb.DuckDBPyConnection",
+            report_name: str,
+            existing_alias_map: list[dict] | None = None,
+    ) -> tuple[list[dict], list[dict], bool]:
+        """Fill params for each selected check, building alias_map entries for column params.
+
+        Column params → alias_map (not in params dict). Choices are displayed
+        as 'column_name (TYPE)' sourced from column_type_registry. Auto-populate
+        fires when param_name exactly matches a column name.
+        Scalar params → params dict.
+        DataFrame params → skipped (auto-filled at runtime).
+        check_col (kind=check + returns DataFrame) → params dict.
+        overwrite_cols (kind=transform + returns DataFrame) → params dict.
+
+        Returns (check_entries, alias_map_entries, go_back).
+        """
+        import inspect
+        from proto_pipe.cli.scaffold import (
+            get_table_columns,
+            get_original_func,
+            get_check_params,
+            get_param_suggestions,
+            record_param_history,
+            is_list_annotation,
+        )
+        from proto_pipe.io.db import get_registry_types
+
+        table_cols = sorted(get_table_columns(self._p_db, table))
+        registry_types = get_registry_types(conn, columns=table_cols)
+        existing_alias_map = existing_alias_map or []
+
+        alias_param_to_cols: dict[str, list[str]] = {}
+        for entry in existing_alias_map:
+            alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
+
+        accumulated_alias: list[dict] = list(existing_alias_map)
+
+        checks_with_params = {
+            c: get_check_params(c, self._registry)
+            for c in selected_checks
+            if get_check_params(c, self._registry)
+        }
+
+        # Also include checks that have no promptable params but need df-return prompts
+        df_return_checks = set()
+        for check_name in selected_checks:
+            original = get_original_func(check_name, self._registry)
+            if original:
+                from proto_pipe.checks.registry import CheckParamInspector
+                inspector = CheckParamInspector(original)
+                if inspector.has_dataframe_input() and inspector.returns_dataframe():
+                    df_return_checks.add(check_name)
+
+        checks_needing_prompts = set(checks_with_params.keys()) | df_return_checks
+
+        if not checks_needing_prompts:
+            return [{"name": c} for c in selected_checks], accumulated_alias, False
+
+        check_entries = []
+
+        for check_name in selected_checks:
+            params = checks_with_params.get(check_name, {})
+            original = get_original_func(check_name, self._registry)
+            from proto_pipe.checks.registry import CheckParamInspector
+            inspector = CheckParamInspector(original) if original else None
+
+            has_df_return = check_name in df_return_checks
+            kind = self._registry.get_kind(check_name)
+
+            if not params and not has_df_return:
+                check_entries.append({"name": check_name})
+                continue
+
+            click.echo(f"\nParameters for '{check_name}':")
+
+            eligible = (
+                    self._multi_select
+                    and inspector is not None
+                    and inspector.is_multiselect_eligible()
+            )
+            col_params = inspector.column_params() if inspector else []
+            sig = inspect.signature(inspector.func) if inspector else None
+
+            filled_params: dict = {}
+
+            for param_name, default in params.items():
+                ann = (
+                    sig.parameters[param_name].annotation
+                    if sig and param_name in sig.parameters
+                    else inspect.Parameter.empty
+                )
+
+                if param_name in col_params:
+                    alias_cols = alias_param_to_cols.get(param_name, [])
+                    if alias_cols:
+                        ordered = alias_cols + [c for c in table_cols if c not in alias_cols]
+                    else:
+                        history = get_param_suggestions(conn, check_name, param_name, table_cols)
+                        ordered = history + [c for c in table_cols if c not in history]
+
+                    # Auto-populate: exact param name match pre-selects the column
+                    auto_match = param_name if param_name in table_cols else None
+
+                    if eligible:
+                        click.echo(
+                            f"  \u2139  Selecting multiple columns will run '{check_name}'"
+                            f" once per column."
+                        )
+                        precheck = {auto_match} if auto_match else set()
+                        choices = _make_col_choices(ordered, registry_types, precheck=precheck)
+                        value = questionary.checkbox(f"{param_name}:", choices=choices).ask()
+                        if value is None:
+                            return [], [], True
+                        value = sorted(value)
+                        for col in value:
+                            if not any(
+                                    e["param"] == param_name and e["column"] == col
+                                    for e in accumulated_alias
+                            ):
+                                accumulated_alias.append({"param": param_name, "column": col})
+                    else:
+                        choices = _make_col_choices(ordered, registry_types)
+                        value = questionary.select(
+                            f"{param_name}:", choices=choices, default=auto_match
+                        ).ask()
+                        if value is None:
+                            return [], [], True
+                        if not any(
+                                e["param"] == param_name and e["column"] == value
+                                for e in accumulated_alias
+                        ):
+                            accumulated_alias.append({"param": param_name, "column": value})
+
+                    alias_param_to_cols[param_name] = [
+                        e["column"] for e in accumulated_alias if e["param"] == param_name
+                    ]
+
+                elif is_list_annotation(ann) or isinstance(default, list):
+                    suggestions = get_param_suggestions(conn, check_name, param_name, table_cols)
+                    ordered = suggestions + [c for c in table_cols if c not in suggestions]
+                    choices = _make_col_choices(ordered, registry_types)
+                    value = questionary.checkbox(f"{param_name}:", choices=choices).ask()
+                    if value is None:
+                        return [], [], True
+                    filled_params[param_name] = sorted(value)
+
+                else:
+                    suggestions = get_param_suggestions(conn, check_name, param_name, table_cols)
+                    suggested_default = (
+                        suggestions[0]
+                        if suggestions
+                        else (str(default) if default is not inspect.Parameter.empty else "")
+                    )
+                    value = questionary.text(f"{param_name}:", default=suggested_default).ask()
+                    if value is None:
+                        return [], [], True
+                    if value:
+                        try:
+                            value = int(value) if "." not in value else float(value)
+                        except ValueError:
+                            pass
+                    filled_params[param_name] = value
+
+            # ── DataFrame-return prompts ──────────────────────────────────────
+            if has_df_return:
+                if kind == "check":
+                    click.echo(
+                        f"\n  \u2139  '{check_name}' returns a DataFrame. Select the column "
+                        f"that contains the boolean pass/fail values."
+                    )
+                    check_col = questionary.select(
+                        "check_col — boolean column in the returned DataFrame:",
+                        choices=_make_col_choices(table_cols, registry_types),
+                    ).ask()
+                    if check_col is None:
+                        return [], [], True
+                    filled_params["check_col"] = check_col
+
+                elif kind == "transform":
+                    click.echo(
+                        f"\n  \u2139  '{check_name}' returns a DataFrame. Select the columns "
+                        f"from the returned DataFrame that should overwrite the table."
+                    )
+                    overwrite_cols = questionary.checkbox(
+                        "overwrite_cols — columns to write back to the table:",
+                        choices=_make_col_choices(table_cols, registry_types),
+                    ).ask()
+                    if overwrite_cols is None:
+                        return [], [], True
+                    filled_params["overwrite_cols"] = sorted(overwrite_cols)
+
+            record_param_history(conn, check_name, report_name, table, filled_params)
+            entry = {"name": check_name}
+            if filled_params:
+                entry["params"] = filled_params
+            check_entries.append(entry)
+
+        return check_entries, accumulated_alias, False
 
 
 # ---------------------------------------------------------------------------
@@ -854,11 +1071,11 @@ class DeliverableConfigPrompter:
     """
 
     def __init__(
-        self,
-        rep_config: dict,
-        src_config: dict,
-        sql_dir: str,
-        existing_deliverable: dict | None = None,
+            self,
+            rep_config: dict,
+            src_config: dict,
+            sql_dir: str,
+            existing_deliverable: dict | None = None,
     ) -> None:
         self._rep_config = rep_config
         self._src_config = src_config
@@ -972,7 +1189,7 @@ class DeliverableConfigPrompter:
     def prompt_sql(self, name: str, selected_reports: list[str]) -> str | None:
         """Prompt for SQL transformation file. Returns path or None."""
         from pathlib import Path
-        from proto_pipe.cli.scaffold import _build_rich_sql_scaffold
+        from proto_pipe.cli.scaffold import build_rich_sql_scaffold
 
         current_sql = self._existing.get("sql_file")
         use_sql = questionary.confirm(
@@ -989,7 +1206,7 @@ class DeliverableConfigPrompter:
         if sql_path.exists():
             click.echo(f"  [skip] {sql_path} already exists — not overwriting")
         else:
-            scaffold = _build_rich_sql_scaffold(
+            scaffold = build_rich_sql_scaffold(
                 name, selected_reports, self._rep_config, self._src_config
             )
             sql_path.write_text(scaffold)
@@ -998,7 +1215,7 @@ class DeliverableConfigPrompter:
         return str(sql_path)
 
     def prompt_report_entries(
-        self, selected_reports: list[str], fmt: str
+            self, selected_reports: list[str], fmt: str
     ) -> list[dict]:
         """Prompt for per-report sheet names and date filters."""
         fill_details = questionary.confirm(

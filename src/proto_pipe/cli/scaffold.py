@@ -22,7 +22,7 @@ from proto_pipe.checks.registry import CheckRegistry, CheckParamInspector
 # ---------------------------------------------------------------------------
 
 
-def _get_check_first_sentence(func) -> str:
+def get_check_first_sentence(func) -> str:
     """Extract and return the first sentence from a function's docstring.
 
     Used as the description shown alongside each check in vp new-report.
@@ -38,7 +38,7 @@ def _get_check_first_sentence(func) -> str:
     return sentence
 
 
-def _build_check_param_lines(
+def build_check_param_lines(
     check_name: str,
     check_registry: CheckRegistry,
     table_cols: list[str],
@@ -49,7 +49,7 @@ def _build_check_param_lines(
     DataFrame params are shown as auto-filled (no prompt needed).
     check_col / overwrite_cols appear as synthetic params when applicable.
     """
-    original = _get_original_func(check_name, check_registry)
+    original = get_original_func(check_name, check_registry)
     if original is None:
         return []
 
@@ -86,7 +86,7 @@ def _build_check_param_lines(
                 remaining = len(all_cols) - 3
                 lines.append(f"    {param_name:<18} column   → {shown}  ({remaining}+)")
 
-        elif _is_list_annotation(ann) or isinstance(param.default, list):
+        elif is_list_annotation(ann) or isinstance(param.default, list):
             lines.append(f"    {param_name:<18} list")
 
         else:
@@ -145,7 +145,7 @@ def _get_column_registry_hints(
     return result
 
 
-def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
+def filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
     """Remove files already successfully logged in ingest_state."""
     try:
         from proto_pipe.io.db import get_ingested_filenames
@@ -156,25 +156,11 @@ def _filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
     return [f for f in files if f not in ingested_set]
 
 
-def _filter_unconfigured(files: list[str], sources: list[dict]) -> list[str]:
+def filter_unconfigured(files: list[str], sources: list[dict]) -> list[str]:
     """Return files that don't match any existing source pattern."""
     from fnmatch import fnmatch
     patterns = [p for s in sources for p in s.get("patterns", [])]
     return [f for f in files if not any(fnmatch(f, p) for p in patterns)]
-
-
-def _infer_duckdb_type(series) -> str:
-    """Return the DuckDB type string inferred from a pandas Series dtype."""
-    import pandas as pd
-    if pd.api.types.is_integer_dtype(series):
-        return "BIGINT"
-    if pd.api.types.is_float_dtype(series):
-        return "DOUBLE"
-    if pd.api.types.is_bool_dtype(series):
-        return "BOOLEAN"
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return "TIMESTAMPTZ"
-    return "VARCHAR"
 
 
 def _sorted_choices(items: list[str]) -> Iterable[str]:
@@ -193,7 +179,7 @@ def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.
     return substring + fuzzy
 
 
-def _get_param_suggestions(
+def get_param_suggestions(
         conn: duckdb.DuckDBPyConnection,
         check_name: str,
         param_name: str,
@@ -223,7 +209,7 @@ def _get_param_suggestions(
     return suggestions
 
 
-def _record_param_history(
+def record_param_history(
     conn: duckdb.DuckDBPyConnection,
     check_name: str,
     report_name: str,
@@ -319,7 +305,7 @@ def _format_join_clause(
     )
 
 
-def _get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str]:
+def get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str]:
     """Return tables in the pipeline DB that aren't yet in reports_config."""
     configured = {r["source"]["table"] for r in reports_config.get("reports", [])}
     conn = duckdb.connect(pipeline_db)
@@ -334,7 +320,7 @@ def _get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str
     ]
 
 
-def _get_table_columns(pipeline_db: str, table: str) -> list[str]:
+def get_table_columns(pipeline_db: str, table: str) -> list[str]:
     """Return column names for a table, excluding internal pipeline columns."""
     conn = duckdb.connect(pipeline_db)
     cols = conn.execute(
@@ -397,14 +383,14 @@ def _scan_incoming(incoming_dir: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _is_list_annotation(ann) -> bool:
+def is_list_annotation(ann) -> bool:
     """True if annotation is list or list[str] or similar."""
     if ann is list:
         return True
     return getattr(ann, "__origin__", None) is list
 
 
-def _get_original_func(check_name: str, check_registry: CheckRegistry):
+def get_original_func(check_name: str, check_registry: CheckRegistry):
     """Return the original unwrapped function from the registry."""
     import functools
     func = check_registry.get(check_name)
@@ -419,13 +405,13 @@ def _get_original_func(check_name: str, check_registry: CheckRegistry):
     return unwrapped
 
 
-def _get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
+def get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
     """Return the promptable params for a check.
 
     DataFrame params are excluded — they are auto-filled with the report
     table at call time and never shown to the user.
     """
-    func = _get_original_func(check_name, check_registry)
+    func = get_original_func(check_name, check_registry)
     if func is None:
         return {}
     inspector = CheckParamInspector(func)
@@ -438,205 +424,6 @@ def _get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
     }
 
 
-def _fill_params(
-    selected_checks: list[str],
-    table: str,
-    p_db: str,
-    check_registry: CheckRegistry,
-    multi_select: bool,
-    conn: "duckdb.DuckDBPyConnection",
-    report_name: str,
-    existing_alias_map: list[dict] | None = None,
-) -> tuple[list[dict], list[dict], bool]:
-    """Fill params for each selected check, building alias_map entries for column params.
-
-    Column params → alias_map (not in params dict).
-    Scalar params → params dict.
-    DataFrame params → skipped (auto-filled at runtime).
-    check_col (kind=check + returns DataFrame) → params dict.
-    overwrite_cols (kind=transform + returns DataFrame) → params dict.
-
-    Returns (check_entries, alias_map_entries, go_back).
-    """
-    table_cols = sorted(_get_table_columns(p_db, table))
-    existing_alias_map = existing_alias_map or []
-
-    alias_param_to_cols: dict[str, list[str]] = {}
-    for entry in existing_alias_map:
-        alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
-
-    accumulated_alias: list[dict] = list(existing_alias_map)
-
-    checks_with_params = {
-        c: _get_check_params(c, check_registry)
-        for c in selected_checks
-        if _get_check_params(c, check_registry)
-    }
-
-    # Also include checks that have no promptable params but need df-return prompts
-    df_return_checks = set()
-    for check_name in selected_checks:
-        original = _get_original_func(check_name, check_registry)
-        if original:
-            inspector = CheckParamInspector(original)
-            if inspector.has_dataframe_input() and inspector.returns_dataframe():
-                df_return_checks.add(check_name)
-
-    checks_needing_prompts = set(checks_with_params.keys()) | df_return_checks
-
-    if not checks_needing_prompts:
-        return [{"name": c} for c in selected_checks], accumulated_alias, False
-
-    check_entries = []
-
-    for check_name in selected_checks:
-        params = checks_with_params.get(check_name, {})
-        original = _get_original_func(check_name, check_registry)
-        inspector = CheckParamInspector(original) if original else None
-
-        has_df_return = check_name in df_return_checks
-        kind = check_registry.get_kind(check_name)
-
-        if not params and not has_df_return:
-            check_entries.append({"name": check_name})
-            continue
-
-        click.echo(f"\nParameters for '{check_name}':")
-
-        eligible = (
-            multi_select
-            and inspector is not None
-            and inspector.is_multiselect_eligible()
-        )
-        col_params = inspector.column_params() if inspector else []
-        sig = inspect.signature(inspector.func) if inspector else None
-
-        filled_params: dict = {}
-
-        for param_name, default in params.items():
-            ann = (
-                sig.parameters[param_name].annotation
-                if sig and param_name in sig.parameters
-                else inspect.Parameter.empty
-            )
-
-            if param_name in col_params:
-                alias_cols = alias_param_to_cols.get(param_name, [])
-                if alias_cols:
-                    choices = alias_cols + [
-                        c for c in table_cols if c not in alias_cols
-                    ]
-                else:
-                    history = _get_param_suggestions(
-                        conn, check_name, param_name, table_cols
-                    )
-                    choices = history + [c for c in table_cols if c not in history]
-
-                if eligible:
-                    click.echo(
-                        f"  ℹ  Selecting multiple columns will run '{check_name}'"
-                        f" once per column."
-                    )
-                    value = questionary.checkbox(
-                        f"{param_name}:", choices=sorted(choices)
-                    ).ask()
-                    if value is None:
-                        return [], [], True
-                    value = sorted(value)
-                    for col in value:
-                        if not any(
-                            e["param"] == param_name and e["column"] == col
-                            for e in accumulated_alias
-                        ):
-                            accumulated_alias.append(
-                                {"param": param_name, "column": col}
-                            )
-                else:
-                    value = questionary.select(f"{param_name}:", choices=choices).ask()
-                    if value is None:
-                        return [], [], True
-                    if not any(
-                        e["param"] == param_name and e["column"] == value
-                        for e in accumulated_alias
-                    ):
-                        accumulated_alias.append({"param": param_name, "column": value})
-
-                alias_param_to_cols[param_name] = [
-                    e["column"] for e in accumulated_alias if e["param"] == param_name
-                ]
-
-            elif _is_list_annotation(ann) or isinstance(default, list):
-                suggestions = _get_param_suggestions(
-                    conn, check_name, param_name, table_cols
-                )
-                choices = suggestions + [c for c in table_cols if c not in suggestions]
-                value = questionary.checkbox(
-                    f"{param_name}:", choices=sorted(choices)
-                ).ask()
-                if value is None:
-                    return [], [], True
-                filled_params[param_name] = sorted(value)
-
-            else:
-                suggestions = _get_param_suggestions(
-                    conn, check_name, param_name, table_cols
-                )
-                suggested_default = (
-                    suggestions[0]
-                    if suggestions
-                    else (
-                        str(default) if default is not inspect.Parameter.empty else ""
-                    )
-                )
-                value = questionary.text(
-                    f"{param_name}:", default=suggested_default
-                ).ask()
-                if value is None:
-                    return [], [], True
-                if value:
-                    try:
-                        value = int(value) if "." not in value else float(value)
-                    except ValueError:
-                        pass
-                filled_params[param_name] = value
-
-        # ── DataFrame-return prompts ──────────────────────────────────────────
-        if has_df_return:
-            if kind == "check":
-                # Prompt for the boolean column in the returned DataFrame
-                click.echo(
-                    f"\n  ℹ  '{check_name}' returns a DataFrame. Select the column "
-                    f"that contains the boolean pass/fail values."
-                )
-                check_col = questionary.select(
-                    "check_col — boolean column in the returned DataFrame:",
-                    choices=table_cols,
-                ).ask()
-                if check_col is None:
-                    return [], [], True
-                filled_params["check_col"] = check_col
-
-            elif kind == "transform":
-                # Prompt for columns to overwrite in the source table
-                click.echo(
-                    f"\n  ℹ  '{check_name}' returns a DataFrame. Select the columns "
-                    f"from the returned DataFrame that should overwrite the table."
-                )
-                overwrite_cols = questionary.checkbox(
-                    "overwrite_cols — columns to write back to the table:",
-                    choices=table_cols,
-                ).ask()
-                if overwrite_cols is None:
-                    return [], [], True
-                filled_params["overwrite_cols"] = sorted(overwrite_cols)
-
-        _record_param_history(conn, check_name, report_name, table, filled_params)
-        entry = {"name": check_name}
-        if filled_params:
-            entry["params"] = filled_params
-        check_entries.append(entry)
-
-    return check_entries, accumulated_alias, False
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +527,7 @@ def _scan_macros(macros_dir: str) -> list[str]:
     return signatures
 
 
-def _build_rich_sql_scaffold(
+def build_rich_sql_scaffold(
         deliverable_name: str,
         selected_reports: list[str],
         reports_config: dict,

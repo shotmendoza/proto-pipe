@@ -11,11 +11,11 @@ import questionary
 
 from proto_pipe.cli.scaffold import (
     _scan_incoming,
-    _get_original_func,
-    _get_unconfigured_tables,
-    _build_rich_sql_scaffold,
+    get_original_func,
+    get_unconfigured_tables,
+    build_rich_sql_scaffold,
     _scan_macros,
-    _filter_unconfigured,
+    filter_unconfigured,
     _group_files_by_pattern,
 )
 from proto_pipe.io.config import load_config, write_config, load_settings
@@ -66,7 +66,7 @@ def new_source(sources_config, incoming_dir):
     click.echo("\n── New Source ──────────────────────────────")
 
     all_files = _scan_incoming(inc_dir)
-    files = _filter_unconfigured(all_files, config.all())
+    files = filter_unconfigured(all_files, config.all())
 
     if not files:
         if not all_files:
@@ -194,7 +194,7 @@ def new_report(reports_config, pipeline_db):
         click.echo("\n[warn] No checks available. Add built-in or custom checks first.")
         return
 
-    available_tables = _get_unconfigured_tables(p_db, {"reports": config.all()})
+    available_tables = get_unconfigured_tables(p_db, {"reports": config.all()})
     if not available_tables:
         click.echo(
             "\n  No unconfigured tables found. Either all tables already have "
@@ -215,7 +215,7 @@ def new_report(reports_config, pipeline_db):
     conn = duckdb.connect(p_db)
     init_check_registry_metadata(conn)
     for check_name in check_registry.available():
-        original = _get_original_func(check_name, check_registry)
+        original = get_original_func(check_name, check_registry)
         if original is not None:
             CheckParamInspector(original).write_to_db(conn, check_name)
 
@@ -473,7 +473,7 @@ def new_sql(name, reports_config, sources_config, sql_dir):
         click.echo("Cancelled.")
         return
 
-    scaffold = _build_rich_sql_scaffold(
+    scaffold = build_rich_sql_scaffold(
         deliverable_name=name,
         selected_reports=selected,
         reports_config=rep_config,

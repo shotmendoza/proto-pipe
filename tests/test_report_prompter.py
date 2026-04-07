@@ -43,11 +43,20 @@ def _make_prompter(registry):
     )
 
 
+
+
+def _make_prompter_single(registry: CheckRegistry) -> ReportConfigPrompter:
+    """Prompter with multi_select=False — forces questionary.select for column params."""
+    return ReportConfigPrompter(
+        check_registry=registry,
+        p_db="/fake/path.db",
+        multi_select=False,
+    )
 @contextlib.contextmanager
 def _scaffold_stubs():
-    with patch("proto_pipe.cli.scaffold._get_original_func", return_value=None), \
-         patch("proto_pipe.cli.scaffold._get_check_first_sentence", return_value=""), \
-         patch("proto_pipe.cli.scaffold._build_check_param_lines", return_value=[]):
+    with patch("proto_pipe.cli.scaffold.get_original_func", return_value=None), \
+         patch("proto_pipe.cli.scaffold.get_check_first_sentence", return_value=""), \
+         patch("proto_pipe.cli.scaffold.build_check_param_lines", return_value=[]):
         yield
 
 
@@ -348,3 +357,319 @@ class TestEscBehaviour:
 
         assert go_back is True
         assert selected is None
+
+
+# ---------------------------------------------------------------------------
+# _make_col_choices
+# ---------------------------------------------------------------------------
+
+class TestMakeColChoices:
+    """Behavioral guarantees for the _make_col_choices module-level helper."""
+
+    def test_title_includes_type(self):
+        """Choice title is 'column_name (TYPE)' when column is in registry_types."""
+        from proto_pipe.cli.prompts import _make_col_choices
+        choices = _make_col_choices(["price"], {"price": "DOUBLE"})
+        assert len(choices) == 1
+        assert choices[0].title == "price (DOUBLE)"
+
+    def test_title_is_column_name_when_type_unknown(self):
+        """Choice title is just column name when column not in registry_types."""
+        from proto_pipe.cli.prompts import _make_col_choices
+        choices = _make_col_choices(["mystery_col"], {})
+        assert choices[0].title == "mystery_col"
+
+    def test_value_is_column_name_not_title(self):
+        """Choice value is the raw column name, not the formatted title string."""
+        from proto_pipe.cli.prompts import _make_col_choices
+        choices = _make_col_choices(["price"], {"price": "DOUBLE"})
+        assert choices[0].value == "price"
+        assert choices[0].value != "price (DOUBLE)"
+
+    def test_precheck_marks_column_as_checked(self):
+        """Columns in precheck have checked=True."""
+        from proto_pipe.cli.prompts import _make_col_choices
+        choices = _make_col_choices(
+            ["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"},
+            precheck={"price"},
+        )
+        by_value = {c.value: c for c in choices}
+        assert by_value["price"].checked is True
+        assert by_value["quantity"].checked is False
+
+    def test_no_precheck_all_unchecked(self):
+        """With no precheck, all choices have checked=False."""
+        from proto_pipe.cli.prompts import _make_col_choices
+        choices = _make_col_choices(["a", "b"], {"a": "VARCHAR", "b": "BIGINT"})
+        assert all(not c.checked for c in choices)
+
+    def test_order_preserved(self):
+        """Output order matches input column order."""
+        from proto_pipe.cli.prompts import _make_col_choices
+        cols = ["c", "a", "b"]
+        choices = _make_col_choices(cols, {})
+        assert [c.value for c in choices] == cols
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by _fill_params tests
+# ---------------------------------------------------------------------------
+
+def _make_col_param_check():
+    """Check with one str-annotated column param — alias_map eligible."""
+    def f(col: str) -> "pd.Series[bool]":
+        return pd.Series([True])
+    return f
+
+
+def _make_scalar_param_check():
+    """Check with a column param AND a scalar float param."""
+    def f(col: str, min_val: float) -> "pd.Series[bool]":
+        return pd.Series([True])
+    return f
+
+
+@contextlib.contextmanager
+def _fill_params_stubs(table_cols, registry_types_result):
+    """Stubs for the DB-touching helpers called inside _fill_params."""
+    with patch("proto_pipe.cli.scaffold.get_table_columns", return_value=table_cols), \
+         patch("proto_pipe.cli.scaffold.get_param_suggestions", return_value=[]), \
+         patch("proto_pipe.cli.scaffold.record_param_history"), \
+         patch("proto_pipe.io.db.get_registry_types", return_value=registry_types_result), \
+         patch("proto_pipe.cli.prompts.click.echo"):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# ReportConfigPrompter._fill_params() — alias_map guarantees
+# ---------------------------------------------------------------------------
+
+class TestFillParamsAliasMap:
+
+    @pytest.fixture()
+    def registry_col(self):
+        """Registry with a single column-param check."""
+        reg = CheckRegistry()
+        reg.register("col_check", _make_col_param_check(), kind="check")
+        return reg
+
+    @pytest.fixture()
+    def registry_scalar(self):
+        """Registry with a check that has both a column param and a scalar param."""
+        reg = CheckRegistry()
+        reg.register("scalar_check", _make_scalar_param_check(), kind="check")
+        return reg
+
+    @pytest.fixture()
+    def registry_multiselect(self):
+        """Registry with a multiselect-eligible check (multi_select=True prompter)."""
+        reg = CheckRegistry()
+        reg.register("ms_check", _make_col_param_check(), kind="check")
+        return reg
+
+    def test_column_param_produces_alias_map_entry(self, registry_col):
+        """Every column param on every selected function gets an alias_map entry."""
+        prompter = _make_prompter_single(registry_col)
+        conn = MagicMock()
+
+        mock_select = MagicMock()
+        mock_select.return_value.ask.return_value = "price"
+
+        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
+             patch("proto_pipe.cli.prompts.questionary.select", mock_select):
+
+            _, alias_map, go_back = prompter.prompt_params(
+                selected_checks=["col_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        assert go_back is False
+        assert any(e["param"] == "col" and e["column"] == "price" for e in alias_map), (
+            f"Expected alias_map entry for param='col', column='price'. Got: {alias_map}"
+        )
+
+    def test_auto_populate_on_exact_name_match(self, registry_col):
+        """When param name exactly matches a column, it is passed as the select default."""
+        prompter = _make_prompter_single(registry_col)
+        conn = MagicMock()
+
+        captured_default = []
+
+        def capture_select(label, choices, default=None):
+            captured_default.append(default)
+            m = MagicMock()
+            m.ask.return_value = default or choices[0].value
+            return m
+
+        # table_cols contains "col" — exact match for param name "col"
+        with _fill_params_stubs(["col", "price"], {"col": "VARCHAR", "price": "DOUBLE"}), \
+             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            prompter.prompt_params(
+                selected_checks=["col_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        assert captured_default, "select was never called"
+        assert captured_default[0] == "col", (
+            f"Expected default='col' (exact match), got default={captured_default[0]!r}"
+        )
+
+    def test_no_auto_populate_when_no_exact_match(self, registry_col):
+        """When param name does not match any column, default is None — no fuzzy matching."""
+        prompter = _make_prompter_single(registry_col)
+        conn = MagicMock()
+
+        captured_default = []
+
+        def capture_select(label, choices, default=None):
+            captured_default.append(default)
+            m = MagicMock()
+            m.ask.return_value = choices[0].value
+            return m
+
+        # table_cols does NOT contain "col" — no exact match
+        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
+             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            prompter.prompt_params(
+                selected_checks=["col_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        assert captured_default, "select was never called"
+        assert captured_default[0] is None, (
+            f"Expected no auto-populate (default=None) when no exact match. "
+            f"Got default={captured_default[0]!r}"
+        )
+
+    def test_choices_carry_type_from_registry(self, registry_col):
+        """Column choices passed to questionary.select include type from column_type_registry."""
+        prompter = _make_prompter_single(registry_col)
+        conn = MagicMock()
+
+        captured_choices = []
+
+        def capture_select(label, choices, default=None):
+            captured_choices.extend(choices)
+            m = MagicMock()
+            m.ask.return_value = choices[0].value
+            return m
+
+        with _fill_params_stubs(["price"], {"price": "DOUBLE"}), \
+             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            prompter.prompt_params(
+                selected_checks=["col_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        assert captured_choices, "select was never called"
+        price_choice = next((c for c in captured_choices if c.value == "price"), None)
+        assert price_choice is not None
+        assert "DOUBLE" in price_choice.title, (
+            f"Expected type 'DOUBLE' in choice title, got: {price_choice.title!r}"
+        )
+
+    def test_scalar_param_excluded_from_alias_map(self, registry_scalar):
+        """Scalar params (non-column annotations) go to filled_params, not alias_map."""
+        prompter = _make_prompter_single(registry_scalar)
+        conn = MagicMock()
+
+        mock_select = MagicMock()
+        mock_select.return_value.ask.return_value = "price"
+
+        mock_text = MagicMock()
+        mock_text.return_value.ask.return_value = "10.0"
+
+        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE"}), \
+             patch("proto_pipe.cli.prompts.questionary.select", mock_select), \
+             patch("proto_pipe.cli.prompts.questionary.text", mock_text):
+
+            check_entries, alias_map, go_back = prompter.prompt_params(
+                selected_checks=["scalar_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        # alias_map should only contain the column param entry
+        alias_params = {e["param"] for e in alias_map}
+        assert "min_val" not in alias_params, (
+            "Scalar param 'min_val' must not appear in alias_map"
+        )
+        assert "col" in alias_params, "Column param 'col' must appear in alias_map"
+
+        # min_val should be in the check entry params
+        entry = next((e for e in check_entries if e["name"] == "scalar_check"), None)
+        assert entry is not None
+        assert "min_val" in entry.get("params", {}), (
+            "Scalar param 'min_val' must appear in check entry params"
+        )
+
+    def test_multiselect_produces_one_entry_per_column(self, registry_multiselect):
+        """Multi-select eligible params produce one alias_map entry per selected column."""
+        prompter = ReportConfigPrompter(
+            check_registry=registry_multiselect,
+            p_db="/fake/path.db",
+            multi_select=True,
+        )
+        conn = MagicMock()
+
+        mock_cb = MagicMock()
+        mock_cb.return_value.ask.return_value = ["price", "quantity"]
+
+        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
+             patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb):
+
+            _, alias_map, go_back = prompter.prompt_params(
+                selected_checks=["ms_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        col_entries = [e for e in alias_map if e["param"] == "col"]
+        assert len(col_entries) == 2, (
+            f"Expected 2 alias_map entries (one per selected column), got {col_entries}"
+        )
+        columns = {e["column"] for e in col_entries}
+        assert columns == {"price", "quantity"}
+
+    def test_existing_alias_map_prefills_on_edit(self, registry_col):
+        """Existing alias_map entries are preserved and the matched column is pre-selected."""
+        prompter = _make_prompter_single(registry_col)
+        conn = MagicMock()
+
+        captured_default = []
+
+        def capture_select(label, choices, default=None):
+            captured_default.append(default)
+            m = MagicMock()
+            # User presses Enter — keeps the pre-filled value
+            m.ask.return_value = default or choices[0].value
+            return m
+
+        existing = [{"param": "col", "column": "price"}]
+
+        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
+             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            _, alias_map, go_back = prompter.prompt_params(
+                selected_checks=["col_check"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+                existing_alias_map=existing,
+            )
+
+        # Pre-existing entry preserved
+        assert any(e["param"] == "col" and e["column"] == "price" for e in alias_map)

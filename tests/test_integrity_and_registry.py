@@ -9,13 +9,13 @@ Tests for:
   - _write_integrity_flags (ingest.py)
   - ingest_directory Scenario A: column_types pre-scan (ingest.py)
   - ingest_directory Scenario B: row-level integrity flagging (ingest.py)
-  - _filter_uningested (scaffold.py)
+  - filter_uningested (scaffold.py)
 """
 import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.cli.scaffold import _filter_uningested
+from proto_pipe.cli.scaffold import filter_uningested
 from proto_pipe.io.db import get_column_types, init_ingest_state
 from proto_pipe.io.ingest import (
     ingest_directory,
@@ -607,14 +607,14 @@ class TestIngestDirectoryScenarioB:
 
 
 # ---------------------------------------------------------------------------
-# _filter_uningested
+# filter_uningested
 # ---------------------------------------------------------------------------
 
 class TestFilterUningested:
 
     def test_returns_all_files_when_db_missing(self, tmp_path):
         files = ["sales_jan.csv", "sales_feb.csv"]
-        result = _filter_uningested(files, str(tmp_path / "nonexistent.db"))
+        result = filter_uningested(files, str(tmp_path / "nonexistent.db"))
         assert result == files
 
     def test_hides_ok_files(self, tmp_path):
@@ -629,7 +629,7 @@ class TestFilterUningested:
         conn.close()
 
         files = ["sales_jan.csv", "sales_feb.csv"]
-        result = _filter_uningested(files, pipeline_db)
+        result = filter_uningested(files, pipeline_db)
         assert "sales_jan.csv" not in result
         assert "sales_feb.csv" in result
 
@@ -644,7 +644,7 @@ class TestFilterUningested:
         """)
         conn.close()
 
-        result = _filter_uningested(["sales_jan.csv"], pipeline_db)
+        result = filter_uningested(["sales_jan.csv"], pipeline_db)
         assert "sales_jan.csv" in result
 
     def test_keeps_files_not_in_log(self, tmp_path):
@@ -653,7 +653,7 @@ class TestFilterUningested:
         init_ingest_state(conn)
         conn.close()
 
-        result = _filter_uningested(["brand_new.csv"], pipeline_db)
+        result = filter_uningested(["brand_new.csv"], pipeline_db)
         assert "brand_new.csv" in result
 
     def test_returns_empty_when_all_ingested(self, tmp_path):
@@ -668,7 +668,7 @@ class TestFilterUningested:
             """)
         conn.close()
 
-        result = _filter_uningested(["a.csv", "b.csv", "c.csv"], pipeline_db)
+        result = filter_uningested(["a.csv", "b.csv", "c.csv"], pipeline_db)
         assert result == []
 
     def test_empty_input_returns_empty(self, tmp_path):
@@ -676,7 +676,7 @@ class TestFilterUningested:
         conn = duckdb.connect(pipeline_db)
         init_ingest_state(conn)
         conn.close()
-        result = _filter_uningested([], pipeline_db)
+        result = filter_uningested([], pipeline_db)
         assert result == []
 
 

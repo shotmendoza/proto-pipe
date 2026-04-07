@@ -5,8 +5,8 @@ Covers:
 - _suggest_pattern (filename pattern suggestion)
 - _scan_incoming (directory scanning)
 - _similar_columns (fuzzy column matching)
-- _get_param_suggestions (history-based suggestions)
-- _record_param_history (storing param usage)
+- get_param_suggestions (history-based suggestions)
+- record_param_history (storing param usage)
 - _sort_views (topological sorting)
 - _build_sql_scaffold (SQL scaffold generation)
 """
@@ -18,13 +18,12 @@ import pytest
 from proto_pipe.cli.scaffold import (
     _suggest_pattern,
     _scan_incoming,
+    record_param_history,
+    get_param_suggestions,
     _similar_columns,
-    _get_param_suggestions,
-    _record_param_history,
     _sort_views,
-    _build_rich_sql_scaffold,
+    build_rich_sql_scaffold,
 )
-
 
 # ---------------------------------------------------------------------------
 # _suggest_pattern
@@ -131,7 +130,7 @@ class TestSimilarColumns:
 
 
 # ---------------------------------------------------------------------------
-# _record_param_history and _get_param_suggestions
+# record_param_history and get_param_suggestions
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
@@ -155,7 +154,7 @@ def history_conn(tmp_path):
 
 class TestCheckParamsHistory:
     def test_record_stores_params(self, history_conn):
-        _record_param_history(
+        record_param_history(
             history_conn,
             check_name="range_check",
             report_name="sales_validation",
@@ -171,7 +170,7 @@ class TestCheckParamsHistory:
         assert param_map["max_val"] == "500"
 
     def test_record_skips_none_values(self, history_conn):
-        _record_param_history(
+        record_param_history(
             history_conn,
             check_name="range_check",
             report_name="sales_validation",
@@ -186,33 +185,33 @@ class TestCheckParamsHistory:
         assert "min_val" in param_names
 
     def test_get_suggestions_empty_history(self, history_conn):
-        result = _get_param_suggestions(
+        result = get_param_suggestions(
             history_conn, "range_check", "col", ["price", "quantity"]
         )
         assert result == []
 
     def test_get_suggestions_returns_similar_columns(self, history_conn):
-        _record_param_history(
+        record_param_history(
             history_conn,
             check_name="range_check",
             report_name="sales_validation",
             table_name="sales",
             params={"col": "price"},
         )
-        result = _get_param_suggestions(
+        result = get_param_suggestions(
             history_conn, "range_check", "col", ["carrier_price", "quantity", "region"]
         )
         assert "carrier_price" in result
 
     def test_get_suggestions_no_similar_columns(self, history_conn):
-        _record_param_history(
+        record_param_history(
             history_conn,
             check_name="range_check",
             report_name="sales_validation",
             table_name="sales",
             params={"col": "price"},
         )
-        result = _get_param_suggestions(
+        result = get_param_suggestions(
             history_conn, "range_check", "col", ["sku", "warehouse", "region"]
         )
         assert result == []
@@ -220,14 +219,14 @@ class TestCheckParamsHistory:
     def test_get_suggestions_deduplicates(self, history_conn):
         # Record same param twice
         for _ in range(2):
-            _record_param_history(
+            record_param_history(
                 history_conn,
                 check_name="range_check",
                 report_name="sales_validation",
                 table_name="sales",
                 params={"col": "price"},
             )
-        result = _get_param_suggestions(
+        result = get_param_suggestions(
             history_conn, "range_check", "col", ["price", "carrier_price"]
         )
         assert len(result) == len(set(result))
@@ -336,7 +335,7 @@ class TestBuildSqlScaffold:
         rep_cfg, src_cfg = self._make_configs([
             {"table": "sales", "primary_key": "order_id"}
         ])
-        sql = _build_rich_sql_scaffold(
+        sql = build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation"],
             rep_cfg,
@@ -350,7 +349,7 @@ class TestBuildSqlScaffold:
             {"table": "sales", "primary_key": "order_id"},
             {"table": "customers", "primary_key": "order_id"},
         ])
-        sql = _build_rich_sql_scaffold(
+        sql = build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation", "customers_validation"],
             rep_cfg,
@@ -364,7 +363,7 @@ class TestBuildSqlScaffold:
             {"table": "sales", "primary_key": "order_id"},
             {"table": "inventory", "primary_key": "sku"},
         ])
-        sql = _build_rich_sql_scaffold(
+        sql = build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation", "inventory_validation"],
             rep_cfg,
@@ -378,7 +377,7 @@ class TestBuildSqlScaffold:
             {"table": "sales", "primary_key": None},
             {"table": "customers", "primary_key": None},
         ])
-        sql = _build_rich_sql_scaffold(
+        sql = build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation", "customers_validation"],
             rep_cfg,
@@ -391,7 +390,7 @@ class TestBuildSqlScaffold:
         rep_cfg, src_cfg = self._make_configs([
             {"table": "sales", "primary_key": "order_id"}
         ])
-        sql = _build_rich_sql_scaffold(
+        sql = build_rich_sql_scaffold(
             "carrier_a",
             ["sales_validation"],
             rep_cfg,
@@ -403,7 +402,7 @@ class TestBuildSqlScaffold:
         rep_cfg, src_cfg = self._make_configs([
             {"table": "sales", "primary_key": "order_id"}
         ])
-        sql = _build_rich_sql_scaffold(
+        sql = build_rich_sql_scaffold(
             "my_deliverable",
             ["sales_validation"],
             rep_cfg,
@@ -412,6 +411,6 @@ class TestBuildSqlScaffold:
         assert "my_deliverable" in sql
 
     def test_empty_selected_reports_returns_placeholder(self):
-        sql = _build_rich_sql_scaffold("carrier_a", [], {}, {})
+        sql = build_rich_sql_scaffold("carrier_a", [], {}, {})
         assert "SELECT" in sql
         assert "<table>" in sql
