@@ -53,7 +53,6 @@ from proto_pipe.io.migration import auto_migrate
 from proto_pipe.pipelines.flagging import (
     FlagRecord,
     write_source_flags,
-    compute_row_hash,
     compute_row_hash_sql,
 )
 
@@ -207,8 +206,16 @@ def ingest_directory(
     run_checks: bool = False,
     check_registry=None,
     report_registry=None,
+    on_file_start: "Callable[[str], None] | None" = None,
+    on_file_done: "Callable[[str, dict], None] | None" = None,
 ) -> dict:
-    """Scan a directory, match files to source definitions, load into DuckDB."""
+    """Scan a directory, match files to source definitions, load into DuckDB.
+
+    :param on_file_start: Optional callback called with the filename before
+        each file is processed. Used by the CLI progress display.
+    :param on_file_done:  Optional callback called with (filename, result)
+        after each file completes. Used by the CLI progress display.
+    """
     from proto_pipe.io.db import (
         init_ingest_state as _init_ingest_state,
         already_ingested as _already_ingested,
@@ -248,8 +255,14 @@ def ingest_directory(
             summary[path.name] = {"status": "skipped", "message": "already ingested"}
             continue
 
+        if on_file_start:
+            on_file_start(path.name)
+
         result = ingest_single_file(conn, path, source, mode=mode)
         summary[path.name] = result
+
+        if on_file_done:
+            on_file_done(path.name, result)
 
         if (
             run_checks
@@ -376,14 +389,21 @@ def _handle_duplicates(
                 chunk[primary_key].tolist(),
             )
             rows_to_insert.extend(chunk.itertuples(index=False, name=None))
-            # Update source_pass only when hash changed
-            for _, row in chunk.iterrows():
-                pk_str = str(row[primary_key])
-                row_hash = compute_row_hash(row.to_dict(), comparable_cols)
-                if existing_hashes.get(pk_str) != row_hash:
+            # Compute all hashes in one DuckDB query — replaces per-row Python calls.
+            hash_expr = (
+                compute_row_hash_sql(comparable_cols)
+                if comparable_cols else "md5('')"
+            )
+            chunk_hashes = conn.execute(f"""
+                SELECT CAST("{primary_key}" AS VARCHAR) as pk_value,
+                       {hash_expr} as row_hash
+                FROM chunk
+            """).df()
+            for _, hr in chunk_hashes.iterrows():
+                if existing_hashes.get(hr["pk_value"]) != hr["row_hash"]:
                     pass_records.append({
-                        "pk_value": pk_str,
-                        "row_hash": row_hash,
+                        "pk_value": hr["pk_value"],
+                        "row_hash": hr["row_hash"],
                         "source_file": source_file,
                     })
             continue
@@ -396,13 +416,22 @@ def _handle_duplicates(
                 print(f"[skip] {skipped} row(s) already in source_pass — skipped")
             rows_to_insert.extend(new_rows.itertuples(index=False, name=None))
             total_skipped += skipped
-            for _, row in new_rows.iterrows():
-                pk_str = str(row[primary_key])
-                pass_records.append({
-                    "pk_value": pk_str,
-                    "row_hash": compute_row_hash(row.to_dict(), comparable_cols),
-                    "source_file": source_file,
-                })
+            if not new_rows.empty:
+                hash_expr = (
+                    compute_row_hash_sql(comparable_cols)
+                    if comparable_cols else "md5('')"
+                )
+                new_row_hashes = conn.execute(f"""
+                    SELECT CAST("{primary_key}" AS VARCHAR) as pk_value,
+                           {hash_expr} as row_hash
+                    FROM new_rows
+                """).df()
+                for _, hr in new_row_hashes.iterrows():
+                    pass_records.append({
+                        "pk_value": hr["pk_value"],
+                        "row_hash": hr["row_hash"],
+                        "source_file": source_file,
+                    })
             continue
 
         # ── flag ──────────────────────────────────────────────────────────
@@ -411,10 +440,19 @@ def _handle_duplicates(
                 rows_to_insert.extend(chunk.itertuples(index=False, name=None))
                 continue
 
+            # Compute all hashes in one DuckDB query — replaces per-row Python calls.
+            hash_expr = compute_row_hash_sql(comparable_cols)
+            chunk_hashes = conn.execute(f"""
+                SELECT CAST("{primary_key}" AS VARCHAR) as pk_value,
+                       {hash_expr} as row_hash
+                FROM chunk
+            """).df()
+            pk_to_hash = dict(zip(chunk_hashes["pk_value"], chunk_hashes["row_hash"]))
+
             conflict_pks: list[str] = []
             for _, row in chunk.iterrows():
                 pk_str = str(row[primary_key])
-                row_hash = compute_row_hash(row.to_dict(), comparable_cols)
+                row_hash = pk_to_hash.get(pk_str, "")
 
                 if pk_str not in existing_hashes:
                     # New row — insert and track in source_pass
@@ -930,13 +968,24 @@ def ingest_single_file(
                 c for c in df.columns
                 if not c.startswith("_") and c != primary_key
             ]
+            # Compute all row hashes in one DuckDB query instead of per-row Python
+            # calls — critical for large first ingests (e.g. 650k rows).
+            hash_expr = (
+                compute_row_hash_sql(comparable_cols)
+                if comparable_cols else "md5('')"
+            )
+            hashes_df = conn.execute(f"""
+                SELECT CAST("{primary_key}" AS VARCHAR) as pk_value,
+                       {hash_expr} as row_hash
+                FROM df
+            """).df()
             pass_records = [
                 {
-                    "pk_value": str(row[primary_key]),
-                    "row_hash": compute_row_hash(row.to_dict(), comparable_cols),
+                    "pk_value": row["pk_value"],
+                    "row_hash": row["row_hash"],
                     "source_file": source_file,
                 }
-                for _, row in df.iterrows()
+                for _, row in hashes_df.iterrows()
             ]
             bulk_upsert_source_pass(conn, table, pass_records)
             # Invariant: a row accepted into source_pass must not remain in

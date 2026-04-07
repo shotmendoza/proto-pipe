@@ -914,3 +914,68 @@ class DeliverableConfigPrompter:
             report_entries.append(entry)
 
         return report_entries
+
+
+# ---------------------------------------------------------------------------
+# IngestProgressReporter — rich spinner for vp ingest
+# ---------------------------------------------------------------------------
+
+class IngestProgressReporter:
+    """Rich progress display for vp ingest. Lives in prompts.py (UI layer).
+
+    Displays a spinner with the current filename and elapsed time while each
+    file is being processed. Uses transient=True so the spinner clears when
+    done, leaving the existing [ok]/[fail] print lines as the primary output.
+
+    Usage in cli/data.py:
+        with IngestProgressReporter() as reporter:
+            summary = ingest_directory(
+                ...,
+                on_file_start=reporter.on_file_start,
+                on_file_done=reporter.on_file_done,
+            )
+
+    No rich imports in ingest.py — callbacks are plain callables, zero
+    coupling between the business logic and the display layer.
+    """
+
+    def __init__(self) -> None:
+        self._progress = None
+        self._task = None
+        self._ok = 0
+        self._failed = 0
+        self._skipped = 0
+
+    def __enter__(self) -> "IngestProgressReporter":
+        from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            transient=True,
+        )
+        self._progress.start()
+        self._task = self._progress.add_task("Waiting for files...", total=None)
+        return self
+
+    def __exit__(self, *_args) -> None:
+        if self._progress:
+            self._progress.stop()
+
+    def on_file_start(self, filename: str) -> None:
+        """Called by ingest_directory before each file is processed."""
+        if self._progress is not None and self._task is not None:
+            self._progress.update(
+                self._task,
+                description=f"[cyan]{filename}[/cyan]",
+            )
+
+    def on_file_done(self, filename: str, result: dict) -> None:
+        """Called by ingest_directory after each file completes."""
+        status = result.get("status", "")
+        if status == "ok":
+            self._ok += 1
+        elif status == "failed":
+            self._failed += 1
+        elif status == "skipped":
+            self._skipped += 1

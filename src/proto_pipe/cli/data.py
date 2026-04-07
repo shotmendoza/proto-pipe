@@ -47,6 +47,7 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     from proto_pipe.io.ingest import ingest_directory
     from proto_pipe.checks.registry import check_registry, report_registry
     from proto_pipe.io.db import write_pipeline_events
+    from proto_pipe.cli.prompts import IngestProgressReporter
 
     inc_dir = config_path_or_override("incoming_dir", incoming_dir)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -60,15 +61,18 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
         register_from_config(rep_cfg, cr, rr)
 
     click.echo(f"\nIngesting from: {inc_dir}")
-    summary = ingest_directory(
-        inc_dir,
-        _config["sources"],
-        p_db,
-        mode=mode,
-        run_checks=validate,
-        check_registry=cr,
-        report_registry=rr,
-    )
+    with IngestProgressReporter() as reporter:
+        summary = ingest_directory(
+            inc_dir,
+            _config["sources"],
+            p_db,
+            mode=mode,
+            run_checks=validate,
+            check_registry=cr,
+            report_registry=rr,
+            on_file_start=reporter.on_file_start,
+            on_file_done=reporter.on_file_done,
+        )
 
     ok = sum(1 for v in summary.values() if v["status"] == "ok")
     skipped = sum(1 for v in summary.values() if v["status"] == "skipped")
