@@ -823,3 +823,71 @@ class TestCorrectionRoundTrip:
         # After correction: ORD-002 should now appear in view (views are not materialised)
         df_after = conn_with_sales.execute("SELECT * FROM positive_sales").df()
         assert "ORD-002" in df_after["order_id"].values
+
+
+# ===========================================================================
+# CLAUDE.md behavioral guarantee tests
+# ===========================================================================
+
+class TestAlreadyIngestedCorrectionStatus:
+    """already_ingested returns False for correction status.
+
+    CLAUDE.md guarantee:
+      'ingest_state status values: ok | failed | skipped | correction'
+      Only status='ok' blocks re-ingest.
+    """
+
+    def test_returns_false_after_correction_log(self, conn_with_ingest_log):
+        log_ingest(conn_with_ingest_log, "sales_jan.csv", "sales", "correction")
+        assert already_ingested(conn_with_ingest_log, "sales_jan.csv") is False, (
+            "Files with status='correction' must not be blocked — "
+            "only status='ok' prevents re-ingest"
+        )
+
+
+class TestCorrectionTargetsReportTableNotSourceTable:
+    """Corrections upsert to the report table, not the source table.
+
+    CLAUDE.md guarantee:
+      'Only difference: corrections upsert to the report table, not the
+       source table. Does not block deliverables.'
+    """
+
+    def test_correction_updates_report_table_not_source(self, conn_with_sales, tmp_path):
+        conn_with_sales.execute(
+            "CREATE TABLE sales_report AS SELECT * FROM sales"
+        )
+        flag_id = flag_id_for("ORD-002")
+        conn_with_sales.execute("""
+            INSERT INTO source_block (id, table_name, check_name, pk_value,
+                                      reason, flagged_at)
+            VALUES (?, 'sales_report', 'duplicate_conflict', 'ORD-002',
+                    'changed value', CURRENT_TIMESTAMP)
+            ON CONFLICT (id) DO NOTHING
+        """, [flag_id])
+
+        corrections = pd.DataFrame([{
+            "_flag_id": flag_id,
+            "_flag_reason": "changed value",
+            "order_id": "ORD-002",
+            "price": 999.0,
+            "region": "APAC",
+            "status": "active",
+        }])
+        correction_path = str(tmp_path / "corrections.csv")
+        corrections.to_csv(correction_path, index=False)
+
+        import_corrections(conn_with_sales, "sales_report", correction_path, "order_id")
+
+        report_price = conn_with_sales.execute(
+            "SELECT price FROM sales_report WHERE order_id = 'ORD-002'"
+        ).fetchone()[0]
+        assert report_price == 999.0, "Report table must be updated by the correction"
+
+        source_price = conn_with_sales.execute(
+            "SELECT price FROM sales WHERE order_id = 'ORD-002'"
+        ).fetchone()[0]
+        assert source_price == -50.0, (
+            "Source table must NOT be modified by corrections"
+        )
+

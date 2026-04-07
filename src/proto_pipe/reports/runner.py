@@ -480,6 +480,9 @@ def run_report(
 
     conn = duckdb.connect(pipeline_db)
     try:
+        from proto_pipe.io.db import ensure_pipeline_tables
+        ensure_pipeline_tables(conn)
+
         # 1. Compute check_set_hash
         check_entries = report_config.get("checks", [])
         current_hash = compute_check_set_hash(check_entries, check_registry)

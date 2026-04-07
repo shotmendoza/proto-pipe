@@ -10,7 +10,7 @@
 # Run `vp config set <key> <value>` to update a value without editing this file.
 #
 # All paths can be absolute or relative. Relative paths are resolved from
-# the directory where you run `vp`, not from where this file lives.
+# the directory where this file lives, not from your working directory.
 # Using absolute paths (e.g. /Volumes/SharedDrive/...) avoids ambiguity.
 #
 # Keys marked [required] have defaults that will likely be wrong
@@ -33,22 +33,18 @@ paths:
 
   # [optional] Path to sources_config.yaml.
   # Defines which files to ingest and what tables they map to.
-  # Only change this if your config folder lives somewhere other than config/.
   sources_config: "config/sources_config.yaml"
 
   # [optional] Path to reports_config.yaml.
   # Defines validation checks and which tables they run against.
-  # Only change this if your config folder lives somewhere other than config/.
   reports_config: "config/reports_config.yaml"
 
   # [optional] Path to deliverables_config.yaml.
   # Defines output files — which reports to include, format, filters.
-  # Only change this if your config folder lives somewhere other than config/.
   deliverables_config: "config/deliverables_config.yaml"
 
   # [optional] Path to views_config.yaml.
   # Defines shared SQL views used across deliverables.
-  # Only change this if your config folder lives somewhere other than config/.
   views_config: "config/views_config.yaml"
 
   # [optional] Path to the main DuckDB database file.
@@ -59,17 +55,18 @@ paths:
   # [optional] Path to the watermark DuckDB database file.
   # Tracks the last successful validation run per report so only new rows
   # are checked on subsequent runs. Created automatically by `vp db-init`.
-  # Safe to leave as-is.
   watermark_db: "data/watermarks.db"
 
-# multi_select_params: true
-#
-# When true, vp new-report will show a multi-select checkbox for
+# [optional] When true, vp new source will show a multi-select checkbox for
 # column parameters on eligible checks (those that return pd.Series[bool]
-# with str-typed column params). Each selected column results in a
-# separate check execution. Set to false to always use single-select.
+# with str-typed column params). Each selected column results in a separate
+# check execution. Set to false to always use single-select.
 multi_select_params: true
 
-macros_dir: "macros"  # Name of the directory containing custom SQL macros.
+# [optional] Directory containing custom SQL macro files.
+# Macros are available to all deliverable SQL files.
+macros_dir: "macros"
 
-custom_checks_module: "checks/my_checks.py"  # path to your custom checks file
+# [optional] Path to your custom checks file.
+# Define your own check functions here and they will be loaded automatically.
+custom_checks_module: "checks/my_checks.py"
