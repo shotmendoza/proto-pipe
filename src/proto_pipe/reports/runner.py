@@ -446,7 +446,18 @@ def run_report(
             return {"report": report_name, "status": "skipped"}
 
         all_names = report_config.get("resolved_checks", [])
-        check_names = [n for n in all_names if check_registry.get_kind(n) == "check"]
+        # Guard get_kind — unregistered names must reach run_check_safe rather
+        # than raising here. run_check_safe catches the ValueError and returns
+        # CheckOutcome(status="error"). Silently including them is correct:
+        # the runner sees every name in resolved_checks, and failures are
+        # surfaced per-check rather than aborting the whole report.
+        check_names = []
+        for n in all_names:
+            try:
+                if check_registry.get_kind(n) == "check":
+                    check_names.append(n)
+            except ValueError:
+                check_names.append(n)  # run_check_safe will handle it
         context = {"df": df}
         results = run_checks(check_names, check_registry, context, parallel=parallel_checks)
 

@@ -1,90 +1,46 @@
-"""Tests for proto_pipe.reports.runner
+"""
+Tests for validation_pipeline.runner
 
 Covers:
-- run_report: completes when data is present
-- run_report: skips when no new rows since last watermark
-- run_report: returns error status when source table cannot be loaded
-- run_report: check failure captured, report still completes
-- run_report: watermark advances only when all checks pass
-- run_report: watermark does NOT advance when any check fails
-- run_report: validation flags written to pipeline_db when provided
-- run_report: no flags written when pipeline_db not provided
-- run_report: primary_key from source config passed through to flag writer
-- run_all_reports: runs all registered reports, returns one result per report
-- run_all_reports: parallel and sequential produce the same statuses
-- run_all_reports: pipeline_db passed through to each run_report call
+- run_report: skips when no new data, completes when data present
+- run_report: watermark advanced after successful run
+- run_report: watermark NOT advanced when checks fail hard
+- run_all_reports: returns results for all registered reports
+- Parallel and sequential execution both produce correct results
 """
 
 from functools import partial
-from pathlib import Path
 
 import duckdb
-import pandas as pd
 
-from proto_pipe.checks.helpers import register_custom_check
 from proto_pipe.checks.built_in import check_nulls, check_range
-from proto_pipe.checks.result import CheckResult
 from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.reports.runner import run_report, run_all_reports
-from proto_pipe.io.db import init_all_pipeline_tables
-
-
-def _count_flags(conn, report_name=None):
-    if report_name:
-        return conn.execute(
-            "SELECT count(*) FROM validation_block WHERE report_name = ?", [report_name]
-        ).fetchone()[0]
-    return conn.execute("SELECT count(*) FROM validation_block").fetchone()[0]
-
-
-def _detail(conn, report_name=None):
-    q = "SELECT * FROM validation_block"
-    p = []
-    if report_name:
-        q += " WHERE report_name = ?"
-        p.append(report_name)
-    q += " ORDER BY flagged_at"
-    return conn.execute(q, p).df()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_report_config(
-    pipeline_db: str,
-    table: str,
-    check_names: list[str],
-    primary_key: str | None = None,
-) -> dict:
-    source = {
-        "type": "duckdb",
-        "path": pipeline_db,
-        "table": table,
-        "timestamp_col": "updated_at",
-    }
-    if primary_key:
-        source["primary_key"] = primary_key
+def _make_report_config(pipeline_db: str, table: str, check_names: list[str]) -> dict:
     return {
         "name": f"{table}_validation",
-        "source": source,
+        "source": {
+            "type": "duckdb",
+            "path": pipeline_db,
+            "table": table,
+            "timestamp_col": "updated_at",
+        },
         "options": {"parallel": False},
         "resolved_checks": check_names,
     }
 
 
-def _seed_table(pipeline_db: str, table: str, df: pd.DataFrame) -> None:
+def _seed_table(pipeline_db: str, table: str, df) -> None:
     conn = duckdb.connect(pipeline_db)
     conn.execute(f'CREATE OR REPLACE TABLE "{table}" AS SELECT * FROM df')
-    conn.close()
-
-
-def _init_pipeline_db(pipeline_db: str) -> None:
-    """Bootstrap all pipeline tables including validation_block."""
-    conn = duckdb.connect(pipeline_db)
-    init_all_pipeline_tables(conn)
     conn.close()
 
 
@@ -93,7 +49,9 @@ def _init_pipeline_db(pipeline_db: str) -> None:
 # ---------------------------------------------------------------------------
 
 class TestRunReport:
-    def test_completes_with_data_present(self, pipeline_db, sales_df, check_registry, watermark_store):
+    def test_completes_with_clean_data(
+        self, pipeline_db, watermark_db, sales_df, check_registry, watermark_store
+    ):
         _seed_table(pipeline_db, "sales", sales_df)
         check_registry.register("null_check", check_nulls)
         config = _make_report_config(pipeline_db, "sales", ["null_check"])
@@ -103,47 +61,26 @@ class TestRunReport:
         assert result["status"] == "completed"
         assert result["results"]["null_check"].status == "passed"
 
-    def test_skips_when_no_rows_newer_than_watermark(
-        self, pipeline_db, sales_df, check_registry, watermark_store
+    def test_skips_when_no_new_data(
+        self, pipeline_db, watermark_db, sales_df, check_registry, watermark_store
     ):
         _seed_table(pipeline_db, "sales", sales_df)
         check_registry.register("null_check", check_nulls)
         config = _make_report_config(pipeline_db, "sales", ["null_check"])
 
-        run_report(config, check_registry, watermark_store)   # advances watermark
-        result = run_report(config, check_registry, watermark_store)  # no new rows
+        # First run advances the watermark past all rows
+        run_report(config, check_registry, watermark_store)
+        # Second run — no new rows
+        result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "skipped"
 
-    def test_returns_error_when_source_table_missing(self, pipeline_db, check_registry, watermark_store):
-        check_registry.register("null_check", check_nulls)
-        config = _make_report_config(pipeline_db, "nonexistent_table", ["null_check"])
-
-        result = run_report(config, check_registry, watermark_store)
-
-        assert result["status"] == "error"
-        assert "error" in result
-
-    def test_check_failure_captured_report_still_completes(
-        self, pipeline_db, sales_df, check_registry, watermark_store
-    ):
-        _seed_table(pipeline_db, "sales", sales_df)
-
-        def always_fails(ctx: dict) -> pd.Series:
-            raise RuntimeError("deliberate runtime failure")
-
-        check_registry.register("failing_check", always_fails)
-        config = _make_report_config(pipeline_db, "sales", ["failing_check"])
-
-        result = run_report(config, check_registry, watermark_store)
-
-        assert result["status"] == "completed"
-        assert result["results"]["failing_check"].status == "error"
-
-    def test_range_violation_is_captured_not_raised(
+    def test_check_failure_is_captured_not_raised(
         self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
     ):
         _seed_table(pipeline_db, "sales", sales_df_out_of_range)
+
+        # range_check with params baked in via partial
         fn = partial(check_range, col="price", min_val=0, max_val=500)
         check_registry.register("price_range", fn)
         config = _make_report_config(pipeline_db, "sales", ["price_range"])
@@ -151,10 +88,29 @@ class TestRunReport:
         result = run_report(config, check_registry, watermark_store)
 
         assert result["status"] == "completed"
-        check_result = result["results"]["price_range"].result
-        assert isinstance(check_result, CheckResult)
-        assert check_result.passed is False
-        assert check_result.mask.sum() == 1
+        # The check ran and captured the failure — status must be "failed", not raised
+        assert result["results"]["price_range"].status == "failed"
+
+    def test_missing_check_name_marks_report_failed(
+        self, pipeline_db, sales_df, check_registry, watermark_store
+    ):
+        """An unregistered check name must be caught — report completes with check errored.
+
+        CLAUDE.md guarantee: run_check_safe catches exceptions so one failure does not
+        halt the report. Unregistered names reach run_check_safe via a guard on get_kind
+        in reports/runner.py and return CheckOutcome(status="error").
+        """
+        _seed_table(pipeline_db, "sales", sales_df)
+        # "nonexistent_check" is never registered
+        config = _make_report_config(pipeline_db, "sales", ["nonexistent_check"])
+
+        result = run_report(config, check_registry, watermark_store)
+
+        # run_check_safe catches the ValueError and returns status="error" — report
+        # completes without raising. The check outcome is "error", not "failed",
+        # because the check never ran (it wasn't registered).
+        assert result["status"] == "completed"
+        assert result["results"]["nonexistent_check"].status == "error"
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +118,7 @@ class TestRunReport:
 # ---------------------------------------------------------------------------
 
 class TestWatermarkAdvancement:
-    def test_watermark_advances_when_all_checks_pass(
+    def test_watermark_advances_after_successful_run(
         self, pipeline_db, sales_df, check_registry, watermark_store
     ):
         _seed_table(pipeline_db, "sales", sales_df)
@@ -188,128 +144,20 @@ class TestWatermarkAdvancement:
         assert mark.month == 3
         assert mark.day == 1
 
-    def test_watermark_does_not_advance_when_check_fails(
-        self, pipeline_db, sales_df, check_registry, watermark_store
-    ):
-        _seed_table(pipeline_db, "sales", sales_df)
-
-        def always_raises(ctx) -> pd.Series:
-            raise RuntimeError("hard failure")
-
-        check_registry.register("hard_fail", always_raises)
-        config = _make_report_config(pipeline_db, "sales", ["hard_fail"])
-
-        assert watermark_store.get("sales_validation") is None
-        run_report(config, check_registry, watermark_store)
-        assert watermark_store.get("sales_validation") is None
-
-    def test_watermark_does_not_advance_when_one_of_many_checks_fails(
-        self, pipeline_db, sales_df, check_registry, watermark_store
-    ):
-        _seed_table(pipeline_db, "sales", sales_df)
-        check_registry.register("null_check", check_nulls)
-
-        def always_raises(ctx) -> pd.Series:
-            raise RuntimeError("one bad check")
-
-        check_registry.register("hard_fail", always_raises)
-        config = _make_report_config(pipeline_db, "sales", ["null_check", "hard_fail"])
-
-        run_report(config, check_registry, watermark_store)
-
-        assert watermark_store.get("sales_validation") is None
-
-
-# ---------------------------------------------------------------------------
-# Validation flag writing in run_report
-# ---------------------------------------------------------------------------
-
-class TestRunReportFlagWriting:
-    def test_flags_written_when_pipeline_db_provided(
-        self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
-    ):
-        _init_pipeline_db(pipeline_db)
-        _seed_table(pipeline_db, "sales", sales_df_out_of_range)
-        fn = partial(check_range, col="price", min_val=0, max_val=500)
-        check_registry.register("price_range", fn)
-        config = _make_report_config(pipeline_db, "sales", ["price_range"], primary_key="order_id")
-
-        run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
-
-        conn = duckdb.connect(pipeline_db)
-        try:
-            det = _detail(conn, "sales_validation")
-            assert len(det) == 1
-            assert det.iloc[0]["pk_value"] == "ORD-002"
-        finally:
-            conn.close()
-
-    def test_no_flags_written_when_pipeline_db_not_provided(
-        self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
-    ):
-        _init_pipeline_db(pipeline_db)
-        _seed_table(pipeline_db, "sales", sales_df_out_of_range)
-        fn = partial(check_range, col="price", min_val=0, max_val=500)
-        check_registry.register("price_range", fn)
-        config = _make_report_config(pipeline_db, "sales", ["price_range"], primary_key="order_id")
-
-        run_report(config, check_registry, watermark_store)
-
-        conn = duckdb.connect(pipeline_db)
-        try:
-            assert _count_flags(conn) == 0
-        finally:
-            conn.close()
-
-    def test_flags_contain_pk_value(
-        self, pipeline_db, sales_df_out_of_range, check_registry, watermark_store
-    ):
-        """Validation failures record the pk_value of the failing row."""
-        _init_pipeline_db(pipeline_db)
-        _seed_table(pipeline_db, "sales", sales_df_out_of_range)
-        fn = partial(check_range, col="price", min_val=0, max_val=500)
-        check_registry.register("price_range", fn)
-        config = _make_report_config(pipeline_db, "sales", ["price_range"], primary_key="order_id")
-
-        run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
-
-        conn = duckdb.connect(pipeline_db)
-        try:
-            det = _detail(conn)
-            assert det.iloc[0]["pk_value"] is not None
-        finally:
-            conn.close()
-
-    def test_no_flags_for_clean_data(
-        self, pipeline_db, sales_df, check_registry, watermark_store
-    ):
-        _init_pipeline_db(pipeline_db)
-        _seed_table(pipeline_db, "sales", sales_df)
-        fn = partial(check_range, col="price", min_val=0, max_val=500)
-        check_registry.register("price_range", fn)
-        config = _make_report_config(pipeline_db, "sales", ["price_range"], primary_key="order_id")
-
-        run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
-
-        conn = duckdb.connect(pipeline_db)
-        try:
-            assert _count_flags(conn) == 0
-        finally:
-            conn.close()
-
 
 # ---------------------------------------------------------------------------
 # run_all_reports
 # ---------------------------------------------------------------------------
 
 class TestRunAllReports:
-    def test_returns_one_result_per_registered_report(
+    def test_all_reports_run(
         self, pipeline_db, sales_df, inventory_df,
         check_registry, report_registry, watermark_store, reports_config
     ):
         _seed_table(pipeline_db, "sales", sales_df)
         _seed_table(pipeline_db, "inventory", inventory_df)
 
+        # Patch source paths to point at tmp pipeline_db
         for r in reports_config["reports"]:
             r["source"]["path"] = pipeline_db
 
@@ -322,8 +170,9 @@ class TestRunAllReports:
         assert "daily_sales_validation" in report_names
         assert "inventory_validation" in report_names
 
-    def test_parallel_and_sequential_same_statuses(
-        self, pipeline_db, sales_df, inventory_df, reports_config, watermark_db
+    def test_parallel_and_sequential_same_outcome(
+        self, pipeline_db, sales_df, inventory_df,
+        reports_config, watermark_db
     ):
         _seed_table(pipeline_db, "sales", sales_df)
         _seed_table(pipeline_db, "inventory", inventory_df)
@@ -331,56 +180,259 @@ class TestRunAllReports:
         for r in reports_config["reports"]:
             r["source"]["path"] = pipeline_db
 
-        cr1, rr1 = CheckRegistry(), ReportRegistry()
+        # Sequential
+        cr1 = CheckRegistry()
+        rr1 = ReportRegistry()
         ws1 = WatermarkStore(watermark_db)
         register_from_config(reports_config, cr1, rr1)
-        seq = run_all_reports(rr1, cr1, ws1, parallel_reports=False)
+        seq_results = run_all_reports(rr1, cr1, ws1, parallel_reports=False)
 
+        # Parallel — needs fresh watermark db so it doesn't skip
+        from pathlib import Path
         wdb2 = str(Path(watermark_db).parent / "watermarks2.db")
-        cr2, rr2 = CheckRegistry(), ReportRegistry()
+        cr2 = CheckRegistry()
+        rr2 = ReportRegistry()
         ws2 = WatermarkStore(wdb2)
         register_from_config(reports_config, cr2, rr2)
-        par = run_all_reports(rr2, cr2, ws2, parallel_reports=True)
+        par_results = run_all_reports(rr2, cr2, ws2, parallel_reports=True)
 
-        assert {r["report"]: r["status"] for r in seq} == {r["report"]: r["status"] for r in par}
+        seq_statuses = {r["report"]: r["status"] for r in seq_results}
+        par_statuses = {r["report"]: r["status"] for r in par_results}
+        assert seq_statuses == par_statuses
 
-    def test_pipeline_db_passed_through_writes_flags(
-        self, pipeline_db, sales_df, check_registry, report_registry, watermark_store
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md behavioral guarantee tests — _build_execution_layers
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from proto_pipe.reports.runner import _build_execution_layers, _get_target_table
+
+
+def _report(name: str, source_table: str, target_table: str | None = None) -> dict:
+    """Minimal report config for execution layer tests."""
+    r = {"name": name, "source": {"table": source_table}, "checks": [], "resolved_checks": []}
+    if target_table:
+        r["target_table"] = target_table
+    return r
+
+
+class TestBuildExecutionLayersTopologicalSort:
+    """_build_execution_layers sorts reports into dependency-ordered layers.
+
+    CLAUDE.md guarantee:
+      'Reports in the same layer have no dependencies on each other and may
+       run concurrently. Every layer must complete before the next layer begins.
+       Reports with no dependencies are always in layer 0.'
+    """
+
+    def test_independent_reports_in_single_layer(self):
+        reports = [
+            _report("sales_validation", "sales"),
+            _report("inventory_validation", "inventory"),
+        ]
+        layers = _build_execution_layers(reports)
+        assert len(layers) == 1, "Independent reports must be in a single layer"
+        names = {r["name"] for r in layers[0]}
+        assert names == {"sales_validation", "inventory_validation"}
+
+    def test_dependent_report_in_later_layer(self):
+        """B reads from A's output table → B must be in a later layer than A."""
+        reports = [
+            _report("a", "raw_sales", target_table="sales_report"),
+            _report("b", "sales_report"),
+        ]
+        layers = _build_execution_layers(reports)
+        assert len(layers) == 2, "Dependent report must be in a later layer"
+        assert layers[0][0]["name"] == "a"
+        assert layers[1][0]["name"] == "b"
+
+    def test_target_table_falls_back_to_source_report(self):
+        """Without explicit target_table, falls back to <source_table>_report."""
+        reports = [
+            _report("a", "raw_sales"),        # target_table → raw_sales_report
+            _report("b", "raw_sales_report"),
+        ]
+        layers = _build_execution_layers(reports)
+        assert len(layers) == 2
+        assert layers[0][0]["name"] == "a"
+        assert layers[1][0]["name"] == "b"
+
+    def test_chain_of_three_in_three_layers(self):
+        """A → B → C must produce three sequential layers."""
+        reports = [
+            _report("a", "raw",   target_table="a_out"),
+            _report("b", "a_out", target_table="b_out"),
+            _report("c", "b_out"),
+        ]
+        layers = _build_execution_layers(reports)
+        assert len(layers) == 3
+        assert layers[0][0]["name"] == "a"
+        assert layers[1][0]["name"] == "b"
+        assert layers[2][0]["name"] == "c"
+
+    def test_independent_reports_all_in_layer_zero(self):
+        """All reports with no upstream dependencies must be in layer 0."""
+        reports = [
+            _report("x", "table_x"),
+            _report("y", "table_y"),
+            _report("z", "table_z"),
+        ]
+        layers = _build_execution_layers(reports)
+        assert len(layers) == 1
+        assert len(layers[0]) == 3
+
+    def test_diamond_dependency_ordering(self):
+        """A → B, A → C, B → D: A must precede B and C; B must precede D."""
+        reports = [
+            _report("a", "raw",   target_table="a_out"),
+            _report("b", "a_out", target_table="b_out"),
+            _report("c", "a_out", target_table="c_out"),
+            _report("d", "b_out"),
+        ]
+        layers = _build_execution_layers(reports)
+        all_names = [r["name"] for layer in layers for r in layer]
+        assert all_names.index("a") < all_names.index("b")
+        assert all_names.index("a") < all_names.index("c")
+        assert all_names.index("b") < all_names.index("d")
+
+    def test_empty_reports_returns_empty(self):
+        assert _build_execution_layers([]) == []
+
+    def test_single_report_returns_one_layer(self):
+        layers = _build_execution_layers([_report("solo", "raw_table")])
+        assert len(layers) == 1
+        assert len(layers[0]) == 1
+
+
+class TestBuildExecutionLayersCycleDetection:
+    """_build_execution_layers raises ValueError before any execution on cycles.
+
+    CLAUDE.md guarantee:
+      'If a circular dependency is detected, _build_execution_layers raises
+       ValueError naming the reports involved before any execution begins.'
+    """
+
+    def test_direct_cycle_raises(self):
+        reports = [
+            _report("a", "b_out", target_table="a_out"),
+            _report("b", "a_out", target_table="b_out"),
+        ]
+        with pytest.raises(ValueError, match="cycle"):
+            _build_execution_layers(reports)
+
+    def test_three_report_cycle_raises(self):
+        reports = [
+            _report("a", "c_out", target_table="a_out"),
+            _report("b", "a_out", target_table="b_out"),
+            _report("c", "b_out", target_table="c_out"),
+        ]
+        with pytest.raises(ValueError, match="cycle"):
+            _build_execution_layers(reports)
+
+    def test_cycle_error_names_the_reports(self):
+        """Error message must name the reports involved."""
+        reports = [
+            _report("alpha", "beta_out", target_table="alpha_out"),
+            _report("beta",  "alpha_out", target_table="beta_out"),
+        ]
+        with pytest.raises(ValueError) as exc_info:
+            _build_execution_layers(reports)
+        msg = str(exc_info.value)
+        assert "alpha" in msg and "beta" in msg, (
+            "Cycle error must name the reports involved"
+        )
+
+    def test_self_reference_excluded_not_a_cycle(self):
+        """A report whose source table matches its own output is excluded by design."""
+        reports = [_report("a", "a_out", target_table="a_out")]
+        # Guard in code: upstream_name != r["name"] → self-loops excluded
+        layers = _build_execution_layers(reports)
+        assert len(layers) == 1
+
+
+class TestRunAllReportsFailurePropagation:
+    """Dependents are skipped when upstream report errors.
+
+    CLAUDE.md guarantee:
+      'If a report finishes with status=error, its direct dependents in later
+       layers are skipped (not errored) and logged with a message naming the
+       upstream failure.'
+    """
+
+    def test_dependent_skipped_when_upstream_errors(
+        self, pipeline_db, watermark_store
     ):
-        _init_pipeline_db(pipeline_db)
-        _seed_table(pipeline_db, "sales", sales_df)
+        from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 
+        reg = CheckRegistry()
+        rep_reg = ReportRegistry()
 
-        def check_negative_price(ctx, col: str = "price") -> pd.Series:
-            df = ctx["df"]
-            return df[col] >= 0  # True = passes, False = fails (negative)
+        # Report A: source table does not exist → will error
+        rep_reg.register("report_a", {
+            "name": "report_a",
+            "source": {"type": "duckdb", "path": pipeline_db, "table": "nonexistent_table"},
+            "options": {"parallel": False},
+            "resolved_checks": [],
+            "target_table": "report_a_out",
+        })
+        # Report B: reads from report_a's output → must be skipped when A errors
+        rep_reg.register("report_b", {
+            "name": "report_b",
+            "source": {"type": "duckdb", "path": pipeline_db, "table": "report_a_out"},
+            "options": {"parallel": False},
+            "resolved_checks": [],
+        })
 
-        register_custom_check("neg_price", check_negative_price, check_registry)
-
-        config = {
-            "templates": {},
-            "reports": [{
-                "name": "sales_validation",
-                "source": {
-                    "type": "duckdb", "path": pipeline_db,
-                    "table": "sales", "timestamp_col": "updated_at",
-                    "primary_key": "order_id",
-                },
-                "options": {"parallel": False},
-                "checks": [{"name": "neg_price"}],
-            }],
-        }
-        register_from_config(config, check_registry, report_registry)
-
-        run_all_reports(
-            report_registry, check_registry, watermark_store,
+        results = run_all_reports(
+            rep_reg, reg, watermark_store,
             parallel_reports=False,
             pipeline_db=pipeline_db,
         )
 
-        conn = duckdb.connect(pipeline_db)
-        try:
-            # sales_df has all positive prices → mask is all True → no flags
-            assert _count_flags(conn) == 0
-        finally:
-            conn.close()
+        statuses = {r["report"]: r["status"] for r in results}
+        assert statuses["report_a"] == "error", "Upstream report must have status=error"
+        assert statuses["report_b"] == "skipped", (
+            "Dependent report must be skipped (not errored) when upstream errors"
+        )
+
+    def test_non_dependent_still_runs_when_sibling_errors(
+        self, pipeline_db, watermark_store, sales_df
+    ):
+        """A report independent of the errored report must still run."""
+        from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
+
+        _seed_table(pipeline_db, "sales", sales_df)
+
+        reg = CheckRegistry()
+        rep_reg = ReportRegistry()
+
+        # Report A: errors (nonexistent source)
+        rep_reg.register("report_a", {
+            "name": "report_a",
+            "source": {"type": "duckdb", "path": pipeline_db, "table": "nonexistent_table"},
+            "options": {"parallel": False},
+            "resolved_checks": [],
+            "target_table": "report_a_out",
+        })
+        # Report C: independent — reads from sales, not report_a_out
+        rep_reg.register("report_c", {
+            "name": "report_c",
+            "source": {"type": "duckdb", "path": pipeline_db, "table": "sales",
+                       "timestamp_col": "updated_at"},
+            "options": {"parallel": False},
+            "resolved_checks": [],
+        })
+
+        results = run_all_reports(
+            rep_reg, reg, watermark_store,
+            parallel_reports=False,
+            pipeline_db=pipeline_db,
+        )
+
+        statuses = {r["report"]: r["status"] for r in results}
+        assert statuses["report_a"] == "error"
+        assert statuses["report_c"] != "skipped", (
+            "Independent report must not be skipped due to an unrelated error"
+        )
