@@ -333,6 +333,233 @@ class TestExcelWorkflow:
         # reason should mention price since that changed
         assert any("price" in str(r).lower() for r in flagged["reason"].values)
 
+
+    # -----------------------------------------------------------------------
+    # Guarantees from CLAUDE.md — behavioral contracts not covered above
+    # -----------------------------------------------------------------------
+
+    def test_source_pass_populated_after_ingest(
+        self, infra_db, excel_file, excel_sources_config
+    ):
+        """source_pass tracks every accepted record's row hash and source file.
+
+        CLAUDE.md guarantee:
+          'source_pass → tracks every ingested record's row hash and source file.
+           Enables flag mode duplicate detection without querying the source
+           table directly.'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        df = conn.execute("SELECT * FROM source_pass WHERE table_name = 'sales'").df()
+        conn.close()
+
+        assert not df.empty, "source_pass must be populated after ingest"
+        assert len(df) == len(EXCEL_ROWS), (
+            "source_pass must have one entry per accepted row"
+        )
+        assert df["row_hash"].notna().all(), "every source_pass row must have a hash"
+        assert df["source_file"].notna().all(), "every source_pass row must record its source file"
+
+    def test_existing_row_kept_on_conflict(
+        self, infra_db, excel_file, excel_file_conflict, excel_sources_config
+    ):
+        """On duplicate_conflict, the original row stays in the source table.
+
+        CLAUDE.md guarantee:
+          'Existing row kept, incoming row blocked.'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        original_prices = conn.execute(
+            "SELECT order_id, price FROM sales ORDER BY order_id"
+        ).df().set_index("order_id")["price"].to_dict()
+        conn.close()
+
+        _ingest(infra_db, excel_file_conflict, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        prices_after = conn.execute(
+            "SELECT order_id, price FROM sales ORDER BY order_id"
+        ).df().set_index("order_id")["price"].to_dict()
+        conn.close()
+
+        # Original prices must be preserved — incoming conflicting rows are blocked
+        for order_id, original_price in original_prices.items():
+            assert prices_after[order_id] == original_price, (
+                f"Row {order_id}: original price {original_price} was overwritten "
+                f"— existing row must be kept on duplicate_conflict"
+            )
+
+    def test_clean_rows_proceed_despite_conflicts(
+        self, infra_db, excel_file, excel_sources_config, tmp_path
+    ):
+        """Non-conflicting rows in the same file still insert when others conflict.
+
+        CLAUDE.md guarantee:
+          'Duplicate handling runs after type validation, on clean rows only.
+           Clean rows proceed. No pandas intermediate.'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+
+        # File with one conflicting row (ORD-001) and one new row (ORD-005)
+        mixed = [
+            {"order_id": "ORD-001", "customer_id": "CUST-A", "price": 999.99,
+             "quantity": 2, "region": "EMEA", "updated_at": "2026-01-16"},
+            {"order_id": "ORD-005", "customer_id": "CUST-E", "price": 75.00,
+             "quantity": 3, "region": "EMEA", "updated_at": "2026-04-01"},
+        ]
+        path = tmp_path / "incoming" / "sales_mixed.xlsx"
+        path.parent.mkdir(exist_ok=True)
+        pd.DataFrame(mixed).to_excel(path, index=False)
+
+        summary = ingest_directory(
+            directory=str(path.parent),
+            sources=excel_sources_config["sources"],
+            db_path=infra_db,
+        )
+
+        conn = duckdb.connect(infra_db)
+        new_row = conn.execute(
+            "SELECT * FROM sales WHERE order_id = 'ORD-005'"
+        ).df()
+        conn.close()
+
+        assert not new_row.empty, (
+            "ORD-005 (clean row) must be inserted even though ORD-001 conflicted"
+        )
+
+    def test_ingest_state_logged_per_file(
+        self, infra_db, excel_file, excel_sources_config
+    ):
+        """Every ingest attempt is logged to ingest_state with status='ok'.
+
+        CLAUDE.md guarantee:
+          'ingest_state — Per-file ingest history: status, rows, errors'
+          'ingest_state status values: ok | failed | skipped | correction'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        df = conn.execute(
+            "SELECT * FROM ingest_state WHERE filename = ?",
+            [excel_file.name],
+        ).df()
+        conn.close()
+
+        assert len(df) == 1, "ingest_state must have exactly one entry per file"
+        assert df.iloc[0]["status"] == "ok"
+        assert df.iloc[0]["rows"] == len(EXCEL_ROWS)
+
+    def test_already_ingested_file_skipped(
+        self, infra_db, excel_file, excel_sources_config
+    ):
+        """A file already in ingest_state with status='ok' is skipped on re-run.
+
+        CLAUDE.md guarantee:
+          'Files already ingested are skipped automatically on subsequent runs.'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        row_count_after_first = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+        conn.close()
+
+        summary = _ingest(infra_db, excel_file, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        row_count_after_second = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+        conn.close()
+
+        assert summary[excel_file.name]["status"] == "skipped", (
+            "Already-ingested file must be skipped"
+        )
+        assert row_count_after_second == row_count_after_first, (
+            "Row count must not change when file is skipped"
+        )
+
+    def test_validation_block_does_not_block_sql_deliverable(
+        self, infra_db, excel_file, excel_sources_config,
+        excel_reports_config, watermark_db, tmp_path
+    ):
+        """validation_block failures warn but do not block deliverable SQL execution.
+
+        CLAUDE.md guarantee:
+          'validation_block → Check/transform failures — warns, does not block
+           deliverables.'
+          'Deliverables (Extract): Not blocked by validation_block.'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+        _run_checks(infra_db, excel_reports_config, watermark_db)
+
+        # Confirm validation failures exist
+        flagged = _get_validation_flags(infra_db)
+        assert not flagged.empty, "Need validation failures for this test to be meaningful"
+
+        # Deliverable SQL must still execute despite validation_block entries
+        sql_path = tmp_path / "deliverable.sql"
+        sql_path.write_text("SELECT order_id, price FROM sales ORDER BY order_id")
+
+        conn = duckdb.connect(infra_db)
+        from proto_pipe.reports.query import execute_sql_file
+        df = execute_sql_file(conn, str(sql_path))
+        conn.close()
+
+        assert not df.empty, (
+            "SQL deliverable must execute even when validation_block has entries"
+        )
+
+    def test_flag_id_is_deterministic_md5_of_pk(
+        self, infra_db, excel_file, excel_file_conflict, excel_sources_config
+    ):
+        """source_block.id = md5(str(pk_value)) — deterministic, not random UUID.
+
+        CLAUDE.md guarantee:
+          'id = md5(str(pk_value)) — deterministic, computable in DuckDB SQL'
+          'Determinism matters. UUID keys, watermarks, flag identity are all
+           deterministic.'
+        """
+        import hashlib
+        _ingest(infra_db, excel_file, excel_sources_config)
+        _ingest(infra_db, excel_file_conflict, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        df = conn.execute("SELECT id, pk_value FROM source_block").df()
+        conn.close()
+
+        for _, row in df.iterrows():
+            expected_id = hashlib.md5(str(row["pk_value"]).encode()).hexdigest()
+            assert row["id"] == expected_id, (
+                f"Flag id for pk '{row['pk_value']}' must be md5(pk_value), "
+                f"got '{row['id']}'"
+            )
+
+    def test_source_block_bad_columns_records_changed_columns(
+        self, infra_db, excel_file, excel_file_conflict, excel_sources_config
+    ):
+        """source_block.bad_columns records the pipe-delimited changed column names.
+
+        CLAUDE.md guarantee (source_block schema):
+          'bad_columns — pipe-delimited: "amount|region"'
+        """
+        _ingest(infra_db, excel_file, excel_sources_config)
+        _ingest(infra_db, excel_file_conflict, excel_sources_config)
+
+        conn = duckdb.connect(infra_db)
+        df = conn.execute("SELECT bad_columns FROM source_block").df()
+        conn.close()
+
+        assert not df.empty
+        # bad_columns must be set (not null) and reference the changed column
+        assert df["bad_columns"].notna().all(), (
+            "source_block.bad_columns must not be null for duplicate_conflict flags"
+        )
+        # price changed — must appear in bad_columns
+        assert any("price" in str(v) for v in df["bad_columns"]), (
+            "bad_columns must record 'price' as the changed column"
+        )
+
     def test_step12_clear_ingest_flags(
         self, infra_db, excel_file, excel_file_conflict, excel_sources_config
     ):
@@ -347,4 +574,3 @@ class TestExcelWorkflow:
 
         flagged_after = _get_flagged_rows(infra_db)
         assert flagged_after.empty
-        

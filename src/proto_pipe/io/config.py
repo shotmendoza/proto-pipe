@@ -6,6 +6,7 @@ this class instead.
 """
 from __future__ import annotations
 
+import copy
 from os import PathLike
 from pathlib import Path
 
@@ -373,9 +374,9 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     :rtype: dict
     """
     if not path.exists():
-        return _DEFAULTS.copy()
+        return copy.deepcopy(_DEFAULTS)
     loaded = load_config(path)
-    merged = _DEFAULTS.copy()
+    merged = copy.deepcopy(_DEFAULTS)
 
     # Merge paths sub-dict explicitly so defaults fill any missing keys
     merged["paths"].update(loaded.get("paths", {}))
@@ -385,10 +386,11 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     for key, value in loaded.items():
         if key != "paths":
             merged[key] = value
-            
+
     # Resolve all relative paths against pipeline.yaml's own directory,
     # not the CWD — so vp works correctly from any subdirectory.
     for key, val in merged["paths"].items():
+        config_dir = path.parent
         if val and not Path(val).is_absolute():
             merged["paths"][key] = str((config_dir / val).resolve())
     return merged
@@ -454,5 +456,3 @@ def set_path(key: str, value: str, path: Path = DEFAULT_SETTINGS_PATH) -> None:
     raw = load_config(path) if path.exists() else {}
     raw.setdefault("paths", {})[key] = value
     save_settings(raw, path)
-
-
