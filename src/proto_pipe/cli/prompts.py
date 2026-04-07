@@ -96,8 +96,8 @@ def _safe_sample_label(sample, col: str) -> str:
 
 
 def prompt_delete_impact(
-    rows: list[tuple[str, int, str]],
-    yes: bool = False,
+        rows: list[tuple[str, int, str]],
+        yes: bool = False,
 ) -> bool:
     """Display an impact summary and prompt for confirmation before a delete.
 
@@ -143,12 +143,13 @@ class SourceConfigPrompter:
     :param registry_hints:  {column: {source_name: declared_type}} for conflict display.
     :param existing_source: Existing source dict when editing, None when creating.
     """
+
     def __init__(
-        self,
-        sample_df=None,
-        registry_hints: dict | None = None,
-        existing_source: dict | None = None,
-        existing_sources_lookup: dict[str, dict] | None = None,
+            self,
+            sample_df=None,
+            registry_hints: dict | None = None,
+            existing_source: dict | None = None,
+            existing_sources_lookup: dict[str, dict] | None = None,
     ) -> None:
         self._sample = sample_df
         self._registry_hints = registry_hints or {}
@@ -498,7 +499,7 @@ class SourceConfigPrompter:
 
     @staticmethod
     def prompt_file_group(
-        file_groups: "dict[str, list[str]]",
+            file_groups: "dict[str, list[str]]",
     ) -> "tuple[str | None, str | None]":
         """Show a pattern-grouped file picker.
 
@@ -512,14 +513,14 @@ class SourceConfigPrompter:
             subsequent prompt_pattern step. None if the user cancelled (ESC).
         """
         choices = [
-            questionary.Choice(
-                title=f"{pattern}  ({len(files)} file{'s' if len(files) != 1 else ''})",
-                value=pattern,
-            )
-            for pattern, files in sorted(
+                      questionary.Choice(
+                          title=f"{pattern}  ({len(files)} file{'s' if len(files) != 1 else ''})",
+                          value=pattern,
+                      )
+                      for pattern, files in sorted(
                 file_groups.items(), key=lambda x: (-len(x[1]), x[0])
             )
-        ] + ["None of these — define manually"]
+                  ] + ["None of these — define manually"]
 
         selected = questionary.select(
             "Which file pattern are you configuring a source for?",
@@ -537,9 +538,9 @@ class SourceConfigPrompter:
 
 
 def _make_col_choices(
-    cols: list[str],
-    registry_types: dict[str, str],
-    precheck: "set[str] | None" = None,
+        cols: list[str],
+        registry_types: dict[str, str],
+        precheck: "set[str] | None" = None,
 ) -> "list[questionary.Choice]":
     """Build questionary.Choice objects for column selection prompts.
 
@@ -557,7 +558,6 @@ def _make_col_choices(
         )
         for col in cols
     ]
-
 
 
 # ---------------------------------------------------------------------------
@@ -578,11 +578,11 @@ class ReportConfigPrompter:
     """
 
     def __init__(
-        self,
-        check_registry,
-        p_db: str,
-        multi_select: bool = True,
-        existing_report: dict | None = None,
+            self,
+            check_registry,
+            p_db: str,
+            multi_select: bool = True,
+            existing_report: dict | None = None,
     ) -> None:
         self._registry = check_registry
         self._p_db = p_db
@@ -599,10 +599,10 @@ class ReportConfigPrompter:
     # ---------------------------------------------------------------------------
 
     def run(
-        self,
-        available_tables: list[str],
-        existing_names: list[str],
-        conn,
+            self,
+            available_tables: list[str],
+            existing_names: list[str],
+            conn,
     ) -> bool:
         """Run the full report configuration flow.
 
@@ -711,11 +711,11 @@ class ReportConfigPrompter:
         return name
 
     def prompt_checks(
-        self,
-        table_cols: list[str],
-        alias_map: list[dict],
-        registry_types: dict[str, str],
-        preselected: list[str] | None = None,
+            self,
+            table_cols: list[str],
+            alias_map: list[dict],
+            registry_types: dict[str, str],
+            preselected: list[str] | None = None,
     ) -> tuple[list[str] | None, bool]:
         """Show available columns, then two sequential prompts — transforms then checks.
 
@@ -779,12 +779,12 @@ class ReportConfigPrompter:
         return selected, False
 
     def _prompt_kind_group(
-        self,
-        names: list[str],
-        label: str,
-        table_cols: list[str],
-        alias_param_to_cols: dict[str, list[str]],
-        preselected: list[str],
+            self,
+            names: list[str],
+            label: str,
+            table_cols: list[str],
+            alias_param_to_cols: dict[str, list[str]],
+            preselected: list[str],
     ) -> tuple[list[str] | None, bool]:
         """Render metadata summary and checkbox for one kind group.
 
@@ -838,12 +838,12 @@ class ReportConfigPrompter:
         return selected, False
 
     def prompt_params(
-        self,
-        selected_checks: list[str],
-        table: str,
-        conn,
-        report_name: str,
-        existing_alias_map: list[dict] | None = None,
+            self,
+            selected_checks: list[str],
+            table: str,
+            conn,
+            report_name: str,
+            existing_alias_map: list[dict] | None = None,
     ) -> tuple[list[dict], list[dict], bool]:
         """Fill params for selected checks. Delegates to self._fill_params."""
         return self._fill_params(
@@ -854,14 +854,13 @@ class ReportConfigPrompter:
             existing_alias_map=existing_alias_map,
         )
 
-
     def _fill_params(
-        self,
-        selected_checks: list[str],
-        table: str,
-        conn: "duckdb.DuckDBPyConnection",
-        report_name: str,
-        existing_alias_map: list[dict] | None = None,
+            self,
+            selected_checks: list[str],
+            table: str,
+            conn: "duckdb.DuckDBPyConnection",
+            report_name: str,
+            existing_alias_map: list[dict] | None = None,
     ) -> tuple[list[dict], list[dict], bool]:
         """Fill params for each selected check, building alias_map entries for column params.
 
@@ -935,9 +934,9 @@ class ReportConfigPrompter:
             click.echo(f"\nParameters for '{check_name}':")
 
             eligible = (
-                self._multi_select
-                and inspector is not None
-                and inspector.is_multiselect_eligible()
+                    self._multi_select
+                    and inspector is not None
+                    and inspector.is_multiselect_eligible()
             )
             col_params = inspector.column_params() if inspector else []
             sig = inspect.signature(inspector.func) if inspector else None
@@ -975,8 +974,8 @@ class ReportConfigPrompter:
                         value = sorted(value)
                         for col in value:
                             if not any(
-                                e["param"] == param_name and e["column"] == col
-                                for e in accumulated_alias
+                                    e["param"] == param_name and e["column"] == col
+                                    for e in accumulated_alias
                             ):
                                 accumulated_alias.append({"param": param_name, "column": col})
                     else:
@@ -987,14 +986,25 @@ class ReportConfigPrompter:
                         if value is None:
                             return [], [], True
                         if not any(
-                            e["param"] == param_name and e["column"] == value
-                            for e in accumulated_alias
+                                e["param"] == param_name and e["column"] == value
+                                for e in accumulated_alias
                         ):
                             accumulated_alias.append({"param": param_name, "column": value})
 
                     alias_param_to_cols[param_name] = [
                         e["column"] for e in accumulated_alias if e["param"] == param_name
                     ]
+
+                    # Write column param selections to check_params_history so
+                    # get_param_suggestions can surface them as cross-source
+                    # suggestions when the same check+param is configured on a
+                    # different source. One entry per column — _similar_columns
+                    # matches individual names, not serialised lists (rule 14).
+                    col_values = value if isinstance(value, list) else [value]
+                    for col_val in col_values:
+                        record_param_history(
+                            conn, check_name, report_name, table, {param_name: col_val}
+                        )
 
                 elif is_list_annotation(ann) or isinstance(default, list):
                     suggestions = get_param_suggestions(conn, check_name, param_name, table_cols)
@@ -1076,11 +1086,11 @@ class DeliverableConfigPrompter:
     """
 
     def __init__(
-        self,
-        rep_config: dict,
-        src_config: dict,
-        sql_dir: str,
-        existing_deliverable: dict | None = None,
+            self,
+            rep_config: dict,
+            src_config: dict,
+            sql_dir: str,
+            existing_deliverable: dict | None = None,
     ) -> None:
         self._rep_config = rep_config
         self._src_config = src_config
@@ -1220,7 +1230,7 @@ class DeliverableConfigPrompter:
         return str(sql_path)
 
     def prompt_report_entries(
-        self, selected_reports: list[str], fmt: str
+            self, selected_reports: list[str], fmt: str
     ) -> list[dict]:
         """Prompt for per-report sheet names and date filters."""
         fill_details = questionary.confirm(
