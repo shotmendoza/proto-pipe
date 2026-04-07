@@ -618,10 +618,13 @@ class ReportConfigPrompter:
                 step = STEP_CHECKS
 
             elif step == STEP_CHECKS:
+                from proto_pipe.io.db import get_registry_types
                 table_cols = sorted(_get_table_columns(self._p_db, state["table"]))
+                registry_types = get_registry_types(conn, columns=table_cols)
                 selected, go_back = self.prompt_checks(
                     table_cols=table_cols,
                     alias_map=state.get("alias_map", []),
+                    registry_types=registry_types,
                     preselected=existing_check_names,
                 )
                 if go_back:
@@ -687,25 +690,94 @@ class ReportConfigPrompter:
         self,
         table_cols: list[str],
         alias_map: list[dict],
+        registry_types: dict[str, str],
         preselected: list[str] | None = None,
     ) -> tuple[list[str] | None, bool]:
-        """Show check summary and checkbox. Returns (selected, go_back)."""
+        """Show available columns, then two sequential prompts — transforms then checks.
+
+        Columns are printed once before any prompt so the user can verify
+        type compatibility before selecting functions. Each kind is shown in
+        its own checkbox. If a kind has no registered functions its prompt
+        is skipped silently — no empty checkbox is shown.
+
+        Returns (selected_names, go_back). go_back is True when the user
+        pressed ESC on either prompt. selected_names is the merged list of
+        transform + check selections in that order.
+        """
+        # -- Column display --------------------------------------------------
+        if registry_types:
+            click.echo("\n  Available columns:")
+            for col, dtype in registry_types.items():
+                click.echo(f"    {col} ({dtype})")
+        else:
+            click.echo(
+                "\n  [warn] No column types registered for this source"
+                " — run `vp new source` first"
+            )
+
+        # -- Kind split (consuming existing public methods, not metadata) -----
+        transforms = self._registry.transforms_only()
+        checks = self._registry.checks_only()
+
+        alias_param_to_cols: dict[str, list[str]] = {}
+        for entry in alias_map:
+            alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
+
+        preselected = preselected or []
+        selected: list[str] = []
+
+        # -- Transforms prompt (skipped if none registered) ------------------
+        if transforms:
+            transform_selected, go_back = self._prompt_kind_group(
+                names=transforms,
+                label="Select transforms to apply:",
+                table_cols=table_cols,
+                alias_param_to_cols=alias_param_to_cols,
+                preselected=preselected,
+            )
+            if go_back:
+                return None, True
+            selected.extend(transform_selected or [])
+
+        # -- Checks prompt (skipped if none registered) ----------------------
+        if checks:
+            check_selected, go_back = self._prompt_kind_group(
+                names=checks,
+                label="Select validation checks:",
+                table_cols=table_cols,
+                alias_param_to_cols=alias_param_to_cols,
+                preselected=preselected,
+            )
+            if go_back:
+                return None, True
+            selected.extend(check_selected or [])
+
+        return selected, False
+
+    def _prompt_kind_group(
+        self,
+        names: list[str],
+        label: str,
+        table_cols: list[str],
+        alias_param_to_cols: dict[str, list[str]],
+        preselected: list[str],
+    ) -> tuple[list[str] | None, bool]:
+        """Render metadata summary and checkbox for one kind group.
+
+        Prints name, first docstring sentence, and param lines for each
+        function before showing the checkbox — same display as the previous
+        flat prompt, now per-kind. Returns (selected_names, go_back).
+        go_back is True when the user pressed ESC (questionary returns None).
+        """
         from proto_pipe.cli.scaffold import (
             _get_original_func,
             _get_check_first_sentence,
             _build_check_param_lines,
         )
 
-        available_checks = self._registry.available()
-        preselected = preselected or []
-
-        alias_param_to_cols: dict[str, list[str]] = {}
-        for entry in alias_map:
-            alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
-
-        click.echo("\n  Available checks:\n")
+        click.echo()
         choices = []
-        for check_name in available_checks:
+        for check_name in names:
             original = _get_original_func(check_name, self._registry)
             first_sentence = _get_check_first_sentence(original) if original else ""
             param_lines = _build_check_param_lines(
@@ -737,11 +809,7 @@ class ReportConfigPrompter:
                 )
             )
 
-        selected = questionary.checkbox(
-            "Select checks to run on this report:",
-            choices=choices,
-        ).ask()
-
+        selected = questionary.checkbox(label, choices=choices).ask()
         if selected is None:
             return None, True
         return selected, False
