@@ -510,6 +510,31 @@ def clear_source_pass_for_table(
     return len(result)
 
 
+def clear_source_block_for_pks(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    pk_values: list[str],
+) -> int:
+    """Delete source_block entries for rows that have been accepted into source_pass.
+
+    Called by ingest.py immediately after bulk_upsert_source_pass so that
+    a row cannot simultaneously appear in source_pass (accepted) and
+    source_block (flagged). Returns count deleted.
+
+    Behavioural guarantee: a pk_value present in source_pass for a given
+    table must not appear in source_block for that same table.
+    """
+    if not pk_values:
+        return 0
+    placeholders = ", ".join(["?"] * len(pk_values))
+    result = conn.execute(
+        f"DELETE FROM source_block WHERE table_name = ? "
+        f"AND pk_value IN ({placeholders}) RETURNING id",
+        [table_name] + pk_values,
+    ).fetchall()
+    return len(result)
+
+
 # ---------------------------------------------------------------------------
 # validation_pass operations
 # ---------------------------------------------------------------------------

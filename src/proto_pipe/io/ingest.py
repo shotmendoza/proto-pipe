@@ -47,6 +47,7 @@ from proto_pipe.io.db import (
     log_ingest_state,
     get_source_pass_hashes,
     bulk_upsert_source_pass,
+    clear_source_block_for_pks,
 )
 from proto_pipe.io.migration import auto_migrate
 from proto_pipe.pipelines.flagging import (
@@ -518,6 +519,10 @@ def _handle_duplicates(
     # Bulk update source_pass for all accepted rows
     if pass_records:
         bulk_upsert_source_pass(conn, table, pass_records)
+        # Invariant: a row accepted into source_pass must not remain in
+        # source_block. Clear any stale conflict entries for these pks.
+        accepted_pks = [r["pk_value"] for r in pass_records]
+        clear_source_block_for_pks(conn, table, accepted_pks)
 
     result_df = (
         pd.DataFrame(rows_to_insert, columns=df.columns)
@@ -934,6 +939,10 @@ def ingest_single_file(
                 for _, row in df.iterrows()
             ]
             bulk_upsert_source_pass(conn, table, pass_records)
+            # Invariant: a row accepted into source_pass must not remain in
+            # source_block. Clear any stale conflict entries for these pks.
+            accepted_pks = [r["pk_value"] for r in pass_records]
+            clear_source_block_for_pks(conn, table, accepted_pks)
 
     # ── Scenario B: subsequent ingest ─────────────────────────────────────
     else:
