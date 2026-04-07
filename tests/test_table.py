@@ -385,7 +385,6 @@ class TestDisplayRichTable:
                 f"Column '{df_col}' must appear in the rendered table"
             )
 
-
     def test_renders_without_error_for_mixed_duckdb_dtypes(self):
         """_display_rich_table must not raise for any dtype DuckDB returns.
 

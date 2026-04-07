@@ -43,6 +43,7 @@ def _display_rich_table(df, title: str) -> None:
         header_style="bold cyan",
         show_lines=True,
         row_styles=["", "dim"],
+        expand=False
     )
 
     for col in df.columns:
