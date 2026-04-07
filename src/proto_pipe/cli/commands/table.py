@@ -17,38 +17,27 @@ def _get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
 
 
 def _display_rich_table(df, title: str) -> None:
+    """Fallback table display when Textual is not installed.
+
+    Used only when textual is unavailable. For full horizontal scrolling
+    install textual: uv add 'proto-pipe[tui]'
+    """
     from rich.console import Console
     from rich.table import Table
 
-    # Calculate content-aware width so the table renders at full width.
-    # astype(object) before fillna("") is required — DuckDB returns nullable
-    # integer columns (Int64) that reject "" as a fill value directly.
-    if len(df) > 0:
-        col_widths = [
-            max(
-                len(str(col)),
-                df[col].astype(object).fillna("").astype(str).str.len().max(),
-            ) + 2
-            for col in df.columns
-        ]
-    else:
-        col_widths = [len(str(col)) + 2 for col in df.columns]
-
-    table_width = sum(col_widths) + len(df.columns) + 1  # +borders
-    console = Console(width=max(80, table_width))
-
+    console = Console()
     table = Table(
         title=title,
         show_header=True,
         header_style="bold cyan",
         show_lines=True,
         row_styles=["", "dim"],
-        expand=False
     )
 
     for col in df.columns:
         table.add_column(str(col), no_wrap=True)
 
+    # astype(object) before fillna("") required for nullable DuckDB types (Int64 etc.)
     rows = df.astype(object).fillna("").astype(str).values.tolist()
     for row in rows:
         table.add_row(*row)
@@ -266,15 +255,19 @@ class TextualReview(ReviewInterface):
 
 
 def get_reviewer(edit: bool = False) -> ReviewInterface:
-    """Return the best available reviewer."""
-    if edit:
-        try:
-            import textual  # noqa
+    """Return the best available reviewer.
 
-            return TextualReview()
-        except ImportError:
-            return RichReview()
-    return RichReview()
+    Always tries TextualReview first — it provides proper horizontal and
+    vertical scrolling for both viewing and editing. Falls back to RichReview
+    if textual is not installed.
+
+    Install textual for the best experience: uv add 'proto-pipe[tui]'
+    """
+    try:
+        import textual  # noqa
+        return TextualReview()
+    except ImportError:
+        return RichReview()
 
 
 # ---------------------------------------------------------------------------

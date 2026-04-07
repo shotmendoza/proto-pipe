@@ -114,28 +114,55 @@ class TestRichReview:
 # _get_reviewer
 # ---------------------------------------------------------------------------
 
-class TestGetReviewer:
-    def test_returns_rich_review_when_not_edit(self):
-        reviewer = get_reviewer(edit=False)
-        assert isinstance(reviewer, RichReview)
+# ── CHANGED CLASS ────────────────────────────────────────────────────────────
+# TestGetReviewer — updated for new get_reviewer behaviour:
+#   always tries TextualReview first, falls back to RichReview.
+#   edit=False now returns TextualReview when available (was RichReview).
+#
+# All other classes in test_table.py are unchanged.
+# -----------------------------------------------------------------------------
 
-    def test_returns_textual_review_when_edit_and_available(self):
+
+class TestGetReviewer:
+    def test_returns_textual_review_when_available_for_view(self):
+        """get_reviewer(edit=False) returns TextualReview when textual is installed."""
         try:
             import textual  # noqa
-            reviewer = get_reviewer(edit=True)
-            assert isinstance(reviewer, TextualReview)
         except ImportError:
             pytest.skip("textual not installed")
 
-    def test_falls_back_to_rich_when_textual_unavailable(self):
+        reviewer = get_reviewer(edit=False)
+        assert isinstance(reviewer, TextualReview), (
+            "TextualReview must be used for viewing when textual is installed — "
+            "it provides proper horizontal scrolling"
+        )
+
+    def test_returns_textual_review_when_available_for_edit(self):
+        """get_reviewer(edit=True) returns TextualReview when textual is installed."""
+        try:
+            import textual  # noqa
+        except ImportError:
+            pytest.skip("textual not installed")
+
+        reviewer = get_reviewer(edit=True)
+        assert isinstance(reviewer, TextualReview)
+
+    def test_falls_back_to_rich_when_textual_unavailable_for_view(self):
+        """Falls back to RichReview for viewing when textual is not installed."""
+        with patch.dict("sys.modules", {"textual": None}):
+            reviewer = get_reviewer(edit=False)
+        assert isinstance(reviewer, RichReview)
+
+    def test_falls_back_to_rich_when_textual_unavailable_for_edit(self):
+        """Falls back to RichReview for editing when textual is not installed."""
         with patch.dict("sys.modules", {"textual": None}):
             reviewer = get_reviewer(edit=True)
-            assert isinstance(reviewer, RichReview)
-
+        assert isinstance(reviewer, RichReview)
 
 # ---------------------------------------------------------------------------
 # TextualReview
 # ---------------------------------------------------------------------------
+
 
 class TestTextualReview:
     def test_show_exits_on_escape(self, sample_df):
