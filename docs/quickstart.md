@@ -10,7 +10,7 @@ For first-time installation and config, see `docs/first_time_setup.md`.
 ```
 1. Run everything        vp run-all --deliverable <name>
 2. Fix ingest conflicts  vp flagged open <table> → edit → vp flagged retry <table>
-3. Fix validation flags  vp export-validation → fix at source → re-ingest → re-validate
+3. Fix validation flags  vp export validation → fix at source → re-ingest → re-validate
 ```
 
 ---
@@ -47,7 +47,7 @@ Validation flags are warnings — fix at source, re-ingest, re-validate.
 
 ```bash
 vp validated                       # browse check failures
-vp export-validation               # export Detail + Summary sheets to Excel
+vp export validation               # export Detail + Summary sheets to Excel
 # fix the values in the source file, then:
 vp ingest
 vp validate
@@ -261,8 +261,8 @@ See `docs/adding_deliverables.md` for the full reference.
 |---|---|
 | Run checks | `vp validate` |
 | Browse check failures | `vp validated` |
-| Export check failures | `vp export-validation` |
-| Export for one report | `vp export-validation --report <n>` |
+| Export check failures | `vp export validation` |
+| Export for one report | `vp export validation --report <n>` |
 
 **Deliverables**
 

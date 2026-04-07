@@ -121,7 +121,7 @@ vp validated                        # all reports
 vp validated --report sales_validation
 vp validated --table sales
 vp validated open                   # export failures and open for editing
-vp export-validation                # export detail + summary to Excel
+vp export validation                # export detail + summary to Excel
 ```
 
 ---

@@ -1,26 +1,80 @@
 # Adding a New Report
 
 Reports define what data to validate and which checks to run against it.
-They live entirely in `config/reports_config.yaml` — no code changes required.
+The easiest way is the interactive wizard:
+
+```bash
+vp new report
+```
+
+The wizard walks you through selecting a table, naming the report, picking
+checks, and configuring their column params — then writes the entry to
+`config/reports_config.yaml` automatically.
 
 ---
 
-## Minimal example
+## What the wizard does
+
+1. **Select table** — picks from tables that exist in the pipeline DB
+2. **Name the report** — defaults to `<table>_validation`
+3. **Select checks** — checkbox list of registered checks with docstrings inline.
+   Column params show available table columns alongside. Press ESC to go back.
+4. **Configure params** — for each selected check, column params offer a
+   selector (with alias_map suggestions surfaced first), scalar params are
+   free text. Checks with `pd.Series` or `str` column params support
+   multi-select to run the check once per column.
+
+After completing the wizard, run `vp validate` to run the new report immediately.
+
+---
+
+## Manual config (no wizard)
+
+Add an entry to `config/reports_config.yaml` directly:
 
 ```yaml
 reports:
-  - name: "my_new_report"
+  - name: "sales_validation"
     source:
       type: duckdb
       path: "data/pipeline.db"
-      table: "my_table"
-      timestamp_col: "updated_at"
+      table: "sales"
+    options:
+      parallel: false
+    alias_map:
+      - param: col
+        column: premium
+      - param: col
+        column: renewal
     checks:
-      - template: standard_null_check
+      - name: null_check
+        params: {}
+      - name: range_check
+        params:
+          min_val: 0
+          max_val: 1000000
 ```
 
-That's the smallest valid report. It points at a table, picks a timestamp
-column for watermark tracking, and runs one check.
+---
+
+## alias_map — running one check across multiple columns
+
+`alias_map` maps a check's column param to one or more table columns. At
+runtime the check is expanded — one registered instance per column. Scalar
+params (like `min_val`) broadcast across all instances.
+
+```yaml
+alias_map:
+  - param: col
+    column: premium
+  - param: col
+    column: renewal
+  - param: col
+    column: commission
+```
+
+With `range_check` above, this runs three checks: one per column, all
+sharing the same `min_val` and `max_val`.
 
 ---
 
@@ -28,142 +82,56 @@ column for watermark tracking, and runs one check.
 
 ```yaml
 reports:
-  - name: "my_new_report"           # Unique name — used in deliverables_config.yaml
-                                    # and as the watermark key
+  - name: "my_report"           # unique name — used as watermark key
     source:
-      type: duckdb                  # Only supported type currently
-      path: "data/pipeline.db"      # Path to the DuckDB file
-      table: "my_table"             # Table to query
-      timestamp_col: "updated_at"   # Column used for watermark filtering.
-                                    # Must exist in the table.
+      type: duckdb              # only supported type
+      path: "data/pipeline.db"  # pipeline DB path
+      table: "my_table"         # table to run checks against
     options:
-      parallel: true                # Run this report's checks in parallel threads.
-                                    # Default: false. Safe to enable for independent checks.
+      parallel: false           # true = run checks in parallel threads
+    alias_map:                  # column param → table column mappings
+      - param: col
+        column: premium
     checks:
-      - template: standard_null_check       # Reference a template defined in `templates:`
-      - template: price_range_check         # Templates have params baked in
-      - name: range_check                   # Or define an inline check directly
+      - name: null_check        # built-in or custom check name
+        params: {}              # scalar params only (column params via alias_map)
+      - name: range_check
         params:
-          col: "quantity"
-          min_val: 1
-          max_val: 9999
+          min_val: 0
+          max_val: 500
 ```
-
----
-
-## Using templates vs inline checks
-
-**Templates** (defined once, reused across reports):
-
-```yaml
-templates:
-  standard_null_check:
-    name: null_check              # Maps to a built-in check function
-
-  price_range_check:
-    name: range_check
-    params:
-      col: "price"
-      min_val: 0
-      max_val: 500
-```
-
-Reference them in any report with `template: <template_name>`.
-
-**Inline checks** (defined directly on the report, not reusable):
-
-```yaml
-checks:
-  - name: range_check
-    params:
-      col: "stock_level"
-      min_val: 0
-      max_val: 10000
-```
-
-Use inline checks when the params are specific to one report and not worth
-sharing as a template.
-
----
-
-## Built-in checks and their params
-
-| Check name       | Required params                          | Optional params     |
-|------------------|------------------------------------------|---------------------|
-| `null_check`     | none                                     | —                   |
-| `range_check`    | `col`, `min_val`, `max_val`              | —                   |
-| `schema_check`   | `expected_cols` (list of column names)   | —                   |
-| `duplicate_check`| none                                     | `subset` (list)     |
-
-Run `vp checks` from the CLI to see the current list at any time.
 
 ---
 
 ## After adding a report
 
-No reinstall needed. Just run:
-
 ```bash
 vp validate
 ```
 
-The new report will be picked up automatically. On first run the watermark
-is empty, so all existing rows in the table are checked. Subsequent runs
-only check rows newer than the last successful run.
+The new report is picked up automatically. On first run the watermark is
+empty, so all existing rows are checked. Subsequent runs only check rows
+newer than the last successful run.
 
-To check only your new report's table:
+To check one table only:
 
 ```bash
 vp validate --table my_table
 ```
 
----
+To view check failures:
 
-## Report-to-report dependencies
-
-A report can read from another report's output table. The pipeline detects
-this automatically and ensures the upstream report runs first — no extra
-config is needed.
-
-**How it works:** every report writes its results to a table named
-`<source_table>_report` by default (or an explicit `target_table` if
-configured). If report B's `source.table` matches that name, B is treated
-as depending on A and will always run after A completes.
-
-**Example — enriched sales built on top of validated sales:**
-
-```yaml
-reports:
-  - name: "sales_validation"
-    source:
-      table: "sales"          # reads from the raw sales table
-      timestamp_col: "updated_at"
-    checks:
-      - template: standard_null_check
-
-  - name: "enriched_sales"
-    source:
-      table: "sales_report"   # reads from sales_validation's output table
-      timestamp_col: "updated_at"
-    checks:
-      - template: price_range_check
+```bash
+vp validated --report my_report
+vp export validation --report my_report
 ```
-
-`vp validate` will always run `sales_validation` before `enriched_sales`.
-If `sales_validation` errors, `enriched_sales` is skipped automatically
-with a message naming the upstream failure.
-
-**Cycle detection:** if two reports depend on each other (directly or
-indirectly), `vp validate` will exit with an error naming the reports
-involved before running anything.
 
 ---
 
 ## Notes
 
-- `name` must be unique across all reports. It is used as the watermark key,
-  so renaming a report resets its watermark and triggers a full re-check.
-- `timestamp_col` must exist in the table before the first ingest. If the
-  source file doesn't include it, add it to `sources_config.yaml` and make
-  sure incoming files carry the column.
-- If the table doesn't exist yet, run `vp ingest` first to create it.
+- `name` must be unique across all reports. Renaming a report resets its
+  watermark and triggers a full re-check on the next run.
+- If the table doesn't exist yet, run `vp ingest` first.
+- Custom checks must be registered before the wizard runs. Set
+  `custom_checks_module` in `pipeline.yaml` and run `vp funcs` to verify.

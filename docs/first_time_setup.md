@@ -144,7 +144,7 @@ To view check failures:
 
 ```bash
 vp validated
-vp export-validation
+vp export validation
 ```
 
 ---

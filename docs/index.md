@@ -61,7 +61,7 @@ all driven by YAML with no code changes required for new sources or reports.
 | Apply corrections          | `vp flagged retry <table>`     |
 | Clear flags                | `vp flagged clear --table <n>` |
 | Browse check failures      | `vp validated`                 |
-| Export check failures      | `vp export-validation`         |
+| Export check failures      | `vp export validation`         |
 
 ### Explore & manage
 
