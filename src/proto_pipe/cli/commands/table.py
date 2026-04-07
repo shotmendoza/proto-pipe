@@ -16,28 +16,19 @@ def _get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
     return conn.execute(f'SELECT * FROM "{table}" LIMIT {limit}').df()
 
 
-# ── CHANGED FUNCTION ─────────────────────────────────────────────────────────
-# _display_rich_table — in cli/commands/table.py
-#
-# Root cause of horizontal scroll issue: Console() defaults to terminal width,
-# so rich compresses all columns to fit. The pager has nothing off-screen to
-# scroll to. Fix: calculate the content-aware width so the table renders at
-# full width, giving the pager actual off-screen content.
-#
-# All other code in table.py is unchanged.
-# -----------------------------------------------------------------------------
-
-
 def _display_rich_table(df, title: str) -> None:
     from rich.console import Console
     from rich.table import Table
 
-    # Calculate the content width needed to show all columns without compression.
-    # Each column gets: max(header length, max content length) + 2 padding.
-    # The pager then provides horizontal scrolling for tables wider than the terminal.
+    # Calculate content-aware width so the table renders at full width.
+    # astype(object) before fillna("") is required — DuckDB returns nullable
+    # integer columns (Int64) that reject "" as a fill value directly.
     if len(df) > 0:
         col_widths = [
-            max(len(str(col)), df[col].fillna("").astype(str).str.len().max()) + 2
+            max(
+                len(str(col)),
+                df[col].astype(object).fillna("").astype(str).str.len().max(),
+            ) + 2
             for col in df.columns
         ]
     else:

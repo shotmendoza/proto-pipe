@@ -384,3 +384,61 @@ class TestDisplayRichTable:
             assert str(df_col) in rendered_headers, (
                 f"Column '{df_col}' must appear in the rendered table"
             )
+
+
+    def test_renders_without_error_for_mixed_duckdb_dtypes(self):
+        """_display_rich_table must not raise for any dtype DuckDB returns.
+
+        DuckDB returns nullable integer columns (Int64) that raise
+        TypeError: Invalid value '' for dtype 'Int64' if fillna("") is
+        called before astype(object). This test guards against that regression.
+        """
+        import duckdb
+        import pandas as pd
+        from proto_pipe.cli.commands.table import _display_rich_table
+        from unittest.mock import MagicMock
+
+        # Build a DataFrame with the same dtypes DuckDB returns for real tables
+        conn = duckdb.connect()
+        df = conn.execute("""
+            SELECT
+                1::INTEGER         AS int_col,
+                2.5::DOUBLE        AS float_col,
+                'hello'::VARCHAR   AS str_col,
+                TRUE::BOOLEAN      AS bool_col,
+                NULL::INTEGER      AS nullable_int,
+                NULL::DOUBLE       AS nullable_float,
+                NULL::VARCHAR      AS nullable_str
+        """).df()
+        conn.close()
+
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=None)
+        mock_cm.__exit__ = MagicMock(return_value=False)
+
+        with patch("rich.console.Console") as MockConsole:
+            MockConsole.return_value.pager.return_value = mock_cm
+            # Must not raise — this is the regression guard
+            _display_rich_table(df, "Mixed DuckDB Types")
+
+    def test_renders_without_error_for_nullable_integer_column(self):
+        """Nullable Int64 columns with NULL values must not raise TypeError."""
+        import pandas as pd
+        from proto_pipe.cli.commands.table import _display_rich_table
+        from unittest.mock import MagicMock
+
+        # Pandas nullable integer dtype — same as what DuckDB returns for INTEGER columns
+        df = pd.DataFrame({
+            "id": pd.array([1, 2, None], dtype="Int64"),
+            "value": pd.array([100, None, 300], dtype="Int64"),
+            "label": ["a", "b", "c"],
+        })
+
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=None)
+        mock_cm.__exit__ = MagicMock(return_value=False)
+
+        with patch("rich.console.Console") as MockConsole:
+            MockConsole.return_value.pager.return_value = mock_cm
+            # Must not raise TypeError: Invalid value '' for dtype 'Int64'
+            _display_rich_table(df, "Nullable Integers")
