@@ -347,6 +347,74 @@ def _wrap_dataframe_input(
     return wrapper
 
 
+def _wrap_series_input(
+    func: "Callable",
+    series_params: list[str],
+) -> "Callable":
+    """Wrap a Series-input function to accept the context dict convention.
+
+    For functions with pd.Series params and no pd.DataFrame param.
+    The pipeline assembles the call — users write plain functions,
+    context: dict never appears in user code.
+
+    At call time:
+      - Extracts df from context, strips pipeline (_) columns
+      - For each pd.Series param: reads baked column name from partial
+        keywords (set by _register_check from alias_map), extracts
+        df[col_name] as a Series and injects it by keyword
+      - Scalar constants remain in the partial and are passed through
+        automatically via the inner function call
+
+    series_params: list of param names annotated as pd.Series,
+                   from CheckParamInspector.series_params(). Must be
+                   non-empty (caller is responsible for this guard).
+
+    Raises ValueError at call time if a Series param has no baked column
+    name (alias_map not configured) or the column is not in the table.
+    """
+    # Collect all baked keywords from the full partial chain.
+    # These contain: Series param → column name string (from alias_map),
+    # plus any scalar constants (from filled_params).
+    baked_keywords: dict = {}
+    inner = func
+    while isinstance(inner, functools.partial):
+        baked_keywords.update(inner.keywords)
+        inner = inner.func
+
+    @functools.wraps(inner)
+    def wrapper(context: dict):
+        df: "pd.DataFrame" = context["df"]
+        user_cols = [c for c in df.columns if not c.startswith("_")]
+        clean_df = df[user_cols]
+
+        # Build the full kwargs dict starting from all baked constants
+        call_kwargs = dict(baked_keywords)
+
+        # Replace each Series param's baked string with the actual column data
+        for param_name in series_params:
+            col_name = baked_keywords.get(param_name)
+            if col_name is None:
+                raise ValueError(
+                    f"Series param '{param_name}' has no column name baked in partial. "
+                    f"Ensure alias_map is configured for this function in reports_config.yaml."
+                )
+            if col_name not in clean_df.columns:
+                raise ValueError(
+                    f"Series param '{param_name}' maps to column '{col_name}' "
+                    f"which is not in the table. "
+                    f"Available columns: {list(clean_df.columns)}"
+                )
+            call_kwargs[param_name] = clean_df[col_name]
+
+        # Call the inner (unwrapped) function directly — not the partial.
+        # The partial's baked strings have already been replaced with Series
+        # in call_kwargs, so calling the partial would cause "multiple values"
+        # for the Series params. Calling inner with the full kwargs avoids this.
+        return inner(**call_kwargs)
+
+    return wrapper
+
+
 def validate_check(
     name: str,
     func: "Callable",
@@ -404,6 +472,31 @@ def validate_check(
 
         df_wrapped = _wrap_dataframe_input(func, df_param, kind)
         wrapped_func = wrap_series_check(df_wrapped) if kind == "check" else df_wrapped
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
+
+    # ── Series-input path ────────────────────────────────────────────────────
+    # Functions with pd.Series params and no pd.DataFrame param.
+    # Legacy context: dict functions are routed to the standard path below —
+    # has_legacy_context_param() detects them. New annotation-based functions
+    # (no context param) get the Series injection wrapper.
+    if inspector.has_series_params() and not inspector.has_legacy_context_param():
+        series_param_names = inspector.series_params()
+
+        if inspector.empty_return_annotation():
+            print(
+                f"[warn] '{name}': no return annotation — registering as {kind} anyway. "
+                f"Consider adding '-> pd.Series', '-> pd.Series[bool]', or '-> pd.DataFrame'."
+            )
+        elif kind == "check" and not inspector.returns_boolean_series():
+            reason = (
+                "Series-input check must return pd.Series[bool] — skipping registration. "
+                "Fix the return annotation or use kind='transform'."
+            )
+            print(f"[warn] '{name}': {reason}")
+            return CheckAudit(contract=None, failure_reason=reason)
+
+        series_wrapped = _wrap_series_input(func, series_param_names)
+        wrapped_func = wrap_series_check(series_wrapped) if kind == "check" else series_wrapped
         return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
 
     # ── Standard path (existing behaviour) ──────────────────────────────────
@@ -507,6 +600,18 @@ class CheckParamInspector:
             for name, param in self._sig.parameters.items()
             if name != "context"
         )
+
+    def has_legacy_context_param(self) -> bool:
+        """True if the function has a 'context' parameter (legacy calling convention).
+
+        Legacy functions take context: dict as their first param and access
+        df via context["df"] themselves. They must use the standard execution
+        path, not the Series injection wrapper.
+
+        Used by validate_check to route legacy functions away from _wrap_series_input.
+        Callers must use this method — never access _sig.parameters directly.
+        """
+        return "context" in self._sig.parameters
 
     def series_params(self) -> list[str]:
         """Return param names annotated as pd.Series.
