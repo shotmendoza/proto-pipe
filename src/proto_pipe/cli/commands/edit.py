@@ -202,7 +202,7 @@ def edit_report(report, reports_config, pipeline_db):
     from proto_pipe.checks.helpers import load_custom_checks_module
     from proto_pipe.io.db import init_check_registry_metadata
     from proto_pipe.cli.prompts import ReportConfigPrompter
-    from proto_pipe.cli.scaffold import _get_original_func, _get_unconfigured_tables
+    from proto_pipe.cli.scaffold import get_original_func, get_unconfigured_tables
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)
@@ -242,7 +242,7 @@ def edit_report(report, reports_config, pipeline_db):
 
     # Include existing report's table in available tables
     other_reports = {"reports": [r for r in config.all() if r["name"] != report]}
-    unconfigured = _get_unconfigured_tables(p_db, other_reports)
+    unconfigured = get_unconfigured_tables(p_db, other_reports)
     existing_table = existing.get("source", {}).get("table")
     available_tables = sorted(
         set(unconfigured + ([existing_table] if existing_table else []))
@@ -264,7 +264,7 @@ def edit_report(report, reports_config, pipeline_db):
     conn = duckdb.connect(p_db)
     init_check_registry_metadata(conn)
     for check_name in check_registry.available():
-        original = _get_original_func(check_name, check_registry)
+        original = get_original_func(check_name, check_registry)
         if original is not None:
             CheckParamInspector(original).write_to_db(conn, check_name)
 
