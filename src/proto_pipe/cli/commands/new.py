@@ -125,10 +125,8 @@ def new_source(sources_config, incoming_dir):
         try:
             with duckdb.connect(pipeline_db) as conn:
                 registry_hints = get_registry_hints(conn, file_cols)
-        except Exception:
-            pass
-
-    # Build lookup so the prompter can pre-fill when the user picks an
+        except Exception as e:
+            print(f"[warn] Could not load column type hints from registry: {e}")
     # existing source name (e.g. to add a new pattern).
     existing_lookup = {s["name"]: s for s in config.all()}
 
@@ -148,10 +146,12 @@ def new_source(sources_config, incoming_dir):
                 write_registry_types(
                     conn, prompter.source["name"], prompter.confirmed_types
                 )
-        except Exception:
-            pass
-
-    config.add_or_update(prompter.source)
+        except Exception as e:
+            click.echo(
+                f"[warn] Column types were not saved to column_type_registry: {e}\n"
+                f"  Has 'vp db-init' been run? Types confirmed this session are lost.\n"
+                f"  Run 'vp db-init' then 'vp new source' again to re-confirm them."
+            )
     click.echo(f"\n[ok] Source '{prompter.source['name']}' added to {src_cfg}")
     click.echo("\nNext steps:")
     click.echo("1. Review the entry in sources_config.yaml if needed")

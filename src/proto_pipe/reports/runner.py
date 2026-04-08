@@ -272,8 +272,8 @@ def _apply_transforms_with_gate(
                         except Exception:
                             continue
 
-                        for _, row in failing.iterrows():
-                            pk_str = str(row["pk_val"])
+                        for row in failing.itertuples(index=False, name=None):
+                            pk_str = str(row[0])  # pk_val column
                             blocked_pks.add(pk_str)
                             accumulated_flags.append(FlagRecord(
                                 id=flag_id_for(pk_str),
@@ -284,7 +284,7 @@ def _apply_transforms_with_gate(
                                 bad_columns=col,
                                 reason=(
                                     f"[{col}] transform '{name}' produced "
-                                    f"'{row['raw_value']}' which cannot be cast to {base_type}"
+                                    f"'{row[1]}' which cannot be cast to {base_type}"
                                 )[:500],
                             ))
                 finally:
@@ -587,6 +587,7 @@ def _compute_report(
         write_validation_flags,
         compute_check_set_hash,
         compute_row_hash,
+        compute_row_hash_sql,
     )
     from proto_pipe.io.db import (
         flag_id_for,
@@ -642,10 +643,19 @@ def _compute_report(
         ]
 
         if pk_col and pk_col in source_df.columns:
-            incoming = {
-                str(row[pk_col]): compute_row_hash(row.to_dict(), comparable_cols)
-                for _, row in source_df.iterrows()
-            }
+            # Compute all hashes in one DuckDB query — same performance invariant
+            # as ingest.py: N Python hash calls → 1 SQL query. compute_row_hash_sql
+            # produces the same md5 as the Python compute_row_hash function.
+            # Guard: empty comparable_cols → fall back to md5('') per CLAUDE.md.
+            hash_expr = (
+                compute_row_hash_sql(comparable_cols) if comparable_cols else "md5('')"
+            )
+            hash_df = conn.execute(f"""
+                SELECT CAST("{pk_col}" AS VARCHAR) AS pk_value,
+                       {hash_expr} AS row_hash
+                FROM source_df
+            """).df()
+            incoming = dict(zip(hash_df["pk_value"], hash_df["row_hash"]))
         else:
             incoming = {str(i): "" for i in range(len(source_df))}
 
@@ -711,8 +721,13 @@ def _compute_report(
 
             if failing_count > 0 and failing_mask is not None:
                 failing_df = pending_df[failing_mask]
-                for _, row in failing_df.iterrows():
-                    pk_val = str(row[pk_col]) if pk_col and pk_col in pending_df.columns else None
+                pk_idx = (
+                    list(failing_df.columns).index(pk_col)
+                    if pk_col and pk_col in failing_df.columns
+                    else None
+                )
+                for row in failing_df.itertuples(index=False, name=None):
+                    pk_val = str(row[pk_idx]) if pk_idx is not None else None
                     accumulated_flags.append(FlagRecord(
                         id=flag_id_for(pk_val),
                         table_name=target_table,
