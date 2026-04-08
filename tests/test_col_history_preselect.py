@@ -356,9 +356,20 @@ class TestOutputPromptParamMirror:
 
     @pytest.fixture()
     def registry_transform(self):
-        """Transform with float params. eligible=True because kind=transform
-        with column-backed params (updated eligible logic in _fill_params)."""
+        """Two-param transform. Used by test 1 which needs both multi-col (bar)
+        and single-col (baz) params to verify exclusion logic."""
         def my_transform(bar: float, baz: float) -> "pd.Series":
+            pass
+        reg = CheckRegistry()
+        reg.register("my_transform", my_transform, kind="transform")
+        return reg
+
+    @pytest.fixture()
+    def registry_single_transform(self):
+        """Single-param transform. Used by tests 2 and 3 so the only checkbox
+        call before the _output prompt is the bar param selection — no second
+        param checkbox that would be mistaken for the output step 2."""
+        def my_transform(bar: float) -> "pd.Series":
             pass
         reg = CheckRegistry()
         reg.register("my_transform", my_transform, kind="transform")
@@ -419,81 +430,31 @@ class TestOutputPromptParamMirror:
             "Manual escape option must always be present in step 1"
         )
 
-    def test_output_prompt_param_chosen_prechecks_its_columns(
-        self, registry_transform
+    def test_output_prompt_param_chosen_writes_directly(
+        self, registry_single_transform
     ):
-        """When user picks a param in step 1, its columns are pre-checked in step 2.
-
-        bar → [col_a, col_b] via checkbox. Step 1 select picks 'bar'.
-        Step 2 output checkbox must arrive with col_a and col_b pre-checked.
+        """When user picks a param in step 1, its columns are written directly as
+        _output entries — no step 2 checkbox fires. Eliminates Enter-key bleed-through
+        where the Enter that closed step 1 auto-submits step 2's pre-checked items.
         """
-        prompter = _make_prompter_multi(registry_transform)
+        prompter = _make_prompter_multi(registry_single_transform)
         conn = MagicMock()
 
-        captured_output_choices = []
         checkbox_call = [0]
-        select_call = [0]
+        step2_fired = [False]
 
         def capture_select(label, choices, default=None):
-            select_call[0] += 1
             m = MagicMock()
-            # Only select call = _output step 1
-            m.ask.return_value = "bar"  # pick bar to mirror
+            m.ask.return_value = "bar"
             return m
 
         def capture_checkbox(label, choices):
             checkbox_call[0] += 1
             m = MagicMock()
             if checkbox_call[0] == 1:
-                # bar param selection
                 m.ask.return_value = ["col_a", "col_b"]
             else:
-                # _output step 2: capture choices, return pre-checked ones
-                captured_output_choices.extend(choices)
-                m.ask.return_value = [c.value for c in choices if getattr(c, "checked", False)]
-            return m
-
-        with _fill_params_stubs(
-            ["col_a", "col_b", "result"],
-            {"col_a": "DOUBLE", "col_b": "DOUBLE", "result": "DOUBLE"},
-        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
-           patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
-
-            prompter._fill_params(
-                selected_checks=["my_transform"],
-                table="sales",
-                conn=conn,
-                report_name="test_report",
-            )
-
-        by_value = {c.value: c for c in captured_output_choices}
-        assert by_value.get("col_a") and by_value["col_a"].checked is True, (
-            "col_a must be pre-checked when bar is chosen as mirror param"
-        )
-        assert by_value.get("col_b") and by_value["col_b"].checked is True, (
-            "col_b must be pre-checked when bar is chosen as mirror param"
-        )
-
-    def test_output_prompt_manual_has_no_prechecks(self, registry_transform):
-        """When user picks manual escape, no columns are pre-checked in step 2."""
-        prompter = _make_prompter_multi(registry_transform)
-        conn = MagicMock()
-
-        captured_output_choices = []
-        checkbox_call = [0]
-
-        def capture_select(label, choices, default=None):
-            m = MagicMock()
-            m.ask.return_value = choices[-1].value  # always pick manual
-            return m
-
-        def capture_checkbox(label, choices):
-            checkbox_call[0] += 1
-            m = MagicMock()
-            if checkbox_call[0] == 1:
-                m.ask.return_value = ["col_a", "col_b"]  # bar: multi
-            else:
-                captured_output_choices.extend(choices)
+                step2_fired[0] = True
                 m.ask.return_value = []
             return m
 
@@ -502,14 +463,59 @@ class TestOutputPromptParamMirror:
             {"col_a": "DOUBLE", "col_b": "DOUBLE", "result": "DOUBLE"},
         ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
            patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
-
-            prompter._fill_params(
+            _, alias_entries, _ = prompter._fill_params(
                 selected_checks=["my_transform"],
                 table="sales",
                 conn=conn,
                 report_name="test_report",
             )
 
-        assert all(
-            not getattr(c, "checked", False) for c in captured_output_choices
-        ), "Manual selection must produce no pre-checked output columns"
+        assert not step2_fired[0], (
+            "Step 2 checkbox must NOT fire when a param is chosen — direct write only"
+        )
+        output_cols = [e["column"] for e in alias_entries if e["param"] == "_output"]
+        assert set(output_cols) == {"col_a", "col_b"}, (
+            "bar's columns written directly as _output entries"
+        )
+
+    def test_output_prompt_manual_shows_free_checkbox(self, registry_single_transform):
+        """Manual escape shows a free checkbox with no pre-checks. Result is stored."""
+        prompter = _make_prompter_multi(registry_single_transform)
+        conn = MagicMock()
+
+        captured_output_choices = []
+        checkbox_call = [0]
+
+        def capture_select(label, choices, default=None):
+            m = MagicMock()
+            m.ask.return_value = choices[-1].value  # manual
+            return m
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            if checkbox_call[0] == 1:
+                m.ask.return_value = ["col_a", "col_b"]
+            else:
+                captured_output_choices.extend(choices)
+                m.ask.return_value = ["result"]
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b", "result"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE", "result": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
+           patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
+            _, alias_entries, _ = prompter._fill_params(
+                selected_checks=["my_transform"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        assert captured_output_choices, "Manual path must show output checkbox"
+        assert all(not getattr(c, "checked", False) for c in captured_output_choices), (
+            "No columns pre-checked in manual mode"
+        )
+        output_cols = [e["column"] for e in alias_entries if e["param"] == "_output"]
+        assert output_cols == ["result"]

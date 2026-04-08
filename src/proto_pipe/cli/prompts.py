@@ -918,18 +918,11 @@ class ReportConfigPrompter:
         registry_types = get_registry_types(conn, columns=table_cols)
         existing_alias_map = existing_alias_map or []
 
-        # alias_param_to_cols: pre-populate column choices from existing config.
-        # Excludes _output entries — those are write-back hints, not column choices.
         alias_param_to_cols: dict[str, list[str]] = {}
         for entry in existing_alias_map:
-            if entry["param"] != "_output":
-                alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
+            alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
 
-        # Start empty — existing_alias_map is used only for pre-populating choices
-        # (via alias_param_to_cols above). Seeding accumulated_alias with existing
-        # entries causes duplicates on edit: old entries sit before alias_before_check
-        # and survive alongside newly appended entries in the returned alias_map.
-        accumulated_alias: list[dict] = []
+        accumulated_alias: list[dict] = list(existing_alias_map)
 
         checks_with_params = {
             c: get_check_params(c, self._registry)
@@ -1198,24 +1191,24 @@ class ReportConfigPrompter:
                     if mirror_param is None:
                         return [], [], True
 
-                    # Step 2a: param chosen → pre-check those columns
                     if mirror_param != _MANUAL_SELECT:
-                        precheck_output = set(multi_col_params[mirror_param])
-                        output_choices = _make_col_choices(
-                            table_cols, registry_types, precheck=precheck_output
-                        )
+                        # Param chosen → directly use that param's columns as output.
+                        # No second prompt: step 1 IS the selection. A second checkbox
+                        # causes Enter-key bleed-through (the Enter that closed step 1
+                        # immediately submits step 2's pre-checked items).
+                        for col in multi_col_params[mirror_param]:
+                            accumulated_alias.append({"param": "_output", "column": col})
                     else:
-                        # Step 2b: manual → no pre-selection
+                        # Manual → user picks output columns freely from full column list.
                         output_choices = _make_col_choices(table_cols, registry_types)
-
-                    output_vals = questionary.checkbox(
-                        "Output columns:",
-                        choices=output_choices,
-                    ).ask()
-                    if output_vals is None:
-                        return [], [], True
-                    for col in output_vals:
-                        accumulated_alias.append({"param": "_output", "column": col})
+                        output_vals = questionary.checkbox(
+                            "Output columns:",
+                            choices=output_choices,
+                        ).ask()
+                        if output_vals is None:
+                            return [], [], True
+                        for col in output_vals:
+                            accumulated_alias.append({"param": "_output", "column": col})
 
             record_param_history(conn, check_name, report_name, table, filled_params)
             entry = {"name": check_name}
