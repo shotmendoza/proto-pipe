@@ -607,7 +607,11 @@ def _compute_report(
         f"{source_table}_report" if source_table else report_name,
     )
 
-    conn = duckdb.connect(pipeline_db)
+    # read_only=True allows multiple concurrent threads to open this file
+    # simultaneously without acquiring the exclusive write lock. This is what
+    # makes Phase 1 parallel execution safe — all _compute_report calls are
+    # reading, never writing.
+    conn = duckdb.connect(pipeline_db, read_only=True)
     try:
         # 1. Compute check_set_hash
         check_entries = report_config.get("checks", [])
