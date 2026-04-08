@@ -918,11 +918,18 @@ class ReportConfigPrompter:
         registry_types = get_registry_types(conn, columns=table_cols)
         existing_alias_map = existing_alias_map or []
 
+        # alias_param_to_cols: pre-populate column choices from existing config.
+        # Excludes _output entries — those are write-back hints, not column choices.
         alias_param_to_cols: dict[str, list[str]] = {}
         for entry in existing_alias_map:
-            alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
+            if entry["param"] != "_output":
+                alias_param_to_cols.setdefault(entry["param"], []).append(entry["column"])
 
-        accumulated_alias: list[dict] = list(existing_alias_map)
+        # Start empty — existing_alias_map is used only for pre-populating choices
+        # (via alias_param_to_cols above). Seeding accumulated_alias with existing
+        # entries causes duplicates on edit: old entries sit before alias_before_check
+        # and survive alongside newly appended entries in the returned alias_map.
+        accumulated_alias: list[dict] = []
 
         checks_with_params = {
             c: get_check_params(c, self._registry)
