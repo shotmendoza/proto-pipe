@@ -409,13 +409,12 @@ class TestMultiselectGatePreventExpansion:
             BUILT_IN_CHECKS.pop("no_params_check", None)
 
     def test_non_series_return_not_expanded(self):
-        """Function without pd.Series[bool] return must not expand.
+        """Function without pd.Series or pd.DataFrame return must not expand.
 
-        KNOWN CODE BUG: register_from_config does not call is_multiselect_eligible()
-        before expanding alias_map. Functions without pd.Series[bool] return are still
-        expanded by alias_map before registration fails. Fix needed in io/registry.py:
-        check is_multiselect_eligible() before calling _expand_check_with_alias_map.
-        Tracked in Spec deferred work. This test must remain failing until fixed.
+        is_expandable() in CheckParamInspector gates alias_map expansion:
+        only functions returning pd.Series or pd.DataFrame are expanded.
+        Dict-returning functions must always register as a single check
+        regardless of alias_map contents.
         """
         from proto_pipe.io.registry import register_from_config
         from proto_pipe.checks.built_in import BUILT_IN_CHECKS
@@ -444,3 +443,107 @@ class TestMultiselectGatePreventExpansion:
             )
         finally:
             BUILT_IN_CHECKS.pop("dict_return_check", None)
+
+
+# ===========================================================================
+# CheckParamInspector.is_expandable() — behavioral guarantees (rule 9)
+# ===========================================================================
+
+class TestIsExpandable:
+    """Behavioral guarantees for CheckParamInspector.is_expandable().
+
+    is_expandable() is the alias_map expansion gate in _expand_check_with_alias_map.
+    True for pd.Series and pd.DataFrame returns; False for dict, unannotated, int etc.
+    """
+
+    def test_series_bool_return_is_expandable(self):
+        """pd.Series[bool]-returning function (check) is expandable."""
+        def check(col: str) -> "pd.Series[bool]":
+            pass
+        assert CheckParamInspector(check).is_expandable() is True
+
+    def test_series_return_is_expandable(self):
+        """pd.Series-returning function (transform) is expandable."""
+        def transform(col: str) -> "pd.Series":
+            pass
+        assert CheckParamInspector(transform).is_expandable() is True
+
+    def test_dataframe_return_is_expandable(self):
+        """pd.DataFrame-returning function (transform) is expandable."""
+        def transform(df: "pd.DataFrame") -> "pd.DataFrame":
+            pass
+        assert CheckParamInspector(transform).is_expandable() is True
+
+    def test_dict_return_is_not_expandable(self):
+        """dict-returning function must not be expandable — per-column semantics undefined."""
+        def bad_check(col: str) -> dict:
+            pass
+        assert CheckParamInspector(bad_check).is_expandable() is False
+
+    def test_int_return_is_not_expandable(self):
+        """int-returning function is not expandable."""
+        def scalar_func(col: str) -> int:
+            pass
+        assert CheckParamInspector(scalar_func).is_expandable() is False
+
+    def test_unannotated_return_is_not_expandable(self):
+        """Function with no return annotation is not expandable."""
+        def unannotated(col: str):
+            pass
+        assert CheckParamInspector(unannotated).is_expandable() is False
+
+    def test_expand_gate_blocks_dict_return(self):
+        """_expand_check_with_alias_map registers single check for dict-returning function.
+
+        Integration guarantee: even when alias_map has entries, a dict-returning
+        function must never produce more than one resolved check.
+        """
+        from proto_pipe.io.registry import _expand_check_with_alias_map, _build_alias_param_map
+        from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+
+        def dict_func(col: str) -> dict:
+            pass
+
+        BUILT_IN_CHECKS["_test_dict_func"] = dict_func
+        try:
+            reg = CheckRegistry()
+            reg.register("_test_dict_func", dict_func)
+            names = _expand_check_with_alias_map(
+                func_name="_test_dict_func",
+                params={},
+                alias_param_map={"col": ["A", "B", "C"]},
+                check_registry=reg,
+            )
+            assert len(names) == 1, (
+                f"dict-returning function must not be expanded by alias_map, got {len(names)}"
+            )
+        finally:
+            BUILT_IN_CHECKS.pop("_test_dict_func", None)
+
+    def test_expand_gate_allows_series_return(self):
+        """_expand_check_with_alias_map expands pd.Series[bool]-returning function.
+
+        Integration guarantee: a check with pd.Series[bool] return and N alias_map
+        entries produces N resolved checks.
+        """
+        from proto_pipe.io.registry import _expand_check_with_alias_map
+        from proto_pipe.checks.built_in import BUILT_IN_CHECKS
+
+        def series_check(col: str) -> "pd.Series[bool]":
+            pass
+
+        BUILT_IN_CHECKS["_test_series_check"] = series_check
+        try:
+            reg = CheckRegistry()
+            reg.register("_test_series_check", series_check)
+            names = _expand_check_with_alias_map(
+                func_name="_test_series_check",
+                params={},
+                alias_param_map={"col": ["A", "B"]},
+                check_registry=reg,
+            )
+            assert len(names) == 2, (
+                f"pd.Series[bool]-returning check must expand to 2, got {len(names)}"
+            )
+        finally:
+            BUILT_IN_CHECKS.pop("_test_series_check", None)

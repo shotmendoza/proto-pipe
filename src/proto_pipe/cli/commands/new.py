@@ -13,6 +13,7 @@ from proto_pipe.cli.scaffold import (
     _scan_incoming,
     get_original_func,
     get_unconfigured_tables,
+    get_all_source_tables,
     build_rich_sql_scaffold,
     _scan_macros,
     filter_unconfigured,
@@ -194,14 +195,17 @@ def new_report(reports_config, pipeline_db):
         click.echo("\n[warn] No checks available. Add built-in or custom checks first.")
         return
 
-    available_tables = get_unconfigured_tables(p_db, {"reports": config.all()})
-    if not available_tables:
+    all_tables = get_all_source_tables(p_db, {"reports": config.all()})
+    if not all_tables:
         click.echo(
-            "\n  No unconfigured tables found. Either all tables already have "
-            "reports defined, or no tables have been ingested yet.\n"
-            "  Run: vp ingest to load files first."
+            "\n  No tables found. Run: vp ingest to load files first."
         )
         return
+
+    # all_tables is list[tuple[str, int]] — prompt_table in prompts.py
+    # builds the annotated questionary.Choice objects (CLAUDE.md: prompts.py
+    # owns all CLI formatting; command files never call questionary directly).
+    table_choices = all_tables
 
     click.echo("\n── New Report ──────────────────────────────")
     click.echo("  Press ESC at any prompt to go back to the previous step.\n")
@@ -220,7 +224,7 @@ def new_report(reports_config, pipeline_db):
             CheckParamInspector(original).write_to_db(conn, check_name)
 
     try:
-        if not prompter.run(available_tables, config.names(), conn):
+        if not prompter.run(table_choices, config.names(), conn):
             click.echo("Cancelled.")
             return
     finally:

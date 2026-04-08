@@ -209,6 +209,35 @@ def get_param_suggestions(
     return suggestions
 
 
+
+def get_column_param_history(
+    conn: "duckdb.DuckDBPyConnection",
+    check_name: str,
+    param_name: str,
+) -> list[str]:
+    """Return historical column values for a check+param combination, most recent first.
+
+    Unlike get_param_suggestions, this returns the raw stored values without
+    similarity filtering against the current source's columns. The caller
+    intersects with available columns and builds the precheck/default from
+    the result — because these are explicit user declarations, not guesses.
+
+    Used to pre-select columns in vp new report when the same check+param
+    has been configured on other sources.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT DISTINCT param_value
+            FROM check_params_history
+            WHERE check_name = ? AND param_name = ?
+            ORDER BY recorded_at DESC
+            LIMIT 20
+        """, [check_name, param_name]).fetchall()
+    except Exception:
+        return []
+
+    return [row[0] for row in rows if row[0]]
+
 def record_param_history(
     conn: duckdb.DuckDBPyConnection,
     check_name: str,
@@ -317,6 +346,45 @@ def get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str]
     return [
         t for t in all_tables
         if t not in PIPELINE_TABLES and t not in configured
+    ]
+
+
+def get_all_source_tables(
+    pipeline_db: str,
+    reports_config: dict,
+) -> list[tuple[str, int]]:
+    """Return all non-pipeline tables with their current report count.
+
+    Unlike get_unconfigured_tables, this returns ALL source tables — including
+    those that already have reports defined — with an annotation showing how
+    many reports reference each table. This allows the vp new report prompt
+    to show all available tables rather than filtering configured ones out,
+    since one source table can back multiple reports.
+
+    :param pipeline_db:     Path to the pipeline DuckDB file.
+    :param reports_config:  Reports config dict (may contain "reports" list).
+    :return:                Sorted list of (table_name, report_count) tuples.
+    """
+    report_counts: dict[str, int] = {}
+    for r in reports_config.get("reports", []):
+        table = r.get("source", {}).get("table", "")
+        if table:
+            report_counts[table] = report_counts.get(table, 0) + 1
+
+    try:
+        conn = duckdb.connect(pipeline_db)
+        all_tables = conn.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'main'
+        """).df()["table_name"].tolist()
+        conn.close()
+    except Exception:
+        return []
+
+    return [
+        (t, report_counts.get(t, 0))
+        for t in sorted(all_tables)
+        if t not in PIPELINE_TABLES
     ]
 
 

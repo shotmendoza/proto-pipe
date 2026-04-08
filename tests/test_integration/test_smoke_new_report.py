@@ -115,8 +115,8 @@ class TestVpNewReportSmoke:
              patch("proto_pipe.io.config.config_path_or_override",
                    return_value=str(tmp_path / "reports_config.yaml")), \
              patch("proto_pipe.io.config.ReportConfig", return_value=mock_report_config), \
-             patch("proto_pipe.cli.commands.new.get_unconfigured_tables",
-                   return_value=["sales"]), \
+             patch("proto_pipe.cli.commands.new.get_all_source_tables",
+                   return_value=[("sales", 0)]), \
              patch("proto_pipe.cli.commands.new.duckdb.connect",
                    return_value=mock_conn), \
              patch("proto_pipe.io.db.init_check_registry_metadata"), \
@@ -161,7 +161,7 @@ class TestVpNewReportSmoke:
              patch("proto_pipe.io.config.config_path_or_override",
                    return_value=str(tmp_path / "reports_config.yaml")), \
              patch("proto_pipe.io.config.ReportConfig", return_value=mock_report_config), \
-             patch("proto_pipe.cli.commands.new.get_unconfigured_tables",
+             patch("proto_pipe.cli.commands.new.get_all_source_tables",
                    return_value=[]), \
              patch("proto_pipe.cli.commands.new.duckdb.connect",
                    return_value=mock_conn), \
@@ -186,8 +186,8 @@ class TestVpNewReportSmoke:
              patch("proto_pipe.io.config.config_path_or_override",
                    return_value=str(tmp_path / "reports_config.yaml")), \
              patch("proto_pipe.io.config.ReportConfig", return_value=mock_report_config), \
-             patch("proto_pipe.cli.commands.new.get_unconfigured_tables",
-                   return_value=["sales"]), \
+             patch("proto_pipe.cli.commands.new.get_all_source_tables",
+                   return_value=[("sales", 0)]), \
              patch("proto_pipe.cli.commands.new.duckdb.connect",
                    return_value=mock_conn), \
              patch("proto_pipe.io.db.init_check_registry_metadata"), \

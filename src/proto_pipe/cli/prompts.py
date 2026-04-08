@@ -560,6 +560,12 @@ def _make_col_choices(
     ]
 
 
+# Sentinel for the free-text escape hatch in column-picker prompts.
+# When selected, the user types a value directly → filled_params (broadcast constant)
+# rather than alias_map (column-backed per-row). Never stored in alias_map.
+_DIRECT_ENTRY = "\u270e Enter value directly"
+
+
 # ---------------------------------------------------------------------------
 # ReportConfigPrompter
 # ---------------------------------------------------------------------------
@@ -685,13 +691,35 @@ class ReportConfigPrompter:
     # Individual prompt methods
     # ---------------------------------------------------------------------------
 
-    def prompt_table(self, available_tables: list[str]) -> str | None:
-        """Prompt for source table selection. Returns None if cancelled."""
+    def prompt_table(self, available_tables) -> str | None:
+        """Prompt for source table selection. Returns None if cancelled.
+
+        Accepts list[str] (plain table names) or list[tuple[str, int]]
+        (table_name, report_count) from get_all_source_tables. When tuples
+        are provided, annotated questionary.Choice objects are built here —
+        keeping all questionary formatting inside prompts.py (CLAUDE.md rule).
+        The value of each choice is always the raw table name string.
+        """
         default = self._existing.get("source", {}).get("table")
+        if available_tables and isinstance(available_tables[0], tuple):
+            choices = [
+                questionary.Choice(
+                    title=f"{name}  ({count} report{'s' if count != 1 else ''})"
+                    if count > 0 else name,
+                    value=name,
+                )
+                for name, count in available_tables
+            ]
+            default_val = default if any(
+                c.value == default for c in choices
+            ) else None
+        else:
+            choices = list(available_tables)
+            default_val = default if default in choices else None
         return questionary.select(
             "Which table should this report run against?",
-            choices=available_tables,
-            default=default if default in available_tables else None,
+            choices=choices,
+            default=default_val,
         ).ask()
 
     def prompt_name(self, existing_names: list[str], default: str) -> str | None:
@@ -880,6 +908,7 @@ class ReportConfigPrompter:
             get_original_func,
             get_check_params,
             get_param_suggestions,
+            get_column_param_history,
             record_param_history,
             is_list_annotation,
         )
@@ -939,9 +968,16 @@ class ReportConfigPrompter:
                     and inspector.is_multiselect_eligible()
             )
             col_params = inspector.column_params() if inspector else []
+            # pd.Series params: column picker only, no escape hatch (unchanged behaviour)
+            series_param_set = set(inspector.series_params()) if inspector else set()
+            # int/float params eligible for column-backing (empty when pd.Series present)
+            col_backed_scalars = set(inspector.column_backed_scalar_params()) if inspector else set()
+            # All params that get column picker: Series + str/unannotated + eligible int/float
+            all_col_picker_params = set(col_params) | col_backed_scalars
             sig = inspect.signature(inspector.func) if inspector else None
 
             filled_params: dict = {}
+            alias_before_check = len(accumulated_alias)  # for _output prompt
 
             for param_name, default in params.items():
                 ann = (
@@ -950,44 +986,84 @@ class ReportConfigPrompter:
                     else inspect.Parameter.empty
                 )
 
-                if param_name in col_params:
+                if param_name in all_col_picker_params:
+                    table_cols_set = set(table_cols)
                     alias_cols = alias_param_to_cols.get(param_name, [])
+                    auto_match = param_name if param_name in table_cols_set else None
+
                     if alias_cols:
                         ordered = alias_cols + [c for c in table_cols if c not in alias_cols]
+                        precheck_cols = set(alias_cols)
+                        default_col = alias_cols[0]
                     else:
-                        history = get_param_suggestions(conn, check_name, param_name, table_cols)
-                        ordered = history + [c for c in table_cols if c not in history]
+                        raw_history = get_column_param_history(conn, check_name, param_name)
+                        historical_in_source = [c for c in raw_history if c in table_cols_set]
+                        ordered = historical_in_source + [
+                            c for c in table_cols if c not in historical_in_source
+                        ]
+                        precheck_cols = set(historical_in_source)
+                        default_col = historical_in_source[0] if historical_in_source else None
 
-                    # Auto-populate: exact param name match pre-selects the column
-                    auto_match = param_name if param_name in table_cols else None
+                    if auto_match:
+                        precheck_cols.add(auto_match)
+                        if default_col is None:
+                            default_col = auto_match
+
+                    # pd.Series params never get the escape hatch — they are always
+                    # column selectors by annotation. str/unannotated/int/float params
+                    # get the escape hatch so the user can enter a broadcast constant.
+                    has_escape = param_name not in series_param_set
 
                     if eligible:
                         click.echo(
-                            f"  \u2139  Selecting multiple columns will run '{check_name}'"
+                            f"  ℹ  Selecting multiple columns will run '{check_name}'"
                             f" once per column."
                         )
-                        precheck = {auto_match} if auto_match else set()
-                        choices = _make_col_choices(ordered, registry_types, precheck=precheck)
+                        choices = _make_col_choices(ordered, registry_types, precheck=precheck_cols)
                         value = questionary.checkbox(f"{param_name}:", choices=choices).ask()
                         if value is None:
                             return [], [], True
                         value = sorted(value)
                         for col in value:
                             if not any(
-                                    e["param"] == param_name and e["column"] == col
-                                    for e in accumulated_alias
+                                e["param"] == param_name and e["column"] == col
+                                for e in accumulated_alias
                             ):
                                 accumulated_alias.append({"param": param_name, "column": col})
                     else:
-                        choices = _make_col_choices(ordered, registry_types)
+                        col_choices = _make_col_choices(ordered, registry_types)
+                        if has_escape:
+                            col_choices = col_choices + [
+                                questionary.Choice(title=_DIRECT_ENTRY, value=_DIRECT_ENTRY)
+                            ]
+
                         value = questionary.select(
-                            f"{param_name}:", choices=choices, default=auto_match
+                            f"{param_name}:", choices=col_choices, default=default_col
                         ).ask()
                         if value is None:
                             return [], [], True
+
+                        if value == _DIRECT_ENTRY:
+                            raw = questionary.text(
+                                f"{param_name} (enter value directly):"
+                            ).ask()
+                            if raw is None:
+                                return [], [], True
+                            if raw:
+                                try:
+                                    parsed: object = (
+                                        int(raw) if "." not in raw else float(raw)
+                                    )
+                                except ValueError:
+                                    parsed = raw
+                            else:
+                                parsed = raw
+                            filled_params[param_name] = parsed
+                            continue  # skip alias_map — broadcast constant
+
                         if not any(
-                                e["param"] == param_name and e["column"] == value
-                                for e in accumulated_alias
+                            e["param"] == param_name and e["column"] == value
+                            for e in accumulated_alias
                         ):
                             accumulated_alias.append({"param": param_name, "column": value})
 
@@ -995,16 +1071,12 @@ class ReportConfigPrompter:
                         e["column"] for e in accumulated_alias if e["param"] == param_name
                     ]
 
-                    # Write column param selections to check_params_history so
-                    # get_param_suggestions can surface them as cross-source
-                    # suggestions when the same check+param is configured on a
-                    # different source. One entry per column — _similar_columns
-                    # matches individual names, not serialised lists (rule 14).
                     col_values = value if isinstance(value, list) else [value]
                     for col_val in col_values:
-                        record_param_history(
-                            conn, check_name, report_name, table, {param_name: col_val}
-                        )
+                        if col_val != _DIRECT_ENTRY:
+                            record_param_history(
+                                conn, check_name, report_name, table, {param_name: col_val}
+                            )
 
                 elif is_list_annotation(ann) or isinstance(default, list):
                     suggestions = get_param_suggestions(conn, check_name, param_name, table_cols)
@@ -1059,6 +1131,41 @@ class ReportConfigPrompter:
                     if overwrite_cols is None:
                         return [], [], True
                     filled_params["overwrite_cols"] = sorted(overwrite_cols)
+
+            # _output prompt for transforms with column-backed params
+            # Fires when transform alias entries were added this check.
+            # Checks never need _output — results go to validation_block.
+            new_alias_entries = accumulated_alias[alias_before_check:]
+            input_alias_entries = [
+                e for e in new_alias_entries if e["param"] != "_output"
+            ]
+            if kind == "transform" and input_alias_entries:
+                n_runs = max(
+                    len([e for e in input_alias_entries if e["param"] == p])
+                    for p in {e["param"] for e in input_alias_entries}
+                )
+                click.echo(
+                    f"\n  \u2139  '{check_name}' is a transform. "
+                    f"Select the output column(s) where each run's result "
+                    f"should be written ({n_runs} run(s) — select {n_runs} to align)."
+                )
+                if n_runs == 1:
+                    output_val = questionary.select(
+                        "Output column:",
+                        choices=_make_col_choices(table_cols, registry_types),
+                    ).ask()
+                    if output_val is None:
+                        return [], [], True
+                    accumulated_alias.append({"param": "_output", "column": output_val})
+                else:
+                    output_vals = questionary.checkbox(
+                        f"Output columns (select exactly {n_runs} to match input columns):",
+                        choices=_make_col_choices(table_cols, registry_types),
+                    ).ask()
+                    if output_vals is None:
+                        return [], [], True
+                    for col in output_vals:
+                        accumulated_alias.append({"param": "_output", "column": col})
 
             record_param_history(conn, check_name, report_name, table, filled_params)
             entry = {"name": check_name}

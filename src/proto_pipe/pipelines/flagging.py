@@ -441,15 +441,20 @@ def build_validation_flag_export(
 def compute_check_set_hash(
     check_entries: list[dict],
     check_registry,
+    alias_map: list[dict] | None = None,
 ) -> str:
     """Compute a stable hash of the current check set for a report.
 
-    Hash covers: check names + function source code hashes.
-    If a check is added, removed, or its function body changes, the hash
-    changes and vp validate will notify the user.
+    Hash covers: check names + function source code hashes + alias_map contents.
+    If a check is added, removed, its function body changes, or any alias_map
+    routing changes (column-backed ↔ constant), the hash changes and vp validate
+    will notify the user and trigger revalidation.
 
     :param check_entries:   List of check config dicts from reports_config.yaml.
     :param check_registry:  CheckRegistry instance with loaded checks.
+    :param alias_map:       Report alias_map list — included so routing changes
+                            trigger revalidation. Pass None for legacy callers
+                            (alias_map excluded from hash until runner is updated).
     :return:                32-character hex md5 string.
     """
     import inspect
@@ -467,6 +472,15 @@ def compute_check_set_hash(
         except (OSError, TypeError):
             src_hash = "unknown"
         parts.append(f"{name}:{src_hash}")
+
+    # Include alias_map so any routing change (column-backed ↔ constant,
+    # or column reassignment) triggers revalidation. Sorted for determinism.
+    if alias_map:
+        alias_str = "|".join(
+            f"{e.get('param')}:{e.get('column')}"
+            for e in sorted(alias_map, key=lambda e: (e.get("param", ""), e.get("column", "")))
+        )
+        parts.append(f"alias_map:{alias_str}")
 
     combined = "|".join(parts)
     return hashlib.md5(combined.encode()).hexdigest()

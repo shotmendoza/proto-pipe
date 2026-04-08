@@ -29,12 +29,14 @@ from proto_pipe.io.data import load_from_duckdb
 from proto_pipe.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from proto_pipe.pipelines.watermark import WatermarkStore, _watermark_lock
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckParamInspector
+from proto_pipe.constants import DUCKDB_TYPE_MAP
 from proto_pipe.pipelines.query import _log_run, init_report_runs_table
 
 
 # ---------------------------------------------------------------------------
 # Dependency inference helpers
 # ---------------------------------------------------------------------------
+
 def _get_target_table(report_config: dict) -> str:
     """Compute the output table name for a report config.
 
@@ -128,17 +130,23 @@ def _apply_transforms_with_gate(
     pk_col: str | None,
     conn: duckdb.DuckDBPyConnection,
     registry_types: dict[str, str],
+    alias_map: list[dict] | None = None,
 ) -> None:
     """Apply transforms with a TRY_CAST gate before writing back to DuckDB.
 
     For each transform:
       - Scalar transform (no pd.Series/pd.DataFrame params) → attempt DuckDB
         Python UDF registration; fall back to pandas on failure.
+        Column-backed scalar params (int/float in alias_map) become SQL column
+        references; the _output alias_map entry determines the write-back column.
       - Series/DataFrame transform → pandas execution → TRY_CAST gate in DuckDB
         → UPDATE clean rows in report table, bad rows to validation_block.
 
     A single UPDATE per transform (not DROP+CREATE) so the report table is
     never fully replaced — only affected rows are touched.
+
+    alias_map: the report's alias_map list, used by _apply_scalar_transform_duckdb
+    to resolve column-backed params and _output write-back columns.
     """
     from proto_pipe.pipelines.flagging import FlagRecord, write_validation_flags
     from proto_pipe.io.db import flag_id_for
@@ -159,7 +167,8 @@ def _apply_transforms_with_gate(
                 # Try DuckDB Python UDF path
                 try:
                     _apply_scalar_transform_duckdb(
-                        name, func, df, target_table, conn, registry_types
+                        name, func, df, target_table, conn, registry_types,
+                        alias_map=alias_map,
                     )
                     continue
                 except Exception as udf_exc:
@@ -258,6 +267,58 @@ def _apply_transforms_with_gate(
     )
 
 
+def _annotation_to_duckdb(ann) -> type:
+    """Map a Python return annotation to a Python type for DuckDB UDF registration.
+
+    DuckDB cannot infer return type from *args wrapper functions — it must be
+    supplied explicitly. DuckDB accepts Python native types (float, int, str, bool)
+    directly in create_function(), so no duckdb.typing import is needed.
+    Falls back to float (DOUBLE) for unrecognised or missing annotations.
+    """
+    import inspect
+    if ann is inspect.Parameter.empty:
+        return float
+    s = str(ann).lower()
+    if "bool" in s:   return bool
+    if "float" in s:  return float
+    if "int" in s:    return int
+    if "str" in s:    return str
+    return float
+
+
+def _resolve_output_col(
+    alias_map: list[dict],
+    col_backed_params: dict[str, str],
+) -> str | None:
+    """Resolve the _output write-back column for a given expanded check run.
+
+    Matches the baked-in column values (col_backed_params) against the alias_map
+    to determine the run index, then returns the corresponding _output column.
+
+    col_backed_params: {param_name: column_name} for all column-backed params
+    in this registered expanded check (derived from the partial's keywords).
+
+    Returns None when no _output entries exist in alias_map (legacy transforms
+    that write back to the input column fall through to the caller's fallback).
+    """
+    output_cols = [e["column"] for e in alias_map if e["param"] == "_output"]
+    if not output_cols:
+        return None
+
+    # Find run index by matching any baked column value against its alias_map entries
+    for param_name, baked_col in col_backed_params.items():
+        param_entries = [
+            e["column"] for e in alias_map
+            if e["param"] == param_name and e["param"] != "_output"
+        ]
+        if baked_col in param_entries:
+            run_index = param_entries.index(baked_col)
+            if run_index < len(output_cols):
+                return output_cols[run_index]
+
+    return None
+
+
 def _apply_scalar_transform_duckdb(
     name: str,
     func,
@@ -265,6 +326,7 @@ def _apply_scalar_transform_duckdb(
     target_table: str,
     conn: duckdb.DuckDBPyConnection,
     registry_types: dict[str, str],
+    alias_map: list[dict] | None = None,
 ) -> None:
     """Apply a scalar transform by registering as a DuckDB Python UDF.
 
@@ -272,26 +334,114 @@ def _apply_scalar_transform_duckdb(
     value-by-value. This keeps the operation inside DuckDB without a pandas
     round-trip.
 
+    Column-backed scalar params (int/float in alias_map): the baked-in value
+    is a column name. Detected by checking if the partial keyword value exists
+    in df.columns. These become SQL column references: func_udf(col_a, col_b).
+
+    Broadcast constant params: baked-in as actual values via partial — DuckDB
+    receives them via the UDF closure, not as SQL column references.
+
+    Write-back column: determined from _output entries in alias_map. Falls back
+    to the first column-backed param's column when no _output is present (legacy
+    single-column str-param transforms that write back to the input column).
+
     Raises on failure so the caller can fall back to pandas.
     """
     import inspect
+    from functools import partial as _partial
 
-    # Get the scalar column this transform operates on from the function signature
-    sig = inspect.signature(func)
-    params = list(sig.parameters.values())
-    if not params:
+    df_cols = set(df.columns)
+
+    # Unwrap partial to find baked-in keywords (column names or constants)
+    baked_keywords: dict = {}
+    if hasattr(func, "keywords"):
+        baked_keywords = dict(func.keywords)
+
+    # Get original function signature (through partial wrapping) to preserve param order
+    original = func
+    while hasattr(original, "func"):
+        original = original.func
+    sig = inspect.signature(original)
+    all_params = [p.name for p in sig.parameters.values()]
+
+    if not all_params:
         raise ValueError(f"Scalar transform '{name}' has no parameters")
 
-    col_param = params[0].name  # first param assumed to be the input column
-    if col_param not in df.columns:
-        raise ValueError(f"Column '{col_param}' not in DataFrame")
+    # Identify column-backed params: baked value is a string that exists in df.columns.
+    # Broadcast constants: actual typed values (int, float) or strings not in df.columns.
+    col_backed: dict[str, str] = {}   # {param_name: column_name}
+    for param_name in all_params:
+        baked_val = baked_keywords.get(param_name)
+        if isinstance(baked_val, str) and baked_val in df_cols:
+            col_backed[param_name] = baked_val
 
-    # Register UDF and run UPDATE in DuckDB
+    if not col_backed:
+        raise ValueError(
+            f"Scalar transform '{name}' has no column-backed params in alias_map "
+            f"and no first-param column to operate on."
+        )
+
+    # Determine write-back column from _output in alias_map, or fall back to
+    # the first column-backed param's column (legacy single-col transform behaviour).
+    output_col = _resolve_output_col(alias_map or [], col_backed) if alias_map else None
+    if output_col is None:
+        # Fallback: first column-backed param writes result back to its own column.
+        # This preserves existing behaviour for str-param transforms like normalize(col).
+        first_col_param = next(
+            (p for p in all_params if p in col_backed), None
+        )
+        if first_col_param is None:
+            raise ValueError(f"Cannot determine output column for transform '{name}'")
+        output_col = col_backed[first_col_param]
+
+    if output_col not in df_cols:
+        raise ValueError(
+            f"Output column '{output_col}' for transform '{name}' not in DataFrame"
+        )
+
+    # Build SQL args in signature order: column-backed params as SQL column refs.
+    col_param_names = [p for p in all_params if p in col_backed]
+    sql_col_args = ", ".join(f'"{col_backed[p]}"' for p in col_param_names)
+
+    # Cannot register the partial directly as a DuckDB UDF. DuckDB passes SQL
+    # column values positionally, conflicting with the partial's baked-in keyword
+    # args, causing 'multiple values for argument' errors. Build a wrapper that
+    # accepts only column-backed params positionally and closes over constants.
+    constant_kwargs = {k: v for k, v in baked_keywords.items() if k not in col_backed}
+
+
+    # Build wrapper with explicit N named params — DuckDB validates that the
+    # number of types in 'parameters' matches the function's named param count.
+    # *args wrappers have 0 named params, causing arity mismatch errors.
+    # exec() creates a wrapper with exactly N named positional params.
+    _arg_names = [f"_a{i}" for i in range(len(col_param_names))]
+    _call_kwargs = ", ".join(
+        f"'{col_param_names[i]}': _a{i}" for i in range(len(col_param_names))
+    )
+    _exec_ns: dict = {"original": original, "constant_kwargs": constant_kwargs}
+    exec(
+        f"def _wrapper({', '.join(_arg_names)}): "
+        f"return original(**{{{_call_kwargs}}}, **constant_kwargs)",
+        _exec_ns,
+    )
+    udf_wrapper = _exec_ns["_wrapper"]
+
     udf_name = f"_udf_{name}"
     try:
-        conn.create_function(udf_name, func)
+        # Pass input and return types explicitly — DuckDB cannot infer types
+        # from *args wrappers. Input types come from registry_types (column
+        # declarations). Return type comes from the original function annotation.
+        param_ddb_types = [
+            DUCKDB_TYPE_MAP.get(
+                registry_types.get(col_backed[p], "DOUBLE").upper().split("|")[0].strip(),
+                DUCKDB_TYPE_MAP["DOUBLE"],
+            )
+            for p in col_param_names
+        ]
+        return_ddb_type = _annotation_to_duckdb(sig.return_annotation)
+        conn.create_function(udf_name, udf_wrapper, param_ddb_types, return_ddb_type)
         conn.execute(
-            f'UPDATE "{target_table}" SET "{col_param}" = {udf_name}("{col_param}")'
+            f'UPDATE "{target_table}" SET "{output_col}" = {udf_name}({sql_col_args})'
         )
     finally:
         try:
@@ -496,7 +646,8 @@ def run_report(
 
         # 1. Compute check_set_hash
         check_entries = report_config.get("checks", [])
-        current_hash = compute_check_set_hash(check_entries, check_registry)
+        alias_map = report_config.get("alias_map", [])
+        current_hash = compute_check_set_hash(check_entries, check_registry, alias_map=alias_map)
 
         # 2. Detect check set changes
         prior_hash = get_current_check_set_hash(conn, report_name)
@@ -652,6 +803,7 @@ def run_report(
                 pk_col=pk_col,
                 conn=conn,
                 registry_types=registry_types,
+                alias_map=alias_map,
             )
 
         # 9. Update validation_pass for all processed records

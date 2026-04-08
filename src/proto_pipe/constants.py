@@ -65,6 +65,33 @@ DATE_FORMATS = [
 
 # Common DuckDB types shown in all type selection prompts
 DUCKDB_TYPES = ["VARCHAR", "DOUBLE", "BIGINT", "BOOLEAN", "DATE", "TIMESTAMPTZ"]
+
+# Maps column_type_registry type strings to Python native types.
+# Used when registering Python UDFs via conn.create_function() — DuckDB accepts
+# Python types (float, int, str, bool) directly for parameter and return type
+# declarations, avoiding any duckdb.typing dependency here.
+# Defined in constants.py alongside NUMERIC_DUCKDB_TYPES and DUCKDB_TYPES as
+# the canonical DuckDB type vocabulary for the codebase.
+DUCKDB_TYPE_MAP: dict[str, type] = {
+    "DOUBLE":      float,
+    "FLOAT":       float,
+    "REAL":        float,
+    "DECIMAL":     float,
+    "NUMERIC":     float,
+    "BIGINT":      int,
+    "INTEGER":     int,
+    "INT":         int,
+    "SMALLINT":    int,
+    "TINYINT":     int,
+    "HUGEINT":     int,
+    "VARCHAR":     str,
+    "TEXT":        str,
+    "DATE":        str,
+    "TIMESTAMP":   str,
+    "TIMESTAMPTZ": str,
+    "BOOLEAN":     bool,
+    "BOOL":        bool,
+}
 _DEFAULTS = {
     "paths": {
         "sources_config": "config/sources_config.yaml",

@@ -484,8 +484,92 @@ class CheckParamInspector:
         return self._sig.return_annotation is inspect.Parameter.empty
 
     def is_multiselect_eligible(self) -> bool:
-        """True if the function returns pd.Series AND has at least one column param."""
-        return self.returns_boolean_series() and len(self.column_params()) > 0
+        """True if the function returns pd.Series AND has at least one expandable param.
+
+        Expandable params include column selectors (str/Series/unannotated) and
+        column-backed scalars (int/float when no pd.Series params present). Both
+        go through the same alias_map expansion process.
+        """
+        return self.returns_boolean_series() and (
+            len(self.column_params()) > 0
+            or len(self.column_backed_scalar_params()) > 0
+        )
+
+    def has_series_params(self) -> bool:
+        """True if the function has any pd.Series-annotated params.
+
+        When True, the highest-granularity gate applies: all non-Series,
+        non-DataFrame params skip the column picker and go straight to
+        constant entry. No type exceptions.
+        """
+        return any(
+            _is_series_annotation(param.annotation)
+            for name, param in self._sig.parameters.items()
+            if name != "context"
+        )
+
+    def series_params(self) -> list[str]:
+        """Return param names annotated as pd.Series.
+
+        Subset of column_params(). Used by prompts.py to distinguish Series params
+        (column picker, no escape hatch) from str/unannotated params (column picker
+        WITH escape hatch). Callers must use this method — never access _sig directly.
+        """
+        return [
+            name for name, param in self._sig.parameters.items()
+            if name != "context"
+            and _is_series_annotation(param.annotation)
+        ]
+
+    def column_backed_scalar_params(self) -> list[str]:
+        """Return int/float param names eligible for column-backing.
+
+        Returns scalar_params() when has_series_params() is False — these params
+        can be column-backed (alias_map entry, per-row DuckDB UDF values) or
+        broadcast constants (filled_params), decided by the user at prompt time.
+
+        Returns [] when any pd.Series param exists (highest-granularity gate):
+        Series params already provide per-row data, so int/float params must
+        remain broadcast constants. No type exceptions to this rule.
+        """
+        if self.has_series_params():
+            return []
+        return self.scalar_params()
+
+    def is_expandable(self) -> bool:
+        """True if this function can be meaningfully expanded N times per alias_map entry.
+
+        Checks returning pd.Series[bool] produce separate validation results per expansion.
+        Transforms returning pd.Series or pd.DataFrame produce separate column updates.
+        Functions returning dict, int, or other non-data types must not be expanded —
+        the semantics of per-column expansion are undefined for non-Series/DataFrame returns.
+
+        Used by _expand_check_with_alias_map in io/registry.py as the expansion gate,
+        replacing the narrower is_multiselect_eligible() check which only covers bool-Series
+        checks and excluded transforms.
+        """
+        import inspect as _inspect
+        ann = self._sig.return_annotation
+        if ann is _inspect.Parameter.empty:
+            return False
+        ann_str = str(ann)
+        return "Series" in ann_str or "DataFrame" in ann_str
+
+    def all_expandable_param_names(self) -> list[str]:
+        """Return all param names eligible for alias_map expansion.
+
+        Covers column selectors (str/Series/unannotated) and column-backed
+        scalars (int/float). Excludes DataFrame params and the _output reserved key.
+        Used by _expand_check_with_alias_map in io/registry.py — callers must use
+        this method rather than accessing _sig directly (CLAUDE.md: CheckParamInspector
+        is the canonical inspection pattern).
+        """
+        return [
+            name
+            for name, param in self._sig.parameters.items()
+            if name != "context"
+            and not _is_dataframe_annotation(param.annotation)
+        ]
 
     def make_key(self) -> str:
         """Return a deterministic hash of the function source.

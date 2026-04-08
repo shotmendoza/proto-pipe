@@ -106,27 +106,37 @@ def _expand_check_with_alias_map(
 
     inspector = CheckParamInspector(func)
 
-    if not inspector.is_multiselect_eligible():
-        # Function does not return pd.Series[bool] — not eligible for multi-column
-        # expansion. Register as a single check regardless of alias_map contents.
+    # Gate: only functions returning pd.Series or pd.DataFrame are expandable.
+    # Dict-returning or unannotated functions must never expand — per-column
+    # expansion semantics are undefined for non-Series/DataFrame returns.
+    # is_expandable() covers both checks (pd.Series[bool]) and transforms
+    # (pd.Series/pd.DataFrame), replacing the narrower is_multiselect_eligible()
+    # gate that excluded transforms. Uses CheckParamInspector canonical pattern.
+    if not inspector.is_expandable():
         check_name = _build_check_keys(func_name, params)
         if check_name not in check_registry.available():
             _register_check(check_name, func_name, params, check_registry)
         return [check_name]
 
-    col_params = inspector.column_params()
-
-    # Which of this check's column params are covered by alias_map?
+    # All non-_output function params eligible for alias_map expansion.
+    # Covers column selectors (str/Series/unannotated) and column-backed scalars
+    # (int/float). The _output reserved key is excluded — passed to the runner
+    # for write-back routing, not used in expansion key computation.
+    # Uses all_expandable_param_names() — never _sig directly (CLAUDE.md rule).
     alias_col_params = {
-        p: alias_param_map[p] for p in col_params if p in alias_param_map
+        p: alias_param_map[p]
+        for p in inspector.all_expandable_param_names()
+        if p in alias_param_map and p != "_output"
     }
 
     if not alias_col_params:
-        # No alias expansion — register normally with whatever params are given
+        # No expandable params in alias_map — register as single.
         check_name = _build_check_keys(func_name, params)
         if check_name not in check_registry.available():
             _register_check(check_name, func_name, params, check_registry)
         return [check_name]
+
+    col_params = list(alias_col_params.keys())
 
     # Validate that all column params with multiple entries have the same length.
     # Single-entry params (len == 1) are exempt — they broadcast silently.
