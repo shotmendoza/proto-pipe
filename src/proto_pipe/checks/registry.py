@@ -415,6 +415,82 @@ def _wrap_series_input(
     return wrapper
 
 
+def _wrap_scalar_column_input(func: "Callable") -> "Callable":
+    """Wrap a scalar-input function to accept the context dict convention.
+
+    For functions with str/int/float/unannotated params, no pd.DataFrame,
+    no pd.Series, no context: dict. The pipeline assembles the per-row call —
+    users write plain scalar functions, context: dict never appears.
+
+    At call time:
+      - Extracts df from context, strips pipeline (_) columns
+      - For each baked param whose string value matches a column name in df:
+        that param is col-backed → apply function per row via pandas .apply(),
+        producing a Series result
+      - Params whose baked values are not column names are broadcast constants,
+        passed through unchanged from the partial
+      - Col-backed detection: isinstance(val, str) and val in clean_df.columns
+        Same logic as _apply_scalar_transform_duckdb — made at call time so
+        the same wrapper works across different reports (different tables).
+
+    Single col-backed param uses Series.apply for efficiency.
+    Multiple col-backed params use df.apply(axis=1) for row-wise application.
+    """
+    baked_keywords: dict = {}
+    inner = func
+    while isinstance(inner, functools.partial):
+        baked_keywords.update(inner.keywords)
+        inner = inner.func
+
+    @functools.wraps(inner)
+    def wrapper(context: dict):
+        df: "pd.DataFrame" = context["df"]
+        user_cols = [c for c in df.columns if not c.startswith("_")]
+        clean_df = df[user_cols]
+
+        # Separate col-backed params (baked string value exists as a column)
+        # from broadcast constants (all other baked values).
+        # Col-backed detection is deferred to call time so the same registered
+        # function works correctly across different reports/tables.
+        col_backed: dict[str, str] = {}  # {param_name: col_name}
+        constants: dict = {}
+        for param_name, val in baked_keywords.items():
+            if isinstance(val, str) and val in clean_df.columns:
+                col_backed[param_name] = val
+            else:
+                constants[param_name] = val
+
+        if not col_backed:
+            # No col-backed params — all constants. Call once, no per-row apply.
+            return inner(**constants)
+
+        if len(col_backed) == 1:
+            # Single col-backed param — Series.apply is most efficient.
+            # Set result.name to the column name so transform write-back routing
+            # in _apply_transforms_with_gate can identify which column to update.
+            param_name, col_name = next(iter(col_backed.items()))
+            result = clean_df[col_name].apply(
+                lambda val: inner(**{param_name: val}, **constants)
+            )
+            result.name = col_name
+            return result
+
+        # Multiple col-backed params — apply row-wise across needed columns.
+        # result.name is not set — transform write-back requires _output in
+        # alias_map or explicit column naming by the user.
+        needed_cols = list({col for col in col_backed.values()})
+        subset = clean_df[needed_cols]
+
+        def apply_row(row):
+            row_kwargs = {p: row[col] for p, col in col_backed.items()}
+            row_kwargs.update(constants)
+            return inner(**row_kwargs)
+
+        return subset.apply(apply_row, axis=1)
+
+    return wrapper
+
+
 def validate_check(
     name: str,
     func: "Callable",
@@ -499,7 +575,52 @@ def validate_check(
         wrapped_func = wrap_series_check(series_wrapped) if kind == "check" else series_wrapped
         return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
 
-    # ── Standard path (existing behaviour) ──────────────────────────────────
+    # ── Scalar column-backed path ─────────────────────────────────────────────
+    # Functions with str/int/float/unannotated params, no pd.DataFrame,
+    # no pd.Series, no context: dict. Applied per row at call time — the
+    # wrapper detects col-backed params by checking baked string values
+    # against clean_df.columns at call time (same as _apply_scalar_transform_duckdb).
+    # Scalar checks may return bool (per-row scalar) or pd.Series[bool] (vectorised).
+    #
+    # Gate: both legacy name ('context') and positional context patterns
+    # (unannotated first param, dict-annotated first param) are routed to
+    # the standard path to preserve backward compatibility.
+    if not inspector.has_legacy_context_param() and not inspector.has_positional_context_param():
+        if inspector.empty_return_annotation():
+            if kind == "check":
+                reason = (
+                    "no return annotation found — skipping registration. "
+                    "Add '-> bool' or '-> pd.Series[bool]' to your check function."
+                )
+                print(f"[warn] '{name}': {reason}")
+                return CheckAudit(contract=None, failure_reason=reason)
+            else:
+                print(
+                    f"[warn] '{name}': no return annotation — registering as {kind} anyway. "
+                    f"Consider adding '-> bool' or '-> pd.Series[bool]' for checks, "
+                    f"or '-> pd.Series' for transforms."
+                )
+        elif kind == "check":
+            if (
+                not inspector.returns_boolean_series()
+                and not inspector.returns_scalar_bool()
+            ):
+                reason = (
+                    "Scalar check must return bool or pd.Series[bool] — "
+                    "skipping registration. Fix the return annotation or use kind='transform'."
+                )
+                print(f"[warn] '{name}': {reason}")
+                return CheckAudit(contract=None, failure_reason=reason)
+        elif kind == "transform" and inspector.returns_boolean_series():
+            print(
+                f"[warn] '{name}' is kind='transform' but its return annotation is "
+                f"pd.Series[bool] — this looks like a check. "
+                f"Registering as transform anyway. Did you mean kind='check'?"
+            )
+
+        scalar_wrapped = _wrap_scalar_column_input(func)
+        wrapped_func = wrap_series_check(scalar_wrapped) if kind == "check" else scalar_wrapped
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
     if inspector.empty_return_annotation():
         if kind == "check":
             reason = (
@@ -572,6 +693,18 @@ class CheckParamInspector:
         ann_str = str(ann) if not isinstance(ann, str) else ann
         return "Series" in ann_str
 
+    def returns_scalar_bool(self) -> bool:
+        """True if the return annotation is a scalar bool (not pd.Series[bool]).
+
+        Valid for scalar-input checks (str/int/float params) where the wrapper
+        assembles the per-row Series from scalar bool returns via apply().
+        Callers must use this method — never access _sig.return_annotation directly.
+        """
+        ann = self._sig.return_annotation
+        if ann is inspect.Parameter.empty:
+            return False
+        return ann is bool or str(ann) in ("bool", "<class 'bool'>")
+
     def empty_return_annotation(self) -> bool:
         """True if the function has no return annotation."""
         return self._sig.return_annotation is inspect.Parameter.empty
@@ -612,6 +745,34 @@ class CheckParamInspector:
         Callers must use this method — never access _sig.parameters directly.
         """
         return "context" in self._sig.parameters
+
+    def has_positional_context_param(self) -> bool:
+        """True if the function's first positional param looks like a context dict.
+
+        Catches informal legacy patterns beyond the documented 'context: dict'
+        convention — e.g. 'ctx', 'data', 'ctx: dict'. Any unannotated first
+        positional param with no default, or a dict-annotated first param, is
+        treated as a positional context arg and routed to the standard path.
+
+        Callers must use this method — never access _sig.parameters directly.
+        """
+        params = list(self._sig.parameters.values())
+        if not params:
+            return False
+        first = params[0]
+        if first.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return False
+        if first.default is not inspect.Parameter.empty:
+            return False
+        if first.annotation is inspect.Parameter.empty:
+            # Unannotated first param with no default — positional context arg
+            return True
+        # dict-annotated first param (ctx: dict) — legacy context dict
+        ann = first.annotation
+        return ann is dict or str(ann) in ("dict", "<class 'dict'>")
 
     def series_params(self) -> list[str]:
         """Return param names annotated as pd.Series.

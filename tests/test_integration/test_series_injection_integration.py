@@ -7,7 +7,7 @@ These tests exercise the complete chain that unit tests cannot cover:
   _wrap_series_input → run_all_reports → _compute_report →
   check_registry.run → function receives pd.Series
 
-CLAUDE.md guarantees verified here:
+Guarantees are verified here:
   - A pd.Series check registered via register_from_config with alias_map
     completes without "multiple values for argument" error end-to-end
   - validation_pass records correct pass/fail status per row

@@ -55,16 +55,24 @@ def custom_check(
         Examples:
 
         @custom_check("margin_check")
-        def check_margin(context: dict, col: str = "margin", threshold: float = 0.2) -> pd.Series:
-            df = context["df"]
-            return df[col] >= threshold
+        def check_margin(col: pd.Series, threshold: float = 0.2) -> pd.Series[bool]:
+            return col >= threshold
 
         @custom_check("normalize_transaction_type", kind="transform")
-        def transform_transaction_type(context: dict, col: str = "transaction_type") -> pd.Series:
-            df = context["df"]
-            result = df[col].replace({"Issuance": "Reinstatement"})
-            result.name = col
+        def transform_transaction_type(col: pd.Series) -> pd.Series:
+            result = col.replace({"Issuance": "Reinstatement"})
+            result.name = col.name
             return result
+
+        # With full table access (multiple columns needed):
+        @custom_check("check_ratio", kind="check")
+        def check_ratio(df: pd.DataFrame, numerator: str, denominator: str) -> pd.Series[bool]:
+            return df[numerator] / df[denominator] >= 0.5
+
+        # Scalar check — function called per row, pipeline assembles the Series:
+        @custom_check("check_region_code")
+        def check_region_code(region: str) -> bool:
+            return region in ("EMEA", "APAC", "AMER")
     """
     if kind not in ("check", "transform"):
         raise ValueError(f"kind must be 'check' or 'transform', got '{kind}'")
