@@ -963,9 +963,18 @@ class ReportConfigPrompter:
             click.echo(f"\nParameters for '{check_name}':")
 
             eligible = (
-                    self._multi_select
-                    and inspector is not None
-                    and inspector.is_multiselect_eligible()
+                self._multi_select
+                and inspector is not None
+                and (
+                    inspector.is_multiselect_eligible()  # checks: bool-Series return
+                    or (                                  # transforms: col-backed params
+                        kind == "transform"
+                        and (
+                            len(inspector.column_params()) > 0
+                            or len(inspector.column_backed_scalar_params()) > 0
+                        )
+                    )
+                )
             )
             col_params = inspector.column_params() if inspector else []
             # pd.Series params: column picker only, no escape hatch (unchanged behaviour)
@@ -1158,9 +1167,43 @@ class ReportConfigPrompter:
                         return [], [], True
                     accumulated_alias.append({"param": "_output", "column": output_val})
                 else:
+                    # Step 1: which param's column list should the output mirror?
+                    # Only multi-column params (>1 entry) are offered as choices —
+                    # single-entry params just broadcast and aren't meaningful to mirror.
+                    _MANUAL_SELECT = "\u270e Select output columns manually"
+                    multi_col_params = {
+                        p: [e["column"] for e in input_alias_entries if e["param"] == p]
+                        for p in {e["param"] for e in input_alias_entries}
+                        if len([e for e in input_alias_entries if e["param"] == p]) > 1
+                    }
+                    param_choices = [
+                        questionary.Choice(
+                            title=f"{p}  [{', '.join(cols)}]",
+                            value=p,
+                        )
+                        for p, cols in multi_col_params.items()
+                    ] + [questionary.Choice(title=_MANUAL_SELECT, value=_MANUAL_SELECT)]
+
+                    mirror_param = questionary.select(
+                        "Output columns — tie to which param's column list?",
+                        choices=param_choices,
+                    ).ask()
+                    if mirror_param is None:
+                        return [], [], True
+
+                    # Step 2a: param chosen → pre-check those columns
+                    if mirror_param != _MANUAL_SELECT:
+                        precheck_output = set(multi_col_params[mirror_param])
+                        output_choices = _make_col_choices(
+                            table_cols, registry_types, precheck=precheck_output
+                        )
+                    else:
+                        # Step 2b: manual → no pre-selection
+                        output_choices = _make_col_choices(table_cols, registry_types)
+
                     output_vals = questionary.checkbox(
-                        f"Output columns (select exactly {n_runs} to match input columns):",
-                        choices=_make_col_choices(table_cols, registry_types),
+                        "Output columns:",
+                        choices=output_choices,
                     ).ask()
                     if output_vals is None:
                         return [], [], True

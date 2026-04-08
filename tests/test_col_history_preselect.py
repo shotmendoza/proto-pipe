@@ -1,11 +1,14 @@
-"""Tests for ReportConfigPrompter.prompt_checks() behavioral guarantees.
+"""Tests for cross-session column param pre-selection via check_params_history.
 
-Guarantees under test (CLAUDE.md — vp new report split function selection):
-  - Transforms and checks are never shown in the same prompt.
-  - If a kind has no registered functions, its prompt is skipped.
-  - Column list is printed once before the first selection prompt.
-  - If registry_types is empty, a [warn] is printed and prompts continue.
-  - ESC on either prompt returns go_back=True.
+Behavioral guarantees (CLAUDE.md):
+- Historical column selections for a check+param are pre-checked (checkbox)
+  or pre-defaulted (select) when the same check+param is configured again.
+- Within-session alias_cols are pre-checked/pre-defaulted.
+- Historical values not present in the current source are not pre-selected
+  (can't select a column that doesn't exist here).
+- Exact param name == column name (auto_match) is still pre-selected as a
+  fallback when no history or within-session choices exist.
+- get_column_param_history returns raw values without similarity filtering.
 """
 from __future__ import annotations
 
@@ -23,19 +26,21 @@ from proto_pipe.cli.prompts import ReportConfigPrompter
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_check():
+def _make_col_check():
     def f(col: str) -> "pd.Series[bool]":
         return pd.Series([True])
     return f
 
 
-def _make_transform():
-    def f(col: str) -> "pd.DataFrame":
-        return pd.DataFrame()
-    return f
+def _make_prompter_single(registry):
+    return ReportConfigPrompter(
+        check_registry=registry,
+        p_db="/fake/path.db",
+        multi_select=False,
+    )
 
 
-def _make_prompter(registry):
+def _make_prompter_multi(registry):
     return ReportConfigPrompter(
         check_registry=registry,
         p_db="/fake/path.db",
@@ -43,398 +48,14 @@ def _make_prompter(registry):
     )
 
 
-
-
-def _make_prompter_single(registry: CheckRegistry) -> ReportConfigPrompter:
-    """Prompter with multi_select=False — forces questionary.select for column params."""
-    return ReportConfigPrompter(
-        check_registry=registry,
-        p_db="/fake/path.db",
-        multi_select=False,
-    )
 @contextlib.contextmanager
-def _scaffold_stubs():
-    with patch("proto_pipe.cli.scaffold.get_original_func", return_value=None), \
-         patch("proto_pipe.cli.scaffold.get_check_first_sentence", return_value=""), \
-         patch("proto_pipe.cli.scaffold.build_check_param_lines", return_value=[]):
-        yield
-
-
-def _checkbox_returning(value):
-    m = MagicMock()
-    m.return_value.ask.return_value = value
-    return m
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture()
-def registry_both():
-    reg = CheckRegistry()
-    reg.register("my_check", _make_check(), kind="check")
-    reg.register("my_transform", _make_transform(), kind="transform")
-    return reg
-
-
-@pytest.fixture()
-def registry_checks_only():
-    reg = CheckRegistry()
-    reg.register("my_check", _make_check(), kind="check")
-    return reg
-
-
-@pytest.fixture()
-def registry_transforms_only():
-    reg = CheckRegistry()
-    reg.register("my_transform", _make_transform(), kind="transform")
-    return reg
-
-
-# ---------------------------------------------------------------------------
-# Kind split
-# ---------------------------------------------------------------------------
-
-class TestKindSplit:
-
-    def test_two_prompts_when_both_kinds_registered(self, registry_both):
-        """Transforms and checks each get their own separate checkbox prompt."""
-        prompter = _make_prompter(registry_both)
-        mock_cb = _checkbox_returning([])
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert mock_cb.call_count == 2, "Expected two separate checkbox calls — one per kind"
-        assert go_back is False
-
-    def test_transforms_prompt_comes_before_checks(self, registry_both):
-        """Transforms prompt is shown first, checks prompt second."""
-        prompter = _make_prompter(registry_both)
-        labels = []
-
-        def capture(label, choices):
-            labels.append(label)
-            m = MagicMock()
-            m.ask.return_value = []
-            return m
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert len(labels) == 2
-        assert "transform" in labels[0].lower()
-        assert "check" in labels[1].lower() or "validation" in labels[1].lower()
-
-    def test_each_prompt_contains_only_correct_kind(self, registry_both):
-        """Choices in each prompt contain only functions of the matching kind."""
-        prompter = _make_prompter(registry_both)
-        captured = []
-
-        def capture(label, choices):
-            captured.append(list(choices))
-            m = MagicMock()
-            m.ask.return_value = []
-            return m
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert len(captured) == 2
-        transform_values = {c.value for c in captured[0]}
-        check_values = {c.value for c in captured[1]}
-        assert transform_values == {"my_transform"}
-        assert check_values == {"my_check"}
-        assert transform_values.isdisjoint(check_values)
-
-    def test_transforms_prompt_skipped_when_none_registered(self, registry_checks_only):
-        """When no transforms registered, only the checks prompt is shown."""
-        prompter = _make_prompter(registry_checks_only)
-        mock_cb = _checkbox_returning([])
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert mock_cb.call_count == 1, "Transforms prompt must be skipped when none registered"
-        assert go_back is False
-
-    def test_checks_prompt_skipped_when_none_registered(self, registry_transforms_only):
-        """When no checks registered, only the transforms prompt is shown."""
-        prompter = _make_prompter(registry_transforms_only)
-        mock_cb = _checkbox_returning([])
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert mock_cb.call_count == 1, "Checks prompt must be skipped when none registered"
-
-    def test_selections_from_both_prompts_merged(self, registry_both):
-        """Selections from both prompts are merged into a single returned list."""
-        prompter = _make_prompter(registry_both)
-        n = 0
-
-        def alternate(label, choices):
-            nonlocal n
-            n += 1
-            m = MagicMock()
-            m.ask.return_value = ["my_transform"] if n == 1 else ["my_check"]
-            return m
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=alternate), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert set(selected) == {"my_transform", "my_check"}
-        assert go_back is False
-
-
-# ---------------------------------------------------------------------------
-# Column display
-# ---------------------------------------------------------------------------
-
-class TestColumnDisplay:
-
-    def test_columns_printed_before_first_checkbox(self, registry_checks_only):
-        """Column list appears in output before the first checkbox prompt."""
-        prompter = _make_prompter(registry_checks_only)
-        call_order = []
-
-        def record_echo(msg="", **kw):
-            call_order.append(("echo", str(msg)))
-
-        def record_cb(label, choices):
-            call_order.append(("checkbox", label))
-            m = MagicMock()
-            m.ask.return_value = []
-            return m
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=record_cb), \
-             patch("proto_pipe.cli.prompts.click.echo", side_effect=record_echo):
-
-            prompter.prompt_checks(
-                table_cols=["price"], alias_map=[],
-                registry_types={"price": "DOUBLE"},
-            )
-
-        first_cb = next(i for i, (k, _) in enumerate(call_order) if k == "checkbox")
-        col_echo = next(
-            (i for i, (k, t) in enumerate(call_order) if k == "echo" and "price" in t),
-            None,
-        )
-        assert col_echo is not None, "Column 'price' was never echoed"
-        assert col_echo < first_cb, "Column display must appear before first checkbox"
-
-    def test_columns_printed_exactly_once(self, registry_both):
-        """Column list is printed once even when both kinds have prompts."""
-        prompter = _make_prompter(registry_both)
-        echoed = []
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", _checkbox_returning([])), \
-             patch("proto_pipe.cli.prompts.click.echo",
-                   side_effect=lambda m="", **k: echoed.append(str(m))):
-
-            prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        mentions = [m for m in echoed if "col" in m and "VARCHAR" in m]
-        assert len(mentions) == 1, f"Expected exactly one col/VARCHAR echo, got {mentions}"
-
-    def test_warn_when_registry_types_empty(self, registry_checks_only):
-        """When registry_types is empty a [warn] is printed."""
-        prompter = _make_prompter(registry_checks_only)
-        echoed = []
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", _checkbox_returning([])), \
-             patch("proto_pipe.cli.prompts.click.echo",
-                   side_effect=lambda m="", **k: echoed.append(str(m))):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=[], alias_map=[], registry_types={},
-            )
-
-        assert any("[warn]" in m for m in echoed), f"Expected [warn], got: {echoed}"
-
-    def test_prompts_continue_after_warn(self, registry_checks_only):
-        """Prompts continue normally after the [warn] — not aborted."""
-        prompter = _make_prompter(registry_checks_only)
-        mock_cb = _checkbox_returning([])
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=[], alias_map=[], registry_types={},
-            )
-
-        assert mock_cb.call_count >= 1, "Checkbox must still appear after [warn]"
-        assert go_back is False
-
-
-# ---------------------------------------------------------------------------
-# ESC behaviour
-# ---------------------------------------------------------------------------
-
-class TestEscBehaviour:
-
-    def test_esc_on_transforms_returns_go_back(self, registry_both):
-        """ESC (None from questionary) on transforms prompt → go_back=True."""
-        prompter = _make_prompter(registry_both)
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", _checkbox_returning(None)), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert go_back is True
-        assert selected is None
-
-    def test_esc_on_checks_returns_go_back(self, registry_both):
-        """ESC on the checks prompt (second call) also returns go_back=True."""
-        prompter = _make_prompter(registry_both)
-        n = 0
-
-        def esc_on_second(label, choices):
-            nonlocal n
-            n += 1
-            m = MagicMock()
-            m.ask.return_value = [] if n == 1 else None
-            return m
-
-        with _scaffold_stubs(), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=esc_on_second), \
-             patch("proto_pipe.cli.prompts.click.echo"):
-
-            selected, go_back = prompter.prompt_checks(
-                table_cols=["col"], alias_map=[],
-                registry_types={"col": "VARCHAR"},
-            )
-
-        assert go_back is True
-        assert selected is None
-
-
-# ---------------------------------------------------------------------------
-# _make_col_choices
-# ---------------------------------------------------------------------------
-
-class TestMakeColChoices:
-    """Behavioral guarantees for the _make_col_choices module-level helper."""
-
-    def test_title_includes_type(self):
-        """Choice title is 'column_name (TYPE)' when column is in registry_types."""
-        from proto_pipe.cli.prompts import _make_col_choices
-        choices = _make_col_choices(["price"], {"price": "DOUBLE"})
-        assert len(choices) == 1
-        assert choices[0].title == "price (DOUBLE)"
-
-    def test_title_is_column_name_when_type_unknown(self):
-        """Choice title is just column name when column not in registry_types."""
-        from proto_pipe.cli.prompts import _make_col_choices
-        choices = _make_col_choices(["mystery_col"], {})
-        assert choices[0].title == "mystery_col"
-
-    def test_value_is_column_name_not_title(self):
-        """Choice value is the raw column name, not the formatted title string."""
-        from proto_pipe.cli.prompts import _make_col_choices
-        choices = _make_col_choices(["price"], {"price": "DOUBLE"})
-        assert choices[0].value == "price"
-        assert choices[0].value != "price (DOUBLE)"
-
-    def test_precheck_marks_column_as_checked(self):
-        """Columns in precheck have checked=True."""
-        from proto_pipe.cli.prompts import _make_col_choices
-        choices = _make_col_choices(
-            ["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"},
-            precheck={"price"},
-        )
-        by_value = {c.value: c for c in choices}
-        assert by_value["price"].checked is True
-        assert by_value["quantity"].checked is False
-
-    def test_no_precheck_all_unchecked(self):
-        """With no precheck, all choices have checked=False."""
-        from proto_pipe.cli.prompts import _make_col_choices
-        choices = _make_col_choices(["a", "b"], {"a": "VARCHAR", "b": "BIGINT"})
-        assert all(not c.checked for c in choices)
-
-    def test_order_preserved(self):
-        """Output order matches input column order."""
-        from proto_pipe.cli.prompts import _make_col_choices
-        cols = ["c", "a", "b"]
-        choices = _make_col_choices(cols, {})
-        assert [c.value for c in choices] == cols
-
-
-# ---------------------------------------------------------------------------
-# Helpers shared by _fill_params tests
-# ---------------------------------------------------------------------------
-
-def _make_col_param_check():
-    """Check with one str-annotated column param — alias_map eligible."""
-    def f(col: str) -> "pd.Series[bool]":
-        return pd.Series([True])
-    return f
-
-
-def _make_scalar_param_check():
-    """Check with a column param AND a scalar float param."""
-    def f(col: str, min_val: float) -> "pd.Series[bool]":
-        return pd.Series([True])
-    return f
-
-
-@contextlib.contextmanager
-def _fill_params_stubs(table_cols, registry_types_result):
-    """Stubs for the DB-touching helpers called inside _fill_params."""
+def _fill_params_stubs(table_cols, registry_types_result, col_history=None):
+    """Stubs for DB-touching helpers. col_history controls what
+    get_column_param_history returns (default: empty list)."""
     with patch("proto_pipe.cli.scaffold.get_table_columns", return_value=table_cols), \
          patch("proto_pipe.cli.scaffold.get_param_suggestions", return_value=[]), \
-         patch("proto_pipe.cli.scaffold.get_column_param_history", return_value=[]), \
+         patch("proto_pipe.cli.scaffold.get_column_param_history",
+               return_value=col_history or []), \
          patch("proto_pipe.cli.scaffold.record_param_history"), \
          patch("proto_pipe.io.db.get_registry_types", return_value=registry_types_result), \
          patch("proto_pipe.cli.prompts.click.echo"):
@@ -442,60 +63,69 @@ def _fill_params_stubs(table_cols, registry_types_result):
 
 
 # ---------------------------------------------------------------------------
-# ReportConfigPrompter._fill_params() — alias_map guarantees
+# get_column_param_history unit tests
 # ---------------------------------------------------------------------------
 
-class TestFillParamsAliasMap:
+class TestGetColumnParamHistory:
 
-    @pytest.fixture()
-    def registry_col(self):
-        """Registry with a single column-param check."""
-        reg = CheckRegistry()
-        reg.register("col_check", _make_col_param_check(), kind="check")
-        return reg
+    def test_returns_raw_values_ordered_by_recency(self):
+        """Raw historical values returned without similarity filtering."""
+        from proto_pipe.cli.scaffold import get_column_param_history
 
-    @pytest.fixture()
-    def registry_scalar(self):
-        """Registry with a check that has both a column param and a scalar param."""
-        reg = CheckRegistry()
-        reg.register("scalar_check", _make_scalar_param_check(), kind="check")
-        return reg
-
-    @pytest.fixture()
-    def registry_multiselect(self):
-        """Registry with a multiselect-eligible check (multi_select=True prompter)."""
-        reg = CheckRegistry()
-        reg.register("ms_check", _make_col_param_check(), kind="check")
-        return reg
-
-    def test_column_param_produces_alias_map_entry(self, registry_col):
-        """Every column param on every selected function gets an alias_map entry."""
-        prompter = _make_prompter_single(registry_col)
         conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = [
+            ("expiry_date",), ("endt",), ("end_date",)
+        ]
 
-        mock_select = MagicMock()
-        mock_select.return_value.ask.return_value = "price"
+        result = get_column_param_history(conn, "null_check", "col")
 
-        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
-             patch("proto_pipe.cli.prompts.questionary.select", mock_select):
+        assert result == ["expiry_date", "endt", "end_date"]
+        # Verify it queries by check_name + param_name
+        call_args = conn.execute.call_args
+        assert "null_check" in call_args.args[1]
+        assert "col" in call_args.args[1]
 
-            _, alias_map, go_back = prompter.prompt_params(
-                selected_checks=["col_check"],
-                table="sales",
-                conn=conn,
-                report_name="test_report",
-            )
+    def test_returns_empty_on_db_error(self):
+        """Falls back to empty list when check_params_history doesn't exist."""
+        from proto_pipe.cli.scaffold import get_column_param_history
 
-        assert go_back is False
-        assert any(e["param"] == "col" and e["column"] == "price" for e in alias_map), (
-            f"Expected alias_map entry for param='col', column='price'. Got: {alias_map}"
-        )
-
-    def test_auto_populate_on_exact_name_match(self, registry_col):
-        """When param name exactly matches a column, it is passed as the select default."""
-        prompter = _make_prompter_single(registry_col)
         conn = MagicMock()
+        conn.execute.side_effect = Exception("Table not found")
 
+        result = get_column_param_history(conn, "null_check", "col")
+
+        assert result == []
+
+    def test_filters_none_values(self):
+        """None or empty param_value rows are excluded."""
+        from proto_pipe.cli.scaffold import get_column_param_history
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = [
+            ("endt",), (None,), ("",), ("expiry_date",)
+        ]
+
+        result = get_column_param_history(conn, "null_check", "col")
+
+        assert result == ["endt", "expiry_date"]
+
+
+# ---------------------------------------------------------------------------
+# Pre-selection from historical matches
+# ---------------------------------------------------------------------------
+
+class TestHistoricalPreselect:
+
+    @pytest.fixture()
+    def registry(self):
+        reg = CheckRegistry()
+        reg.register("null_check", _make_col_check(), kind="check")
+        return reg
+
+    def test_historical_col_in_source_is_predefault_for_select(self, registry):
+        """When history has 'endt' and source has 'endt', select default='endt'."""
+        prompter = _make_prompter_single(registry)
+        conn = MagicMock()
         captured_default = []
 
         def capture_select(label, choices, default=None):
@@ -504,27 +134,27 @@ class TestFillParamsAliasMap:
             m.ask.return_value = default or choices[0].value
             return m
 
-        # table_cols contains "col" — exact match for param name "col"
-        with _fill_params_stubs(["col", "price"], {"col": "VARCHAR", "price": "DOUBLE"}), \
-             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+        with _fill_params_stubs(
+            ["endt", "price"],
+            {"endt": "DATE", "price": "DOUBLE"},
+            col_history=["endt"],
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
 
             prompter.prompt_params(
-                selected_checks=["col_check"],
-                table="sales",
+                selected_checks=["null_check"],
+                table="van",
                 conn=conn,
-                report_name="test_report",
+                report_name="van_report",
             )
 
-        assert captured_default, "select was never called"
-        assert captured_default[0] == "col", (
-            f"Expected default='col' (exact match), got default={captured_default[0]!r}"
+        assert captured_default == ["endt"], (
+            f"Expected default='endt' from history. Got: {captured_default}"
         )
 
-    def test_no_auto_populate_when_no_exact_match(self, registry_col):
-        """When param name does not match any column, default is None — no fuzzy matching."""
-        prompter = _make_prompter_single(registry_col)
+    def test_historical_col_not_in_source_is_not_predefaulted(self, registry):
+        """When history has 'endt' but source doesn't, no pre-selection fires."""
+        prompter = _make_prompter_single(registry)
         conn = MagicMock()
-
         captured_default = []
 
         def capture_select(label, choices, default=None):
@@ -533,163 +163,353 @@ class TestFillParamsAliasMap:
             m.ask.return_value = choices[0].value
             return m
 
-        # table_cols does NOT contain "col" — no exact match
-        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
-             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+        with _fill_params_stubs(
+            ["expiry_date", "price"],
+            {"expiry_date": "DATE", "price": "DOUBLE"},
+            col_history=["endt"],  # not in this source's columns
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
 
             prompter.prompt_params(
-                selected_checks=["col_check"],
-                table="sales",
+                selected_checks=["null_check"],
+                table="foo",
                 conn=conn,
-                report_name="test_report",
+                report_name="foo_report",
             )
 
-        assert captured_default, "select was never called"
-        assert captured_default[0] is None, (
-            f"Expected no auto-populate (default=None) when no exact match. "
-            f"Got default={captured_default[0]!r}"
+        # endt is not available, so default should be None (falls through to auto_match)
+        assert captured_default == [None], (
+            f"Expected no pre-selection when history col not in source. Got: {captured_default}"
         )
 
-    def test_choices_carry_type_from_registry(self, registry_col):
-        """Column choices passed to questionary.select include type from column_type_registry."""
-        prompter = _make_prompter_single(registry_col)
+    def test_historical_col_in_source_is_prechecked_for_checkbox(self, registry):
+        """When history has 'endt' and source has 'endt', checkbox pre-checks it."""
+        prompter = _make_prompter_multi(registry)
         conn = MagicMock()
-
         captured_choices = []
 
-        def capture_select(label, choices, default=None):
+        def capture_checkbox(label, choices):
             captured_choices.extend(choices)
             m = MagicMock()
-            m.ask.return_value = choices[0].value
+            m.ask.return_value = [c.value for c in choices if c.checked]
             return m
 
-        with _fill_params_stubs(["price"], {"price": "DOUBLE"}), \
-             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+        with _fill_params_stubs(
+            ["endt", "price"],
+            {"endt": "DATE", "price": "DOUBLE"},
+            col_history=["endt"],
+        ), patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
 
             prompter.prompt_params(
-                selected_checks=["col_check"],
-                table="sales",
+                selected_checks=["null_check"],
+                table="van",
                 conn=conn,
-                report_name="test_report",
+                report_name="van_report",
             )
 
-        assert captured_choices, "select was never called"
-        price_choice = next((c for c in captured_choices if c.value == "price"), None)
-        assert price_choice is not None
-        assert "DOUBLE" in price_choice.title, (
-            f"Expected type 'DOUBLE' in choice title, got: {price_choice.title!r}"
+        endt_choice = next((c for c in captured_choices if c.value == "endt"), None)
+        assert endt_choice is not None
+        assert endt_choice.checked is True, (
+            "Historical column 'endt' must be pre-checked in checkbox prompt"
         )
 
-    def test_scalar_param_excluded_from_alias_map(self, registry_scalar):
-        """int/float params go to alias_map when column chosen, filled_params when escape chosen.
-
-        Under the unified column-or-escape routing model, int/float params get the
-        same column picker + escape hatch as str/unannotated params (when no pd.Series
-        params are present). When the user picks the escape hatch, the value goes to
-        filled_params as a broadcast constant — not alias_map.
-        This test verifies the escape hatch path: col → alias_map, min_val → filled_params.
-        """
-        prompter = _make_prompter_single(registry_scalar)
+    def test_multiple_historical_cols_all_prechecked_if_in_source(self, registry):
+        """All historical columns that exist in the current source are pre-checked."""
+        prompter = _make_prompter_multi(registry)
         conn = MagicMock()
+        captured_choices = []
 
-        # Differentiated mock: col gets a column, min_val gets the escape hatch.
-        # Sentinel is the LAST choice in the list (prompts.py positions it at end).
-        call_count = [0]
-
-        def capture_select(label, choices, default=None):
-            call_count[0] += 1
+        def capture_checkbox(label, choices):
+            captured_choices.extend(choices)
             m = MagicMock()
-            if call_count[0] == 1:
-                # First call = col param → pick first column
-                m.ask.return_value = choices[0].value
-            else:
-                # Second call = min_val param → pick escape hatch (last choice)
-                m.ask.return_value = choices[-1].value
+            m.ask.return_value = [c.value for c in choices if c.checked]
             return m
 
-        mock_text = MagicMock()
-        mock_text.return_value.ask.return_value = "10.0"
+        with _fill_params_stubs(
+            ["endt", "expiry_date", "price"],
+            {"endt": "DATE", "expiry_date": "DATE", "price": "DOUBLE"},
+            col_history=["endt", "expiry_date", "stale_col"],  # stale_col not in source
+        ), patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
 
-        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE"}), \
-             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
-             patch("proto_pipe.cli.prompts.questionary.text", mock_text):
-
-            check_entries, alias_map, go_back = prompter.prompt_params(
-                selected_checks=["scalar_check"],
-                table="sales",
+            prompter.prompt_params(
+                selected_checks=["null_check"],
+                table="van",
                 conn=conn,
-                report_name="test_report",
+                report_name="van_report",
             )
 
-        # col → alias_map (column picked), min_val → filled_params (escape chosen)
-        alias_params = {e["param"] for e in alias_map}
-        assert "min_val" not in alias_params, (
-            "min_val must not appear in alias_map when escape hatch was chosen"
-        )
-        assert "col" in alias_params, "Column param 'col' must appear in alias_map"
+        by_value = {c.value: c for c in captured_choices}
+        assert by_value["endt"].checked is True
+        assert by_value["expiry_date"].checked is True
+        assert by_value["price"].checked is False  # not in history
 
-        # min_val should be in the check entry params as a broadcast constant
-        entry = next((e for e in check_entries if e["name"] == "scalar_check"), None)
-        assert entry is not None
-        assert "min_val" in entry.get("params", {}), (
-            "min_val must appear in check entry params when escape hatch was chosen"
-        )
-
-    def test_multiselect_produces_one_entry_per_column(self, registry_multiselect):
-        """Multi-select eligible params produce one alias_map entry per selected column."""
-        prompter = ReportConfigPrompter(
-            check_registry=registry_multiselect,
-            p_db="/fake/path.db",
-            multi_select=True,
-        )
+    def test_history_takes_priority_over_auto_match_as_default(self, registry):
+        """Historical match is used as default before auto_match (exact name)."""
+        prompter = _make_prompter_single(registry)
         conn = MagicMock()
-
-        mock_cb = MagicMock()
-        mock_cb.return_value.ask.return_value = ["price", "quantity"]
-
-        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
-             patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb):
-
-            _, alias_map, go_back = prompter.prompt_params(
-                selected_checks=["ms_check"],
-                table="sales",
-                conn=conn,
-                report_name="test_report",
-            )
-
-        col_entries = [e for e in alias_map if e["param"] == "col"]
-        assert len(col_entries) == 2, (
-            f"Expected 2 alias_map entries (one per selected column), got {col_entries}"
-        )
-        columns = {e["column"] for e in col_entries}
-        assert columns == {"price", "quantity"}
-
-    def test_existing_alias_map_prefills_on_edit(self, registry_col):
-        """Existing alias_map entries are preserved and the matched column is pre-selected."""
-        prompter = _make_prompter_single(registry_col)
-        conn = MagicMock()
-
         captured_default = []
 
         def capture_select(label, choices, default=None):
             captured_default.append(default)
             m = MagicMock()
-            # User presses Enter — keeps the pre-filled value
             m.ask.return_value = default or choices[0].value
             return m
 
-        existing = [{"param": "col", "column": "price"}]
+        # Source has both "col" (auto_match candidate) and "endt" (history match)
+        with _fill_params_stubs(
+            ["col", "endt", "price"],
+            {"col": "VARCHAR", "endt": "DATE", "price": "DOUBLE"},
+            col_history=["endt"],
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
 
-        with _fill_params_stubs(["price", "quantity"], {"price": "DOUBLE", "quantity": "BIGINT"}), \
-             patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+            prompter.prompt_params(
+                selected_checks=["null_check"],
+                table="van",
+                conn=conn,
+                report_name="van_report",
+            )
 
-            _, alias_map, go_back = prompter.prompt_params(
-                selected_checks=["col_check"],
+        # History ('endt') should be default, not auto_match ('col')
+        assert captured_default == ["endt"], (
+            f"Expected history match 'endt' as default over auto_match 'col'. "
+            f"Got: {captured_default}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Within-session alias_cols pre-selection
+# ---------------------------------------------------------------------------
+
+class TestWithinSessionPreselect:
+
+    @pytest.fixture()
+    def registry_two_checks(self):
+        """Registry with two checks that share the same 'col' param name."""
+        def check_a(col: str) -> "pd.Series[bool]":
+            return pd.Series([True])
+        def check_b(col: str) -> "pd.Series[bool]":
+            return pd.Series([True])
+
+        reg = CheckRegistry()
+        reg.register("check_a", check_a, kind="check")
+        reg.register("check_b", check_b, kind="check")
+        return reg
+
+    def test_within_session_selection_prechecked_for_subsequent_check(
+        self, registry_two_checks
+    ):
+        """When check_a maps col→endt this session, check_b's col prompt
+        pre-checks endt because it's in alias_param_to_cols."""
+        prompter = _make_prompter_multi(registry_two_checks)
+        conn = MagicMock()
+
+        call_count = 0
+        captured_checks: list[list] = []
+
+        def capture_checkbox(label, choices):
+            nonlocal call_count
+            call_count += 1
+            captured_checks.append(list(choices))
+            m = MagicMock()
+            # First call (check_a): select endt
+            # Second call (check_b): return whatever is pre-checked
+            if call_count == 1:
+                m.ask.return_value = ["endt"]
+            else:
+                m.ask.return_value = [c.value for c in choices if c.checked]
+            return m
+
+        with _fill_params_stubs(
+            ["endt", "price"],
+            {"endt": "DATE", "price": "DOUBLE"},
+            col_history=[],
+        ), patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
+
+            _, alias_map, _ = prompter.prompt_params(
+                selected_checks=["check_a", "check_b"],
+                table="van",
+                conn=conn,
+                report_name="van_report",
+            )
+
+        # check_b's choices should have endt pre-checked
+        assert len(captured_checks) == 2, "Expected two checkbox prompts"
+        check_b_choices = {c.value: c for c in captured_checks[1]}
+        assert check_b_choices["endt"].checked is True, (
+            "Within-session alias (endt) must be pre-checked for check_b"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _output prompt — param-mirror pre-selection (rule 9)
+# ---------------------------------------------------------------------------
+
+class TestOutputPromptParamMirror:
+    """Behavioral guarantees for the two-step _output param-mirror prompt.
+
+    Root cause of previous test failures: eligible=False for transforms (not
+    bool-Series return) meant the checkbox never fired, alias entries were never
+    added during the call, and the _output prompt never triggered.
+    Fix: eligible is now also True for transforms with column-backed params.
+    Tests must trigger the checkbox by having the mock return multiple columns,
+    creating the n_runs > 1 scenario that fires the _output mirror prompt.
+    """
+
+    @pytest.fixture()
+    def registry_transform(self):
+        """Transform with float params. eligible=True because kind=transform
+        with column-backed params (updated eligible logic in _fill_params)."""
+        def my_transform(bar: float, baz: float) -> "pd.Series":
+            pass
+        reg = CheckRegistry()
+        reg.register("my_transform", my_transform, kind="transform")
+        return reg
+
+    def test_output_prompt_step1_shows_multi_col_params_only(
+        self, registry_transform
+    ):
+        """Step 1 choices include only params with >1 column, plus manual escape.
+
+        Single-entry (broadcast) params must not appear as mirror choices.
+        bar → [col_a, col_b] (multi), baz → [floor_a] (broadcast, excluded).
+        Checkbox mock: bar returns 2 cols, baz returns 1 col → n_runs=2 → _output fires.
+        """
+        prompter = _make_prompter_multi(registry_transform)
+        conn = MagicMock()
+
+        captured_step1_choices = []
+        checkbox_call = [0]
+
+        def capture_select(label, choices, default=None):
+            # Only fires for _output step 1 (col params use checkbox with eligible=True)
+            captured_step1_choices.extend(choices)
+            m = MagicMock()
+            m.ask.return_value = choices[-1].value  # pick manual so step 2 doesn't interfere
+            return m
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            if checkbox_call[0] == 1:
+                m.ask.return_value = ["col_a", "col_b"]  # bar: 2 cols → multi
+            elif checkbox_call[0] == 2:
+                m.ask.return_value = ["floor_a"]          # baz: 1 col → broadcast
+            else:
+                m.ask.return_value = []                   # _output step 2: manual → empty
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b", "floor_a", "result"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE", "floor_a": "DOUBLE", "result": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
+           patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
+
+            prompter._fill_params(
+                selected_checks=["my_transform"],
                 table="sales",
                 conn=conn,
                 report_name="test_report",
-                existing_alias_map=existing,
             )
 
-        # Pre-existing entry preserved
-        assert any(e["param"] == "col" and e["column"] == "price" for e in alias_map)
+        step1_values = [c.value for c in captured_step1_choices]
+        assert "bar" in step1_values, "Multi-column param 'bar' must appear in step 1"
+        assert "baz" not in step1_values, (
+            "Single-entry broadcast param 'baz' must NOT appear in step 1"
+        )
+        assert any("\u270e" in v for v in step1_values), (
+            "Manual escape option must always be present in step 1"
+        )
+
+    def test_output_prompt_param_chosen_prechecks_its_columns(
+        self, registry_transform
+    ):
+        """When user picks a param in step 1, its columns are pre-checked in step 2.
+
+        bar → [col_a, col_b] via checkbox. Step 1 select picks 'bar'.
+        Step 2 output checkbox must arrive with col_a and col_b pre-checked.
+        """
+        prompter = _make_prompter_multi(registry_transform)
+        conn = MagicMock()
+
+        captured_output_choices = []
+        checkbox_call = [0]
+        select_call = [0]
+
+        def capture_select(label, choices, default=None):
+            select_call[0] += 1
+            m = MagicMock()
+            # Only select call = _output step 1
+            m.ask.return_value = "bar"  # pick bar to mirror
+            return m
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            if checkbox_call[0] == 1:
+                # bar param selection
+                m.ask.return_value = ["col_a", "col_b"]
+            else:
+                # _output step 2: capture choices, return pre-checked ones
+                captured_output_choices.extend(choices)
+                m.ask.return_value = [c.value for c in choices if getattr(c, "checked", False)]
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b", "result"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE", "result": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
+           patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
+
+            prompter._fill_params(
+                selected_checks=["my_transform"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        by_value = {c.value: c for c in captured_output_choices}
+        assert by_value.get("col_a") and by_value["col_a"].checked is True, (
+            "col_a must be pre-checked when bar is chosen as mirror param"
+        )
+        assert by_value.get("col_b") and by_value["col_b"].checked is True, (
+            "col_b must be pre-checked when bar is chosen as mirror param"
+        )
+
+    def test_output_prompt_manual_has_no_prechecks(self, registry_transform):
+        """When user picks manual escape, no columns are pre-checked in step 2."""
+        prompter = _make_prompter_multi(registry_transform)
+        conn = MagicMock()
+
+        captured_output_choices = []
+        checkbox_call = [0]
+
+        def capture_select(label, choices, default=None):
+            m = MagicMock()
+            m.ask.return_value = choices[-1].value  # always pick manual
+            return m
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            if checkbox_call[0] == 1:
+                m.ask.return_value = ["col_a", "col_b"]  # bar: multi
+            else:
+                captured_output_choices.extend(choices)
+                m.ask.return_value = []
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b", "result"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE", "result": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select), \
+           patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox):
+
+            prompter._fill_params(
+                selected_checks=["my_transform"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        assert all(
+            not getattr(c, "checked", False) for c in captured_output_choices
+        ), "Manual selection must produce no pre-checked output columns"
