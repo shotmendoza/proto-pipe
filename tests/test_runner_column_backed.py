@@ -124,21 +124,20 @@ class TestApplyScalarTransformDuckdb:
         ]
 
         df = conn.execute(f'SELECT * FROM "{table}"').df()
-        _apply_scalar_transform_duckdb(
+        conn.close()
+
+        # New interface: no target_table or conn — returns modified DataFrame
+        result_df = _apply_scalar_transform_duckdb(
             name="add_floor",
             func=func,
             df=df,
-            target_table=table,
-            conn=conn,
             registry_types={"result_col": "DOUBLE"},
             alias_map=alias_map,
         )
 
-        result = conn.execute(f'SELECT result_col FROM "{table}" ORDER BY id').df()
-        assert list(result["result_col"]) == [15.0, 25.0, 35.0], (
+        assert list(result_df.sort_values("id")["result_col"]) == [15.0, 25.0, 35.0], (
             "UDF must receive per-row column values and write sum to result_col"
         )
-        conn.close()
 
     def test_no_output_fallback_writes_to_input_col(self, db_with_table):
         """Without _output in alias_map: result written back to first column-backed
@@ -153,21 +152,20 @@ class TestApplyScalarTransformDuckdb:
         alias_map = [{"param": "price", "column": "price_col"}]  # no _output
 
         df = conn.execute(f'SELECT * FROM "{table}"').df()
-        _apply_scalar_transform_duckdb(
+        conn.close()
+
+        # New interface: no target_table or conn — returns modified DataFrame
+        result_df = _apply_scalar_transform_duckdb(
             name="double",
             func=func,
             df=df,
-            target_table=table,
-            conn=conn,
             registry_types={"price_col": "DOUBLE"},
             alias_map=alias_map,
         )
 
-        result = conn.execute(f'SELECT price_col FROM "{table}" ORDER BY id').df()
-        assert list(result["price_col"]) == [20.0, 40.0, 60.0], (
+        assert list(result_df.sort_values("id")["price_col"]) == [20.0, 40.0, 60.0], (
             "Without _output, result must write back to input column (price_col)"
         )
-        conn.close()
 
     def test_constant_params_not_treated_as_column_refs(self, db_with_table):
         """Broadcast constant int/float params (non-column values in partial)
@@ -186,39 +184,33 @@ class TestApplyScalarTransformDuckdb:
         ]
 
         df = conn.execute(f'SELECT * FROM "{table}"').df()
-        _apply_scalar_transform_duckdb(
+        conn.close()
+
+        # New interface: no target_table or conn — returns modified DataFrame
+        result_df = _apply_scalar_transform_duckdb(
             name="clamp",
             func=func,
             df=df,
-            target_table=table,
-            conn=conn,
             registry_types={"result_col": "DOUBLE"},
             alias_map=alias_map,
         )
 
-        result = conn.execute(f'SELECT result_col FROM "{table}" ORDER BY id').df()
-        assert list(result["result_col"]) == [10.0, 15.0, 15.0], (
+        assert list(result_df.sort_values("id")["result_col"]) == [10.0, 15.0, 15.0], (
             "max_val=15.0 must be treated as a constant, not a column reference"
         )
-        conn.close()
 
     def test_raises_when_no_column_backed_params(self):
         """Raises ValueError when no column-backed params can be identified."""
-        conn = duckdb.connect()
-
         def no_col(x: float) -> float:
             return x
 
-        # No column-backed params — x is a constant baked in
+        # No column-backed params — x is a constant baked in (5.0 not in df.columns)
         func = functools.partial(no_col, x=5.0)
-
         df = pd.DataFrame({"a": [1.0]})
-        conn.execute("CREATE TABLE t AS SELECT * FROM df")
 
+        # New interface: no target_table or conn required
         with pytest.raises(ValueError, match="no column-backed params"):
             _apply_scalar_transform_duckdb(
                 name="no_col", func=func, df=df,
-                target_table="t", conn=conn,
                 registry_types={}, alias_map=[],
             )
-        conn.close()

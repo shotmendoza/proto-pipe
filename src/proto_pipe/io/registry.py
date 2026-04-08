@@ -106,6 +106,15 @@ def _expand_check_with_alias_map(
 
     inspector = CheckParamInspector(func)
 
+    # Resolve kind from the base function's registration. load_custom_checks runs
+    # before register_from_config, so the base name is already in the registry
+    # with the correct kind. Fall back to "check" only for built-ins that were
+    # never decorated (e.g. registered manually without @custom_check).
+    try:
+        kind = check_registry.get_kind(func_name)
+    except ValueError:
+        kind = "check"
+
     # Gate: only functions returning pd.Series or pd.DataFrame are expandable.
     # Dict-returning or unannotated functions must never expand — per-column
     # expansion semantics are undefined for non-Series/DataFrame returns.
@@ -115,7 +124,7 @@ def _expand_check_with_alias_map(
     if not inspector.is_expandable():
         check_name = _build_check_keys(func_name, params)
         if check_name not in check_registry.available():
-            _register_check(check_name, func_name, params, check_registry)
+            _register_check(check_name, func_name, params, check_registry, kind=kind)
         return [check_name]
 
     # All non-_output function params eligible for alias_map expansion.
@@ -133,7 +142,7 @@ def _expand_check_with_alias_map(
         # No expandable params in alias_map — register as single.
         check_name = _build_check_keys(func_name, params)
         if check_name not in check_registry.available():
-            _register_check(check_name, func_name, params, check_registry)
+            _register_check(check_name, func_name, params, check_registry, kind=kind)
         return [check_name]
 
     col_params = list(alias_col_params.keys())
@@ -160,7 +169,7 @@ def _expand_check_with_alias_map(
             run_params[p] = cols[i] if i < len(cols) else cols[0]
         check_name = _build_check_keys(func_name, run_params)
         if check_name not in check_registry.available():
-            _register_check(check_name, func_name, run_params, check_registry)
+            _register_check(check_name, func_name, run_params, check_registry, kind=kind)
         names.append(check_name)
     return names
 
@@ -193,6 +202,13 @@ def resolve_check_uuid(
         func_name = check["name"]
         params = check.get("params", {}) or {}
 
+        # Resolve kind from the base function's registration — same pattern as
+        # _expand_check_with_alias_map. Fallback to "check" for undecorated built-ins.
+        try:
+            kind = check_registry.get_kind(func_name)
+        except ValueError:
+            kind = "check"
+
         if alias_param_map:
             expanded = _expand_check_with_alias_map(
                 func_name, params, alias_param_map, check_registry
@@ -201,7 +217,7 @@ def resolve_check_uuid(
         else:
             check_name = _build_check_keys(func_name, params)
             if check_name not in check_registry.available():
-                _register_check(check_name, func_name, params, check_registry)
+                _register_check(check_name, func_name, params, check_registry, kind=kind)
             resolved_check_names.append(check_name)
 
     return resolved_check_names
@@ -282,11 +298,17 @@ def register_from_config(
 
     # Register templates as named checks (params baked in)
     for template_name, template in templates.items():
+        func_name = template["name"]
+        try:
+            kind = check_registry.get_kind(func_name)
+        except ValueError:
+            kind = "check"
         _register_check(
             name=template_name,
-            func_name=template["name"],
+            func_name=func_name,
             params=template.get("params", {}),
             check_registry=check_registry,
+            kind=kind,
         )
 
     # Register reports and any inline checks they define
