@@ -29,7 +29,7 @@ from proto_pipe.io.db import coerce_for_display
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Shared helpers (CLI-layer wiring only — no business logic)
 # ---------------------------------------------------------------------------
 
 def _resolve_source(table: str, sources_config: str | None) -> dict | None:
@@ -57,23 +57,6 @@ def _resolve_primary_key(table: str, sources_config: str | None) -> str | None:
     return pk
 
 
-def _glob_flagged_export(table: str, incoming_dir: str) -> Path | None:
-    """Return the most recently modified flagged export CSV for a table.
-
-    Globs incoming_dir for *_flagged_*.csv files and returns the most
-    recently modified one. Named to match source patterns so vp ingest
-    picks them up naturally (e.g. van_flagged_2026-04-02.csv matches van_*.csv).
-    """
-    inc = Path(incoming_dir)
-    candidates = sorted(
-        list(inc.glob(f"*{table}*_flagged_*.csv")) +
-        list(inc.glob(f"{table}_flagged_*.csv")),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
-
-
 def _flagged_export_path(table: str, source_name: str, incoming_dir: str) -> str:
     """Build the export path for a flagged table export.
 
@@ -84,66 +67,71 @@ def _flagged_export_path(table: str, source_name: str, incoming_dir: str) -> str
     return str(Path(incoming_dir) / f"{source_name}_flagged_{today}.csv")
 
 
-def _get_raw_source_block(
-    conn: duckdb.DuckDBPyConnection,
-    table: str | None,
-    limit: int | None = None,
-) -> pd.DataFrame:
-    """Return raw source_block, optionally filtered by table_name."""
-    query = """
-        SELECT
-            id          AS _flag_id,
-            table_name,
-            check_name  AS _flag_check,
-            pk_value,
-            source_file,
-            source_file_missing,
-            bad_columns AS _flag_columns,
-            reason      AS _flag_reason,
-            flagged_at
-        FROM source_block
-    """
-    params = []
-    if table:
-        query += " WHERE table_name = ?"
-        params.append(table)
-    query += " ORDER BY flagged_at DESC"
-    if limit:
-        query += f" LIMIT {limit}"
-    return coerce_for_display(conn.execute(query, params).df())
+def _diff_flag_ids(
+    original_df: pd.DataFrame,
+    edited_df: pd.DataFrame,
+) -> tuple[set[str], set[str]]:
+    """Compute deleted and remaining flag IDs from original vs edited DataFrames."""
+    orig_ids = set(original_df["_flag_id"].dropna().tolist())
+    edited_ids = (
+        set(edited_df["_flag_id"].dropna().tolist())
+        if "_flag_id" in edited_df.columns
+        else set()
+    )
+    return orig_ids - edited_ids, edited_ids
 
 
-def _get_raw_validation_block(
-    conn: duckdb.DuckDBPyConnection,
-    table: str | None,
-    report: str | None,
-    limit: int | None = None,
-) -> pd.DataFrame:
-    """Return raw validation_block, optionally filtered."""
-    query = """
-        SELECT
-            id          AS _flag_id,
-            table_name,
-            report_name,
-            check_name  AS _flag_check,
-            pk_value,
-            bad_columns AS _flag_columns,
-            reason      AS _flag_reason,
-            flagged_at
-        FROM validation_block
-        WHERE 1=1
+def _read_export_flag_ids(path: Path) -> set[str]:
+    """Read _flag_id values from a CSV export. Returns empty set on error."""
+    import csv as _csv
+    try:
+        with open(path, newline="") as _f:
+            reader = _csv.DictReader(_f)
+            return {
+                row["_flag_id"]
+                for row in reader
+                if "_flag_id" in row and row["_flag_id"]
+            }
+    except Exception:
+        return set()
+
+
+def _strip_pipeline_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Return only non-underscore-prefixed columns."""
+    data_cols = [c for c in df.columns if not c.startswith("_")]
+    return df[data_cols].copy()
+
+
+def _resolve_report_context(
+    report: str,
+    key: str | None,
+    sources_config: str | None,
+) -> tuple[str, str | None]:
+    """Resolve (target_table, pk_col) for a report name.
+
+    Reads ReportConfig to find target_table and primary_key. Falls back to
+    sources_config.yaml for the PK if not set on the report.
+
+    Returns (table, pk_col) where pk_col may be None if unresolvable.
     """
-    params = []
-    if table:
-        query += " AND table_name = ?"
-        params.append(table)
-    if report:
-        query += " AND report_name = ?"
-        params.append(report)
-    query += " ORDER BY flagged_at DESC"
-    if limit:
-        query += f" LIMIT {limit}"
-    return coerce_for_display(conn.execute(query, params).df())
+    from proto_pipe.io.config import ReportConfig
+
+    rep_cfg = config_path_or_override("reports_config", sources_config)
+    report_config = None
+    source_table = None
+    try:
+        report_config = ReportConfig(rep_cfg).get(report)
+        table = report_config.get("target_table", report) if report_config else report
+        source_table = report_config.get("source", {}).get("table") if report_config else None
+    except Exception:
+        table = report
+
+    pk_col = key
+    if not pk_col and report_config:
+        pk_col = report_config.get("source", {}).get("primary_key")
+    if not pk_col and source_table:
+        pk_col = _resolve_primary_key(source_table, sources_config)
+    return table, pk_col
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +172,14 @@ def flagged_cmd(ctx, table, export, limit, pipeline_db):
         return
 
     from proto_pipe.cli.commands.table import get_reviewer
+    from proto_pipe.pipelines.flagging import get_raw_flags
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
 
     try:
-        df = _get_raw_source_block(conn, table, limit=limit)
+        filters = {"table_name": table} if table else None
+        df = get_raw_flags(conn, "source_block", filters=filters, limit=limit)
 
         if df.empty:
             scope = f"'{table}'" if table else "any table"
@@ -240,8 +230,7 @@ def flagged_edit(table, key, resolve, sources_config, pipeline_db):
       vp flagged edit --table van --resolve
     """
     from proto_pipe.cli.commands.table import get_reviewer
-    from proto_pipe.pipelines.flagging import build_source_flag_export
-    import tempfile, os
+    from proto_pipe.pipelines.flagging import build_source_flag_export, clear_flags
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     pk_col = key or _resolve_primary_key(table, sources_config)
@@ -254,8 +243,7 @@ def flagged_edit(table, key, resolve, sources_config, pipeline_db):
 
     conn = duckdb.connect(p_db)
     try:
-        df = build_source_flag_export(conn, table, pk_col)
-        df = coerce_for_display(df)
+        df = coerce_for_display(build_source_flag_export(conn, table, pk_col))
 
         if df.empty:
             click.echo(f"\n  No blocked rows for '{table}' — all clear.")
@@ -274,7 +262,24 @@ def flagged_edit(table, key, resolve, sources_config, pipeline_db):
             click.echo("  No changes made.")
             return
 
-        _apply_flagged_edits(conn, table, pk_col, df, edited_df, sources_config)
+        # Diff flag IDs → clear deleted, apply edits, clear remaining
+        deleted_ids, remaining_ids = _diff_flag_ids(df, edited_df)
+
+        if deleted_ids:
+            cleared = clear_flags(conn, "source_block", deleted_ids)
+            click.echo(f"  [ok] {cleared} row(s) skipped and cleared from source_block")
+
+        corrections_df = _strip_pipeline_cols(edited_df)
+        if corrections_df.empty:
+            return
+
+        # Source corrections go through the full ingest path
+        _ingest_corrections(conn, corrections_df, table, pk_col, sources_config)
+
+        if remaining_ids:
+            cleared = clear_flags(conn, "source_block", remaining_ids)
+            if cleared:
+                click.echo(f"[ok] {cleared} flag(s) cleared from source_block")
 
     except Exception as e:
         click.echo(f"[error] Could not build enriched view: {e}")
@@ -291,14 +296,11 @@ def _run_resolve_wizard(
 ) -> None:
     """Step-through wizard for resolving duplicate conflicts column by column."""
     import questionary
-
-    flag_col = "_flag_columns"
-    reason_col = "_flag_reason"
+    from proto_pipe.pipelines.flagging import clear_flags
 
     for _, row in df.iterrows():
         pk_val = row.get(pk_col, "unknown")
-        reason = row.get(reason_col, "")
-        bad_cols = [c.strip() for c in str(row.get(flag_col, "")).split("|") if c.strip()]
+        reason = row.get("_flag_reason", "")
 
         click.echo(f"\n── Record: {pk_col}={pk_val} ──────────────────────────")
         click.echo(f"  Reason: {reason}")
@@ -312,56 +314,26 @@ def _run_resolve_wizard(
             ],
         ).ask()
 
-        if action == "skip":
-            conn.execute(
-                "DELETE FROM source_block WHERE id = ?",
-                [row.get("_flag_id")]
-            )
-            click.echo(f"  [ok] Flag cleared — existing row kept.")
-        elif action == "accept":
-            # Mark for upsert by clearing flag — user will re-ingest
-            conn.execute(
-                "DELETE FROM source_block WHERE id = ?",
-                [row.get("_flag_id")]
-            )
-            click.echo(f"  [ok] Flag cleared — re-ingest the source file to apply.")
+        flag_id = row.get("_flag_id")
+        if action in ("skip", "accept"):
+            clear_flags(conn, "source_block", [flag_id])
+            msg = "existing row kept" if action == "skip" else "re-ingest the source file to apply"
+            click.echo(f"  [ok] Flag cleared — {msg}.")
         else:
             click.echo(f"  [skip] Left for later.")
 
 
-def _apply_flagged_edits(
+def _ingest_corrections(
     conn: duckdb.DuckDBPyConnection,
+    corrections_df: pd.DataFrame,
     table: str,
     pk_col: str,
-    original_df: pd.DataFrame,
-    edited_df: pd.DataFrame,
     sources_config: str | None,
 ) -> None:
-    """Apply edits from the TUI back to the source table and clear resolved flags."""
+    """Write corrections through the full ingest path (source layer only)."""
+    from proto_pipe.io.config import SourceConfig, config_path_or_override
     from proto_pipe.io.ingest import ingest_single_file
-    from proto_pipe.io.config import SourceConfig
     import tempfile, os
-
-    # Determine which rows were deleted (user wants to skip)
-    orig_flag_ids = set(original_df["_flag_id"].dropna().tolist())
-    edited_flag_ids = set(edited_df["_flag_id"].dropna().tolist()) if "_flag_id" in edited_df.columns else set()
-    deleted_flag_ids = orig_flag_ids - edited_flag_ids
-
-    # Clear deleted flags (user chose to skip)
-    if deleted_flag_ids:
-        placeholders = ", ".join(["?"] * len(deleted_flag_ids))
-        conn.execute(
-            f"DELETE FROM source_block WHERE id IN ({placeholders})",
-            list(deleted_flag_ids),
-        )
-        click.echo(f"  [ok] {len(deleted_flag_ids)} row(s) skipped and cleared from source_block")
-
-    # Apply edits for remaining rows
-    data_cols = [c for c in edited_df.columns if not c.startswith("_")]
-    corrections_df = edited_df[data_cols].copy()
-
-    if corrections_df.empty:
-        return
 
     src_cfg = config_path_or_override("sources_config", sources_config)
     try:
@@ -383,16 +355,6 @@ def _apply_flagged_edits(
         )
         if result["status"] == "ok":
             click.echo(f"[ok] {result['rows']} row(s) applied to '{table}'")
-            # Clear resolved flags
-            remaining_flag_ids = list(edited_flag_ids)
-            if remaining_flag_ids:
-                placeholders = ", ".join(["?"] * len(remaining_flag_ids))
-                cleared = conn.execute(
-                    f"DELETE FROM source_block WHERE id IN ({placeholders}) RETURNING id",
-                    remaining_flag_ids,
-                ).fetchall()
-                if cleared:
-                    click.echo(f"[ok] {len(cleared)} flag(s) cleared from source_block")
         else:
             click.echo(f"[error] {result.get('message', 'Ingest failed')}")
     finally:
@@ -418,14 +380,19 @@ def flagged_open(table, key, sources_config, pipeline_db):
       vp flagged open van
       vp flagged open van --key van_id
     """
-    from proto_pipe.pipelines.flagging import build_source_flag_export
+    from proto_pipe.cli.scaffold import glob_most_recent
+    from proto_pipe.pipelines.flagging import build_source_flag_export, get_raw_flags
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     incoming_dir = config_path_or_override("incoming_dir")
     pk_col = key or _resolve_primary_key(table, sources_config)
 
     # Check for existing export first
-    path = _glob_flagged_export(table, incoming_dir)
+    path = glob_most_recent(
+        incoming_dir,
+        f"*{table}*_flagged_*.csv",
+        f"{table}_flagged_*.csv",
+    )
 
     if not path:
         conn = duckdb.connect(p_db)
@@ -433,7 +400,7 @@ def flagged_open(table, key, sources_config, pipeline_db):
             if pk_col:
                 df = coerce_for_display(build_source_flag_export(conn, table, pk_col))
             else:
-                df = _get_raw_source_block(conn, table)
+                df = get_raw_flags(conn, "source_block", filters={"table_name": table})
 
             if df.empty:
                 click.echo(f"  No blocked rows for '{table}' — nothing to open.")
@@ -529,11 +496,17 @@ def flagged_retry(table, key, pipeline_db, sources_config):
       vp flagged retry van
       vp flagged retry van --key van_id
     """
+    from proto_pipe.cli.scaffold import glob_most_recent
     from proto_pipe.io.config import SourceConfig
     from proto_pipe.io.ingest import ingest_single_file
+    from proto_pipe.pipelines.flagging import clear_flags
 
     incoming_dir = config_path_or_override("incoming_dir")
-    path = _glob_flagged_export(table, incoming_dir)
+    path = glob_most_recent(
+        incoming_dir,
+        f"*{table}*_flagged_*.csv",
+        f"{table}_flagged_*.csv",
+    )
 
     if not path:
         click.echo(
@@ -561,37 +534,22 @@ def flagged_retry(table, key, pipeline_db, sources_config):
 
     conn = duckdb.connect(p_db)
     try:
-        # Read export to find deleted rows (user wants to skip)
-        import csv as _csv
-        try:
-            with open(path, newline="") as _f:
-                reader = _csv.DictReader(_f)
-                export_rows = list(reader)
-            export_flag_ids = {
-                row["_flag_id"] for row in export_rows
-                if "_flag_id" in row and row["_flag_id"]
-            }
-        except Exception:
-            export_flag_ids = set()
-
-        # Find flags for this table that are NOT in the export (deleted = skip)
-        all_flags = conn.execute(
-            "SELECT id FROM source_block WHERE table_name = ?", [table]
-        ).df()["id"].tolist()
-
-        deleted_flag_ids = [fid for fid in all_flags if fid not in export_flag_ids]
-        if deleted_flag_ids:
-            placeholders = ", ".join(["?"] * len(deleted_flag_ids))
+        # Handle deleted rows (removed from export = skip, clear flag)
+        export_flag_ids = _read_export_flag_ids(path)
+        all_flag_ids = set(
             conn.execute(
-                f"DELETE FROM source_block WHERE id IN ({placeholders})",
-                deleted_flag_ids,
-            )
+                "SELECT id FROM source_block WHERE table_name = ?", [table]
+            ).df()["id"].tolist()
+        )
+        deleted_ids = all_flag_ids - export_flag_ids
+        if deleted_ids:
+            cleared = clear_flags(conn, "source_block", deleted_ids)
             from proto_pipe.io.db import log_ingest_state
             log_ingest_state(
                 conn, path.name, table, "skipped",
-                message=f"{len(deleted_flag_ids)} row(s) deleted from export — skipped"
+                message=f"{cleared} row(s) deleted from export — skipped"
             )
-            click.echo(f"  [ok] {len(deleted_flag_ids)} deleted row(s) skipped and cleared")
+            click.echo(f"  [ok] {cleared} deleted row(s) skipped and cleared")
 
         # Re-ingest the export with upsert + strip pipeline cols
         result = ingest_single_file(
@@ -610,12 +568,12 @@ def flagged_retry(table, key, pipeline_db, sources_config):
         click.echo(f"[ok] {result['rows']} row(s) applied to '{table}'")
 
         # Clear remaining flags for this table
-        cleared = conn.execute(
+        remaining = conn.execute(
             "DELETE FROM source_block WHERE table_name = ? RETURNING id",
             [table],
         ).fetchall()
-        if cleared:
-            click.echo(f"[ok] {len(cleared)} flag(s) cleared from source_block")
+        if remaining:
+            click.echo(f"[ok] {len(remaining)} flag(s) cleared from source_block")
 
         if result.get("new_cols"):
             click.echo(f"  New columns added: {', '.join(result['new_cols'])}")
@@ -661,13 +619,24 @@ def validated_cmd(ctx, table, report, export, limit, pipeline_db):
         return
 
     from proto_pipe.cli.commands.table import get_reviewer
+    from proto_pipe.pipelines.flagging import get_raw_flags
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
 
     try:
+        filters = {}
+        if table:
+            filters["table_name"] = table
+        if report:
+            filters["report_name"] = report
+
         try:
-            df = _get_raw_validation_block(conn, table, report, limit=limit)
+            df = get_raw_flags(
+                conn, "validation_block",
+                filters=filters or None,
+                limit=limit,
+            )
         except Exception as e:
             click.echo(f"[error] Could not read validation_block: {e}")
             click.echo("Has 'vp db-init' been run yet?")
@@ -724,26 +693,11 @@ def validated_edit(report, key, sources_config, pipeline_db):
       vp validated edit --report van_report
     """
     from proto_pipe.cli.commands.table import get_reviewer
-    from proto_pipe.pipelines.flagging import build_validation_flag_export
-    from proto_pipe.io.config import ReportConfig
+    from proto_pipe.io.db import upsert_via_staging
+    from proto_pipe.pipelines.flagging import build_validation_flag_export, clear_flags
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
-    rep_cfg = config_path_or_override("reports_config", sources_config)
-
-    # Resolve report table name and PK
-    try:
-        report_config = ReportConfig(rep_cfg).get(report)
-        table = report_config.get("target_table", report) if report_config else report
-        source_table = report_config.get("source", {}).get("table") if report_config else None
-    except Exception:
-        table = report
-        source_table = None
-
-    pk_col = key
-    if not pk_col and report_config:
-        pk_col = report_config.get("source", {}).get("primary_key")
-    if not pk_col and source_table:
-        pk_col = _resolve_primary_key(source_table, sources_config)
+    table, pk_col = _resolve_report_context(report, key, sources_config)
     if not pk_col:
         click.echo(
             f"[error] Cannot build enriched view without a primary key.\n"
@@ -767,76 +721,28 @@ def validated_edit(report, key, sources_config, pipeline_db):
             click.echo("  No changes made.")
             return
 
-        _apply_validation_edits(conn, table, report, pk_col, df, edited_df)
+        # Diff flag IDs → clear deleted, upsert edits, clear remaining
+        deleted_ids, remaining_ids = _diff_flag_ids(df, edited_df)
+
+        if deleted_ids:
+            cleared = clear_flags(conn, "validation_block", deleted_ids)
+            click.echo(f"  [ok] {cleared} row(s) skipped and cleared from validation_block")
+
+        corrections_df = _strip_pipeline_cols(edited_df)
+        if not corrections_df.empty and pk_col in corrections_df.columns:
+            upsert_via_staging(conn, table, corrections_df, pk_col)
+            click.echo(f"[ok] {len(corrections_df)} row(s) updated in '{table}'")
+
+        if remaining_ids:
+            cleared = clear_flags(conn, "validation_block", remaining_ids)
+            if cleared:
+                click.echo(f"[ok] {cleared} flag(s) cleared from validation_block")
 
     except Exception as e:
         click.echo(f"[error] Could not build enriched view: {e}")
         click.echo("  Run 'vp validated --report' for the raw failures view.")
     finally:
         conn.close()
-
-
-def _apply_validation_edits(
-    conn: duckdb.DuckDBPyConnection,
-    table: str,
-    report: str,
-    pk_col: str,
-    original_df: pd.DataFrame,
-    edited_df: pd.DataFrame,
-) -> None:
-    """Upsert edited rows back to the report table and clear resolved flags."""
-    # Handle deleted rows (user chose to skip)
-    orig_flag_ids = set(original_df["_flag_id"].dropna().tolist())
-    edited_flag_ids = set(edited_df["_flag_id"].dropna().tolist()) if "_flag_id" in edited_df.columns else set()
-    deleted_flag_ids = orig_flag_ids - edited_flag_ids
-
-    if deleted_flag_ids:
-        placeholders = ", ".join(["?"] * len(deleted_flag_ids))
-        conn.execute(
-            f"DELETE FROM validation_block WHERE id IN ({placeholders})",
-            list(deleted_flag_ids),
-        )
-        click.echo(f"  [ok] {len(deleted_flag_ids)} row(s) skipped and cleared from validation_block")
-
-    # Upsert remaining rows to report table
-    data_cols = [c for c in edited_df.columns if not c.startswith("_")]
-    corrections_df = edited_df[data_cols].copy()
-
-    if corrections_df.empty or pk_col not in corrections_df.columns:
-        return
-
-    # Upsert via staging table
-    conn.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS _val_corrections AS SELECT * FROM corrections_df LIMIT 0"
-    )
-    conn.execute("DELETE FROM _val_corrections")
-    conn.execute("INSERT INTO _val_corrections SELECT * FROM corrections_df")
-
-    update_cols = [c for c in data_cols if c != pk_col]
-    if not update_cols:
-        return
-
-    set_clause = ", ".join(f'"{c}" = _val_corrections."{c}"' for c in update_cols)
-    conn.execute(f"""
-        UPDATE "{table}"
-        SET {set_clause}
-        FROM _val_corrections
-        WHERE "{table}"."{pk_col}" = _val_corrections."{pk_col}"
-    """)
-    conn.execute("DROP TABLE IF EXISTS _val_corrections")
-
-    click.echo(f"[ok] {len(corrections_df)} row(s) updated in '{table}'")
-
-    # Clear resolved flags
-    remaining_flag_ids = list(edited_flag_ids)
-    if remaining_flag_ids:
-        placeholders = ", ".join(["?"] * len(remaining_flag_ids))
-        cleared = conn.execute(
-            f"DELETE FROM validation_block WHERE id IN ({placeholders}) RETURNING id",
-            remaining_flag_ids,
-        ).fetchall()
-        if cleared:
-            click.echo(f"[ok] {len(cleared)} flag(s) cleared from validation_block")
 
 
 @validated_cmd.command("open")
@@ -856,28 +762,10 @@ def validated_open(report, key, sources_config, pipeline_db):
     """
     from proto_pipe.pipelines.flagging import build_validation_flag_export
     from proto_pipe.reports.corrections import dated_export_path
-    from proto_pipe.io.config import ReportConfig
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     out_dir = config_path_or_override("output_dir")
-    rep_cfg = config_path_or_override("reports_config", sources_config)
-
-    try:
-        report_config = ReportConfig(rep_cfg).get(report)
-        table = report_config.get("target_table", report) if report_config else report
-        source_table = report_config.get("source", {}).get("table") if report_config else None
-    except Exception:
-        table = report
-        source_table = None
-
-    pk_col = key
-    if not pk_col and report_config:
-        # Read primary_key from the report's source config — this is the
-        # canonical location for report-layer primary keys (reports_config.yaml).
-        pk_col = report_config.get("source", {}).get("primary_key")
-    if not pk_col and source_table:
-        # Fall back to sources_config.yaml if not set on the report source.
-        pk_col = _resolve_primary_key(source_table, sources_config)
+    table, pk_col = _resolve_report_context(report, key, sources_config)
     if not pk_col:
         click.echo("[error] Cannot export without a primary key. Use --key.")
         return
@@ -982,108 +870,59 @@ def validated_retry(report, key, sources_config, pipeline_db):
     Example:
       vp validated retry van_report
     """
-    from proto_pipe.reports.corrections import dated_export_path
-    from proto_pipe.io.config import ReportConfig
-    import csv as _csv
-    import glob
+    from proto_pipe.cli.scaffold import glob_most_recent
+    from proto_pipe.io.db import upsert_via_staging
+    from proto_pipe.pipelines.flagging import clear_flags
 
     out_dir = config_path_or_override("output_dir")
     p_db = config_path_or_override("pipeline_db", pipeline_db)
-    rep_cfg = config_path_or_override("reports_config", sources_config)
 
-    # Find most recently modified export for this report
-    candidates = sorted(
-        Path(out_dir).glob(f"validated_{report}_*.csv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
+    path = glob_most_recent(out_dir, f"validated_{report}_*.csv")
+    if not path:
         click.echo(
             f"[error] No export found for '{report}' in {out_dir}.\n"
             f"  Run: vp validated open {report}"
         )
         return
 
-    path = candidates[0]
     click.echo(f"  Applying corrections from: {path.name}")
 
-    try:
-        report_config = ReportConfig(rep_cfg).get(report)
-        table = report_config.get("target_table", report) if report_config else report
-        source_table = report_config.get("source", {}).get("table") if report_config else None
-    except Exception:
-        table = report
-        source_table = None
-
-    pk_col = key
-    if not pk_col and source_table:
-        pk_col = _resolve_primary_key(source_table, sources_config)
+    table, pk_col = _resolve_report_context(report, key, sources_config)
     if not pk_col:
         click.echo("[error] Cannot apply corrections without a primary key. Use --key.")
         return
 
     conn = duckdb.connect(p_db)
     try:
-        # Read export to find deleted rows
-        try:
-            with open(path, newline="") as _f:
-                reader = _csv.DictReader(_f)
-                export_rows = list(reader)
-            export_flag_ids = {
-                row["_flag_id"] for row in export_rows
-                if "_flag_id" in row and row["_flag_id"]
-            }
-        except Exception:
-            export_flag_ids = set()
-
-        # Handle deleted rows → skip
-        all_flags = conn.execute(
-            "SELECT id FROM validation_block WHERE report_name = ?", [report]
-        ).df()["id"].tolist()
-
-        deleted_flag_ids = [fid for fid in all_flags if fid not in export_flag_ids]
-        if deleted_flag_ids:
-            placeholders = ", ".join(["?"] * len(deleted_flag_ids))
+        # Handle deleted rows (removed from export = skip)
+        export_flag_ids = _read_export_flag_ids(path)
+        all_flag_ids = set(
             conn.execute(
-                f"DELETE FROM validation_block WHERE id IN ({placeholders})",
-                deleted_flag_ids,
-            )
-            click.echo(f"  [ok] {len(deleted_flag_ids)} deleted row(s) skipped and cleared")
+                "SELECT id FROM validation_block WHERE report_name = ?", [report]
+            ).df()["id"].tolist()
+        )
+        deleted_ids = all_flag_ids - export_flag_ids
+        if deleted_ids:
+            cleared = clear_flags(conn, "validation_block", deleted_ids)
+            click.echo(f"  [ok] {cleared} deleted row(s) skipped and cleared")
 
-        # Load export, strip flag cols, upsert to report table
-        corrections_df = pd.read_csv(path)
-        data_cols = [c for c in corrections_df.columns if not c.startswith("_")]
-        corrections_df = corrections_df[data_cols]
+        # Load, strip flag cols, upsert
+        corrections_df = _strip_pipeline_cols(pd.read_csv(path))
 
         if corrections_df.empty or pk_col not in corrections_df.columns:
             click.echo("  No data to apply after stripping pipeline columns.")
             return
 
-        conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _val_retry AS SELECT * FROM corrections_df LIMIT 0"
-        )
-        conn.execute("DELETE FROM _val_retry")
-        conn.execute("INSERT INTO _val_retry SELECT * FROM corrections_df")
-
-        update_cols = [c for c in data_cols if c != pk_col]
-        if update_cols:
-            set_clause = ", ".join(f'"{c}" = _val_retry."{c}"' for c in update_cols)
-            conn.execute(f"""
-                UPDATE "{table}"
-                SET {set_clause}
-                FROM _val_retry
-                WHERE "{table}"."{pk_col}" = _val_retry."{pk_col}"
-            """)
-        conn.execute("DROP TABLE IF EXISTS _val_retry")
+        upsert_via_staging(conn, table, corrections_df, pk_col)
         click.echo(f"[ok] {len(corrections_df)} row(s) applied to '{table}'")
 
         # Clear remaining flags
-        cleared = conn.execute(
+        remaining = conn.execute(
             "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
             [report],
         ).fetchall()
-        if cleared:
-            click.echo(f"[ok] {len(cleared)} flag(s) cleared from validation_block")
+        if remaining:
+            click.echo(f"[ok] {len(remaining)} flag(s) cleared from validation_block")
 
     finally:
         conn.close()

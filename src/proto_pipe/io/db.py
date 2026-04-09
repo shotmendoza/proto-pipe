@@ -929,3 +929,63 @@ def get_table_columns(pipeline_db: str, table: str) -> list[str]:
     ).df()["column_name"].tolist()
     conn.close()
     return [c for c in cols if not c.startswith("_")]
+
+
+def upsert_via_staging(
+    conn: "duckdb.DuckDBPyConnection",
+    target_table: str,
+    corrections_df: "pd.DataFrame",
+    pk_col: str,
+) -> int:
+    """UPDATE rows in target_table matching pk_col via temp staging table.
+
+    Uses CREATE TEMP TABLE + UPDATE ... FROM + DROP pattern. Does not
+    INSERT new rows — this is UPDATE-only for correction workflows.
+
+    Columns in corrections_df that do not exist in the target table are
+    silently ignored (common when the corrections file has extra columns).
+
+    Returns the number of rows in corrections_df that were sent for update.
+    Rows where pk_col has no match in target_table are silently skipped
+    (standard UPDATE ... FROM behavior).
+    """
+    if corrections_df.empty or pk_col not in corrections_df.columns:
+        return 0
+
+    # Only SET columns that exist in both the DataFrame and the target table
+    target_cols = set(
+        conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            [target_table],
+        ).df()["column_name"].tolist()
+    )
+    update_cols = [
+        c for c in corrections_df.columns
+        if c != pk_col and c in target_cols
+    ]
+    if not update_cols:
+        return 0
+
+    # Staging table only needs PK + updatable columns
+    staging_cols = [pk_col] + update_cols
+    staging_df = corrections_df[staging_cols]
+
+    staging = "_upsert_staging"
+    conn.execute(
+        f"CREATE TEMP TABLE IF NOT EXISTS {staging} "
+        f"AS SELECT * FROM staging_df LIMIT 0"
+    )
+    conn.execute(f"DELETE FROM {staging}")
+    conn.execute(f"INSERT INTO {staging} SELECT * FROM staging_df")
+
+    set_clause = ", ".join(
+        f'"{c}" = {staging}."{c}"' for c in update_cols
+    )
+    conn.execute(f"""
+        UPDATE "{target_table}"
+        SET {set_clause}
+        FROM {staging}
+        WHERE "{target_table}"."{pk_col}" = {staging}."{pk_col}"
+    """)
+    conn.execute(f"DROP TABLE IF EXISTS {staging}")
+    return len(corrections_df)

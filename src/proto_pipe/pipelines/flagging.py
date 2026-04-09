@@ -484,3 +484,68 @@ def compute_check_set_hash(
 
     combined = "|".join(parts)
     return hashlib.md5(combined.encode()).hexdigest()
+
+
+def get_raw_flags(
+    conn: "duckdb.DuckDBPyConnection",
+    flag_table: str,
+    filters: dict[str, str] | None = None,
+    limit: int | None = None,
+) -> "pd.DataFrame":
+    """Return raw flag rows with standard _flag_* column aliases.
+
+    Works for both source_block and validation_block. Filters is a dict
+    of {column_name: value} pairs used as AND-ed WHERE clauses.
+
+    Renames: id → _flag_id, check_name → _flag_check,
+             bad_columns → _flag_columns, reason → _flag_reason.
+    """
+    from proto_pipe.io.db import coerce_for_display
+
+    query = f'SELECT * FROM "{flag_table}"'
+    params: list = []
+    clauses: list[str] = []
+    for col, val in (filters or {}).items():
+        clauses.append(f'"{col}" = ?')
+        params.append(val)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY flagged_at DESC"
+    if limit:
+        query += f" LIMIT {limit}"
+
+    df = conn.execute(query, params).df()
+    rename = {
+        "id": "_flag_id",
+        "check_name": "_flag_check",
+        "bad_columns": "_flag_columns",
+        "reason": "_flag_reason",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    return coerce_for_display(df)
+
+
+def clear_flags(
+    conn: "duckdb.DuckDBPyConnection",
+    flag_table: str,
+    flag_ids: list[str] | set[str],
+) -> int:
+    """DELETE flags by id from the given flag table.
+
+    Returns the count of rows actually deleted. Safe to call with an
+    empty list (returns 0, no query executed).
+    """
+    flag_ids = list(flag_ids)
+    if not flag_ids:
+        return 0
+    placeholders = ", ".join(["?"] * len(flag_ids))
+    count = conn.execute(
+        f'SELECT count(*) FROM "{flag_table}" WHERE id IN ({placeholders})',
+        flag_ids,
+    ).fetchone()[0]
+    if count:
+        conn.execute(
+            f'DELETE FROM "{flag_table}" WHERE id IN ({placeholders})',
+            flag_ids,
+        )
+    return count

@@ -103,8 +103,9 @@ def dated_export_path(output_dir: str, table_name: str) -> str:
 # Import corrections
 # ---------------------------------------------------------------------------
 
+
 def import_corrections(
-    conn: duckdb.DuckDBPyConnection,
+    conn: "duckdb.DuckDBPyConnection",
     table_name: str,
     corrections_path: str,
     primary_key: str,
@@ -121,8 +122,16 @@ def import_corrections(
     :param table_name:        The table to update.
     :param corrections_path:  Path to the corrected CSV file.
     :param primary_key:       Column name to match rows on (e.g. "van_id").
-    :return: dict with keys: updated, flagged_cleared, validation_cleared, not_found.
+    :return: dict with keys: updated, flagged_cleared, validation_cleared,
+             not_found, not_found_keys.
     """
+    from pathlib import Path
+
+    from proto_pipe.io.db import get_registry_types, upsert_via_staging
+    from proto_pipe.io.ingest import load_file
+    from proto_pipe.io.migration import apply_declared_types
+    from proto_pipe.pipelines.flagging import clear_flags
+
     path = Path(corrections_path)
     if not path.exists():
         raise FileNotFoundError(f"Corrections file not found: {corrections_path}")
@@ -131,9 +140,6 @@ def import_corrections(
 
     # Apply declared types from column_type_registry so write-back uses
     # confirmed types, not pandas inference from the CSV round-trip.
-    from proto_pipe.io.db import get_registry_types
-    from proto_pipe.io.migration import apply_declared_types
-
     user_cols = [c for c in df.columns if not c.startswith("_")]
     registry_types = get_registry_types(conn, user_cols)
     if registry_types:
@@ -157,7 +163,9 @@ def import_corrections(
         conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
             [table_name],
-        ).df()["column_name"].tolist()
+        )
+        .df()["column_name"]
+        .tolist()
     )
 
     update_cols = [c for c in df.columns if c in table_cols and c != primary_key]
@@ -168,76 +176,33 @@ def import_corrections(
             f"table columns: {sorted(table_cols)}"
         )
 
-    # Warn about keys in corrections file that don't exist in the table
+    # Check for keys in corrections file that don't exist in the table
     existing_keys = set(
         conn.execute(f'SELECT DISTINCT "{primary_key}" FROM "{table_name}"')
         .df()[primary_key]
         .tolist()
     )
     correction_keys = set(df[primary_key].dropna().tolist())
-    not_found_keys = correction_keys - existing_keys
+    not_found_keys = sorted(correction_keys - existing_keys)
     not_found = len(not_found_keys)
-    if not_found_keys:
-        print(
-            f"  [warn] {not_found} key(s) in corrections file not found in "
-            f"'{table_name}': {sorted(not_found_keys)[:5]}"
-            + (" ..." if not_found > 5 else "")
-        )
 
-    # Batched UPDATE via staging temp table
-    conn.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS _corrections_staging "
-        "AS SELECT * FROM df LIMIT 0"
-    )
-    conn.execute("DELETE FROM _corrections_staging")
-    conn.execute("INSERT INTO _corrections_staging SELECT * FROM df")
-
-    set_clause = ", ".join(
-        f'"{col}" = _corrections_staging."{col}"' for col in update_cols
-    )
-    conn.execute(f"""
-        UPDATE "{table_name}"
-        SET {set_clause}
-        FROM _corrections_staging
-        WHERE "{table_name}"."{primary_key}" = _corrections_staging."{primary_key}"
-    """)
-    conn.execute("DROP TABLE IF EXISTS _corrections_staging")
-
+    # UPDATE via shared staging helper
+    upsert_via_staging(conn, table_name, df, primary_key)
     updated = len(df) - not_found
 
     # Clear resolved entries from source_block and validation_block
-    flagged_cleared = 0
-    validation_cleared = 0
+    flagged_cleared = clear_flags(conn, "source_block", flag_ids)
 
-    if flag_ids:
-        placeholders = ", ".join(["?"] * len(flag_ids))
-
-        flagged_cleared = conn.execute(
-            f"SELECT count(*) FROM source_block WHERE id IN ({placeholders})",
-            flag_ids,
-        ).fetchone()[0]
-        if flagged_cleared:
-            conn.execute(
-                f"DELETE FROM source_block WHERE id IN ({placeholders})",
-                flag_ids,
-            )
-
-        try:
-            validation_cleared = conn.execute(
-                f"SELECT count(*) FROM validation_block WHERE id IN ({placeholders})",
-                flag_ids,
-            ).fetchone()[0]
-            if validation_cleared:
-                conn.execute(
-                    f"DELETE FROM validation_block WHERE id IN ({placeholders})",
-                    flag_ids,
-                )
-        except Exception:
-            validation_cleared = 0
+    try:
+        validation_cleared = clear_flags(conn, "validation_block", flag_ids)
+    except Exception:
+        validation_cleared = 0
 
     return {
         "updated": updated,
         "flagged_cleared": flagged_cleared,
         "validation_cleared": validation_cleared,
         "not_found": not_found,
+        "not_found_keys": not_found_keys[:5],
     }
+

@@ -13,6 +13,21 @@ from proto_pipe.io.config import config_path_or_override, load_config
 from proto_pipe.checks.registry import CheckRegistry, CheckParamInspector
 
 
+def glob_most_recent(search_dir: str, *patterns: str) -> "Path | None":
+    """Return the most recently modified file matching any glob pattern.
+
+    Used by flagged/validated retry to find the latest export CSV.
+    Returns None if no files match any pattern.
+    """
+    inc = Path(search_dir)
+    candidates: list[Path] = []
+    for pat in patterns:
+        candidates.extend(inc.glob(pat))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
 # ---------------------------------------------------------------------------
 # New helpers for check display
 # ---------------------------------------------------------------------------
