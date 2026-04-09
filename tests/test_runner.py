@@ -56,7 +56,7 @@ class TestRunReport:
         check_registry.register("null_check", check_nulls)
         config = _make_report_config(pipeline_db, "sales", ["null_check"])
 
-        result = run_report(config, check_registry, watermark_store)
+        result = run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
 
         assert result["status"] == "completed"
         assert result["results"]["null_check"].status == "passed"
@@ -69,9 +69,9 @@ class TestRunReport:
         config = _make_report_config(pipeline_db, "sales", ["null_check"])
 
         # First run advances the watermark past all rows
-        run_report(config, check_registry, watermark_store)
+        run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
         # Second run — no new rows
-        result = run_report(config, check_registry, watermark_store)
+        result = run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
 
         assert result["status"] == "skipped"
 
@@ -85,7 +85,7 @@ class TestRunReport:
         check_registry.register("price_range", fn)
         config = _make_report_config(pipeline_db, "sales", ["price_range"])
 
-        result = run_report(config, check_registry, watermark_store)
+        result = run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
 
         assert result["status"] == "completed"
         # The check ran and captured the failure — status must be "failed", not raised
@@ -104,7 +104,7 @@ class TestRunReport:
         # "nonexistent_check" is never registered
         config = _make_report_config(pipeline_db, "sales", ["nonexistent_check"])
 
-        result = run_report(config, check_registry, watermark_store)
+        result = run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
 
         # run_check_safe catches the ValueError and returns status="error" — report
         # completes without raising. The check outcome is "error", not "failed",
@@ -126,7 +126,7 @@ class TestWatermarkAdvancement:
         config = _make_report_config(pipeline_db, "sales", ["null_check"])
 
         assert watermark_store.get("sales_validation") is None
-        run_report(config, check_registry, watermark_store)
+        run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
         assert watermark_store.get("sales_validation") is not None
 
     def test_watermark_reflects_max_timestamp_in_data(
@@ -136,7 +136,7 @@ class TestWatermarkAdvancement:
         check_registry.register("null_check", check_nulls)
         config = _make_report_config(pipeline_db, "sales", ["null_check"])
 
-        run_report(config, check_registry, watermark_store)
+        run_report(config, check_registry, watermark_store, pipeline_db=pipeline_db)
         mark = watermark_store.get("sales_validation")
 
         # Max updated_at in sales_df is 2026-03-01
@@ -163,7 +163,8 @@ class TestRunAllReports:
 
         register_from_config(reports_config, check_registry, report_registry)
         results = run_all_reports(
-            report_registry, check_registry, watermark_store, parallel_reports=False
+            report_registry, check_registry, watermark_store,
+            parallel_reports=False, pipeline_db=pipeline_db,
         )
 
         report_names = {r["report"] for r in results}
@@ -185,16 +186,25 @@ class TestRunAllReports:
         rr1 = ReportRegistry()
         ws1 = WatermarkStore(watermark_db)
         register_from_config(reports_config, cr1, rr1)
-        seq_results = run_all_reports(rr1, cr1, ws1, parallel_reports=False)
+        seq_results = run_all_reports(rr1, cr1, ws1, parallel_reports=False, pipeline_db=pipeline_db)
 
-        # Parallel — needs fresh watermark db so it doesn't skip
+        # Parallel — needs a completely fresh pipeline_db so validation_pass
+        # starts empty. A fresh watermark_db alone is not enough: the new path
+        # deduplicates via validation_pass (in pipeline_db) as well as watermarks.
         from pathlib import Path
+        pipeline_db2 = str(Path(pipeline_db).parent / "pipeline2.db")
+        _seed_table(pipeline_db2, "sales", sales_df)
+        _seed_table(pipeline_db2, "inventory", inventory_df)
+
+        for r in reports_config["reports"]:
+            r["source"]["path"] = pipeline_db2
+
         wdb2 = str(Path(watermark_db).parent / "watermarks2.db")
         cr2 = CheckRegistry()
         rr2 = ReportRegistry()
         ws2 = WatermarkStore(wdb2)
         register_from_config(reports_config, cr2, rr2)
-        par_results = run_all_reports(rr2, cr2, ws2, parallel_reports=True)
+        par_results = run_all_reports(rr2, cr2, ws2, parallel_reports=True, pipeline_db=pipeline_db2)
 
         seq_statuses = {r["report"]: r["status"] for r in seq_results}
         par_statuses = {r["report"]: r["status"] for r in par_results}

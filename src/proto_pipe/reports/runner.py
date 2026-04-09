@@ -32,7 +32,7 @@ import duckdb
 import pandas as pd
 
 from proto_pipe.checks.runner import run_checks
-from proto_pipe.io.data import load_from_duckdb
+from proto_pipe.checks.result import CheckOutcome
 from proto_pipe.io.registry import resolve_filename, write_xlsx_sheet, write_csv
 from proto_pipe.pipelines.watermark import WatermarkStore, _watermark_lock
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckParamInspector
@@ -166,16 +166,6 @@ def _resolve_display_name(check_name: str, check_registry) -> str:
     module responsibility rule. This wrapper avoids a top-level import of
     prompts in reports/runner.py (which would create a circular dependency).
     Lazy import inside the function breaks the cycle.
-    """
-    from proto_pipe.cli.prompts import display_name
-    return display_name(check_name, check_registry)
-
-
-def _resolve_display_name(check_name: str, check_registry) -> str:
-    """Thin wrapper — delegates to prompts.display_name (canonical location).
-
-    display_name is a display concern and lives in cli/prompts.py per the
-    module responsibility rule. Lazy import avoids circular dependency.
     """
     from proto_pipe.cli.prompts import display_name
     return display_name(check_name, check_registry)
@@ -578,56 +568,6 @@ def _update_report_table(
     conn.execute("DROP TABLE IF EXISTS _transform_staging")
 
 
-# Legacy transform apply (kept for when pipeline_db is not provided)
-def _apply_transforms(
-    transform_names: list[str],
-    check_registry: CheckRegistry,
-    df: pd.DataFrame,
-    table_name: str,
-    pipeline_db: str,
-) -> None:
-    """Legacy transform application — full table replacement.
-
-    Used only when pipeline_db is provided but validation_pass tracking is
-    not active (i.e. the report was run without a target_table configured).
-    """
-    working_df = df.copy()
-    failed: list[str] = []
-
-    for name in transform_names:
-        try:
-            result = check_registry.run(name, {"df": working_df})
-            if isinstance(result, pd.DataFrame):
-                overwrite_cols = result.attrs.get("overwrite_cols")
-                if overwrite_cols:
-                    working_df = working_df.copy()
-                    for col in overwrite_cols:
-                        if col in result.columns:
-                            working_df[col] = result[col].values
-                else:
-                    working_df = result
-            elif isinstance(result, pd.Series):
-                col_name = result.name
-                if col_name and col_name in working_df.columns:
-                    working_df = working_df.copy()
-                    working_df[col_name] = result.values
-        except Exception as e:
-            print(f"  [transform-fail] '{_resolve_display_name(name, check_registry)}': {e} — skipped")
-            failed.append(name)
-
-    conn = duckdb.connect(pipeline_db)
-    try:
-        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-        conn.execute(f'CREATE TABLE "{table_name}" AS SELECT * FROM working_df')
-    finally:
-        conn.close()
-
-    print(
-        f"  [transform] {len(transform_names) - len(failed)}/{len(transform_names)} "
-        f"transform(s) applied to '{table_name}'"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Report execution — compute / write split
 #
@@ -770,11 +710,15 @@ def _compute_report(
         #    Otherwise keep conn open and pass a DuckDB context to wrappers —
         #    they extract only the columns they need, per check.
         all_names = report_config.get("resolved_checks", [])
-        needs_pandas = any(
-            check_registry.get_contract(n).needs_dataframe
-            or check_registry.get_contract(n).is_legacy
-            for n in all_names
-        )
+        needs_pandas = False
+        for _n in all_names:
+            try:
+                _c = check_registry.get_contract(_n)
+                if _c.needs_dataframe or _c.is_legacy:
+                    needs_pandas = True
+                    break
+            except ValueError:
+                pass  # unregistered — will produce CheckOutcome(status="error") in execution loop
 
         if needs_pandas:
             # Pandas path: load only pending rows, then close connection.
@@ -802,7 +746,10 @@ def _compute_report(
             # at registration time, read here. No re-inspection of wrapped funcs.
             needed_cols: set[str] = set()
             for n in all_names:
-                contract = check_registry.get_contract(n)
+                try:
+                    contract = check_registry.get_contract(n)
+                except ValueError:
+                    continue  # unregistered — skip series column collection
                 if contract.needs_series:
                     for col in contract.series_columns:
                         if col in all_columns:
@@ -847,12 +794,21 @@ def _compute_report(
 
     try:
         # 8. Run checks — wrappers handle context type transparently.
-        check_names = [n for n in all_names if check_registry.get_kind(n) == "check"]
-        transform_names = [
-            n for n in all_names if check_registry.get_kind(n) == "transform"
-        ]
+        # Unregistered names default to kind="check" so they reach the
+        # execution loop's except clause and produce CheckOutcome(status="error").
+        check_names = []
+        transform_names = []
+        for n in all_names:
+            try:
+                kind = check_registry.get_kind(n)
+            except ValueError:
+                kind = "check"  # unregistered → route to execution loop error handler
+            if kind == "check":
+                check_names.append(n)
+            elif kind == "transform":
+                transform_names.append(n)
 
-        results: dict[str, dict] = {}
+        results: dict[str, CheckOutcome] = {}
         accumulated_flags: list[FlagRecord] = []
 
         for check_name in check_names:
@@ -910,15 +866,14 @@ def _compute_report(
                         f"{failing_count} failure(s) → validation_block"
                     )
 
-                results[check_name] = {
-                    "status": "failed" if failing_count > 0 else "passed",
-                    "result": result if isinstance(result, _CheckResult) else None,
-                    "failed_count": failing_count,
-                }
+                results[check_name] = CheckOutcome(
+                    status="failed" if failing_count > 0 else "passed",
+                    result=result if isinstance(result, _CheckResult) else None,
+                )
 
             except Exception as e:
                 print(f"  [check-fail] '{_resolve_display_name(check_name, check_registry)}': {e}")
-                results[check_name] = {"status": "error", "error": str(e)}
+                results[check_name] = CheckOutcome(status="error", error=str(e))
 
         # 9. Apply transforms — context carries either {"df": ...} or DuckDB
         #    context. _apply_transforms_with_gate resolves df lazily if needed.
@@ -942,7 +897,7 @@ def _compute_report(
             conn.close()
 
     # 10. Compute validation_pass entries in memory.
-    all_passed = all(v.get("status") == "passed" for v in results.values())
+    all_passed = all(v.status == "passed" for v in results.values())
     flagged_pks = {fr.pk_value for fr in accumulated_flags if fr.pk_value}
     pass_entries = []
     for pk_str, row_hash in incoming.items():
@@ -1072,48 +1027,11 @@ def run_report(
 ) -> dict:
     """Execute a single report — compute then write.
 
-    Preserves the original public API. Used directly when pipeline_db is
-    absent (legacy watermark-only path) or when a single report is run
-    outside of run_all_reports.
+    pipeline_db is required. Used directly when a single report is run
+    outside of run_all_reports (e.g. from tests or vp validate --table).
     """
     report_name = report_config["name"]
-    source_config = report_config["source"]
 
-    # ── No pipeline_db — legacy watermark-only path ───────────────────────
-    if not pipeline_db:
-        last_run_at = watermark_store.get(report_name)
-        try:
-            df = load_from_duckdb(source_config, last_run_at)
-        except Exception as e:
-            return {"report": report_name, "status": "error", "error": str(e)}
-        if df.empty:
-            return {"report": report_name, "status": "skipped"}
-
-        options = report_config.get("options", {})
-        parallel_checks = options.get("parallel", False)
-        all_names = report_config.get("resolved_checks", [])
-        check_names = []
-        for n in all_names:
-            try:
-                if check_registry.get_kind(n) == "check":
-                    check_names.append(n)
-            except ValueError:
-                check_names.append(n)
-        context = {"df": df}
-        results = run_checks(check_names, check_registry, context, parallel=parallel_checks)
-
-        all_passed = all(v.status == "passed" for v in results.values())
-        if all_passed:
-            ts_col = source_config.get("timestamp_col") or "_ingested_at"
-            if ts_col and ts_col in df.columns:
-                max_ts = df[ts_col].max()
-                if not isinstance(max_ts, datetime):
-                    max_ts = datetime.fromisoformat(str(max_ts)).replace(tzinfo=timezone.utc)
-                watermark_store.set(report_name, max_ts)
-
-        return {"report": report_name, "status": "completed", "results": results}
-
-    # ── Full path: compute then write ─────────────────────────────────────
     # Bootstrap pipeline tables before _compute_report reads validation_pass.
     # run_report is callable directly (e.g. from tests, vp validate --table)
     # without going through run_all_reports, so it cannot rely on the
@@ -1135,20 +1053,6 @@ def run_report(
         return _write_report(conn, bundle, watermark_store)
     finally:
         conn.close()
-
-
-def _advance_watermark(
-    report_name: str,
-    timestamp_col: str,
-    df: pd.DataFrame,
-    watermark_store: WatermarkStore,
-) -> None:
-    """Advance the report watermark to the latest timestamp in the loaded data."""
-    ts_series = pd.to_datetime(df[timestamp_col], utc=True)
-    last_processed_ts = ts_series.max().to_pydatetime()
-    with _watermark_lock:
-        watermark_store.set(report_name, last_processed_ts)
-
 
 # ---------------------------------------------------------------------------
 # Deliverable runner — unchanged

@@ -53,7 +53,7 @@ class TestCleanMorningRun:
         rr = ReportRegistry()
         ws = WatermarkStore(watermark_db)
         register_from_config(reports_config, cr, rr)
-        results = run_all_reports(rr, cr, ws, parallel_reports=False)
+        results = run_all_reports(rr, cr, ws, parallel_reports=False, pipeline_db=pipeline_db)
 
         for r in results:
             assert r["status"] == "completed"
@@ -93,7 +93,7 @@ class TestCleanMorningRun:
         rr = ReportRegistry()
         ws = WatermarkStore(watermark_db)
         register_from_config(reports_config, cr, rr)
-        run_all_reports(rr, cr, ws, parallel_reports=False)
+        run_all_reports(rr, cr, ws, parallel_reports=False, pipeline_db=pipeline_db)
 
         conn = duckdb.connect(pipeline_db)
         dfs = {
@@ -136,14 +136,14 @@ class TestWatermarkFiltering:
         rr = ReportRegistry()
         ws = WatermarkStore(watermark_db)
         register_from_config(reports_config, cr, rr)
-        run_all_reports(rr, cr, ws, parallel_reports=False)
+        run_all_reports(rr, cr, ws, parallel_reports=False, pipeline_db=pipeline_db)
 
         # Debug
         mark = ws.get("daily_sales_validation")
         print(f"Watermark after first run: {mark}")
 
         # Second run — same data, watermark should skip all rows
-        results = run_all_reports(rr, cr, ws, parallel_reports=False)
+        results = run_all_reports(rr, cr, ws, parallel_reports=False, pipeline_db=pipeline_db)
         sales_result = next(r for r in results if r["report"] == "daily_sales_validation")
         assert sales_result["status"] == "skipped"
 
@@ -310,7 +310,7 @@ class TestCustomCheckInPipeline:
         rr = ReportRegistry()
         ws = WatermarkStore(watermark_db)
         register_from_config(reports_config, cr, rr)
-        results = run_all_reports(rr, cr, ws, parallel_reports=False)
+        results = run_all_reports(rr, cr, ws, parallel_reports=False, pipeline_db=pipeline_db)
 
         sales_result = next(r for r in results if r["report"] == "daily_sales_validation")
         # Update assertion — result is now CheckResult not dict:

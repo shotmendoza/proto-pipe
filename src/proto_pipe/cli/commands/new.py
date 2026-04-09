@@ -19,7 +19,8 @@ from proto_pipe.cli.scaffold import (
     filter_unconfigured,
     _group_files_by_pattern,
 )
-from proto_pipe.io.config import load_config, write_config, load_settings
+from proto_pipe.io.config import load_config, write_config, load_settings, config_path_or_override
+from proto_pipe.cli.prompts import SourceConfigPrompter
 from proto_pipe.constants import DEFAULT_SETTINGS_PATH
 
 
@@ -53,8 +54,7 @@ def new_source(sources_config, incoming_dir):
     Example:
       vp new source
     """
-    from proto_pipe.io.config import config_path_or_override, SourceConfig
-    from proto_pipe.cli.prompts import SourceConfigPrompter
+    from proto_pipe.io.config import SourceConfig
     from proto_pipe.io.db import get_registry_hints, write_registry_types
 
     src_cfg = config_path_or_override("sources_config", sources_config)

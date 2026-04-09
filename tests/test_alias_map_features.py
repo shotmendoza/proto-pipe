@@ -1,7 +1,6 @@
 """
 Tests for:
 - alias_map expansion (test_alias_map_*)
-- transform checks kind='transform' (test_transform_*)
 - reset_report (test_reset_*)
 - load_macros / vp new-macro (test_macro_*)
 """
@@ -25,7 +24,6 @@ from proto_pipe.io.registry import (
     register_from_config,
 )
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckContract, validate_check
-from proto_pipe.reports.runner import _apply_transforms
 
 
 # ===========================================================================
@@ -488,127 +486,6 @@ def test_register_from_config_alias_map_stored_in_report():
     assert report["alias_map"] == alias_map
 
 
-# ===========================================================================
-# Transform checks — _apply_transforms
-# ===========================================================================
-
-def test_apply_transforms_series_updates_column(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    df = pd.DataFrame({"id": [1, 2, 3], "status": ["Issuance", "Renewal", "Issuance"]})
-    _setup_table(db_path, "sales", df)
-
-    reg = CheckRegistry()
-
-    def normalize(context: dict) -> pd.Series:
-        s = context["df"]["status"].replace({"Issuance": "Reinstatement"})
-        s.name = "status"
-        return s
-
-    reg.register("normalize", normalize, kind="transform")
-    _apply_transforms(["normalize"], reg, df, "sales", db_path)
-
-    result = _read_table(db_path, "sales")
-    assert list(result["status"]) == ["Reinstatement", "Renewal", "Reinstatement"]
-
-
-def test_apply_transforms_dataframe_replaces_table(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
-    _setup_table(db_path, "sales", df)
-
-    reg = CheckRegistry()
-
-    def double_val(context: dict) -> pd.DataFrame:
-        d = context["df"].copy()
-        d["val"] = d["val"] * 2
-        return d
-
-    reg.register("double_val", double_val, kind="transform")
-    _apply_transforms(["double_val"], reg, df, "sales", db_path)
-
-    result = _read_table(db_path, "sales")
-    assert list(result["val"]) == [20, 40]
-
-
-def test_apply_transforms_failed_transform_leaves_table_unchanged(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
-    _setup_table(db_path, "sales", df)
-
-    reg = CheckRegistry()
-
-    def bad_transform(context: dict) -> pd.Series:
-        raise RuntimeError("deliberate failure")
-
-    reg.register("bad_transform", bad_transform, kind="transform")
-    _apply_transforms(["bad_transform"], reg, df, "sales", db_path)
-
-    result = _read_table(db_path, "sales")
-    assert list(result["val"]) == [10, 20]
-
-
-def test_apply_transforms_successful_before_failed_still_applies(tmp_path):
-    """Successful transforms before a failing one should still be applied."""
-    db_path = str(tmp_path / "test.db")
-    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
-    _setup_table(db_path, "sales", df)
-
-    reg = CheckRegistry()
-
-    def good(context: dict) -> pd.Series:
-        s = context["df"]["val"] * 2
-        s.name = "val"
-        return s
-
-    def bad(context: dict) -> pd.Series:
-        raise RuntimeError("deliberate failure")
-
-    reg.register("good", good, kind="transform")
-    reg.register("bad", bad, kind="transform")
-
-    _apply_transforms(["good", "bad"], reg, df, "sales", db_path)
-
-    result = _read_table(db_path, "sales")
-    assert list(result["val"]) == [20, 40]
-
-
-def test_apply_transforms_series_unknown_column_skipped(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
-    _setup_table(db_path, "sales", df)
-
-    reg = CheckRegistry()
-
-    def bad_col(context: dict) -> pd.Series:
-        return pd.Series([99, 99], name="nonexistent_col")
-
-    reg.register("bad_col", bad_col, kind="transform")
-    _apply_transforms(["bad_col"], reg, df, "sales", db_path)
-
-    result = _read_table(db_path, "sales")
-    assert list(result["val"]) == [10, 20]
-
-
-def test_apply_transforms_order_preserved(tmp_path):
-    db_path = str(tmp_path / "test.db")
-    df = pd.DataFrame({"id": [1], "val": [1]})
-    _setup_table(db_path, "t", df)
-
-    reg = CheckRegistry()
-    call_order = []
-
-    for name in ["t1", "t2", "t3"]:
-        def make_t(n):
-            def t(context: dict) -> pd.DataFrame:
-                call_order.append(n)
-                return context["df"]
-            return t
-        reg.register(name, make_t(name), kind="transform")
-
-    _apply_transforms(["t1", "t2", "t3"], reg, df, "t", db_path)
-    assert call_order == ["t1", "t2", "t3"]
-
-
 def test_run_report_transforms_run_after_checks(tmp_path):
     """Checks must complete before transforms are applied."""
     from proto_pipe.reports.runner import run_report
@@ -969,37 +846,6 @@ def test_checkparam_inspector_dataframe_params():
     )
     assert "df" not in inspector.column_params(), (
         "DataFrame param must not appear in column_params"
-    )
-
-
-def test_source_table_never_modified_by_report_layer(tmp_path):
-    """Transforms write to the report table, never to the source table.
-
-    Spec guarantee:
-      'The source table is never modified by this layer.'
-    """
-    db_path = str(tmp_path / "pipeline.db")
-    df = pd.DataFrame({
-        "id": ["R1", "R2"],
-        "status": ["Issuance", "Renewal"],
-        "_ingested_at": pd.Timestamp("2026-01-01", tz="UTC"),
-    })
-    _setup_table(db_path, "sales", df)
-
-    reg = CheckRegistry()
-
-    def normalize(context: dict) -> pd.Series:
-        s = context["df"]["status"].replace({"Issuance": "Reinstatement"})
-        s.name = "status"
-        return s
-
-    reg.register("normalize", normalize, kind="transform")
-    _apply_transforms(["normalize"], reg, df, "sales_report", db_path)
-
-    # source table 'sales' must be unchanged
-    source_df = _read_table(db_path, "sales")
-    assert list(source_df["status"]) == ["Issuance", "Renewal"], (
-        "Source table must never be modified by the report/transform layer"
     )
 
 
