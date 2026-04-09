@@ -160,6 +160,30 @@ def _build_execution_layers(reports: list[dict]) -> list[list[dict]]:
 
 
 # ---------------------------------------------------------------------------
+# Display name resolution
+# ---------------------------------------------------------------------------
+
+def _display_name(check_name: str, check_registry: CheckRegistry) -> str:
+    """Return a human-readable name for a check UUID.
+
+    Unwraps the registered function to its original __name__. Falls back
+    to the UUID if the name cannot be resolved — always safe to call.
+
+    Used in print statements so users see 'price_check' not '2ebc92ed-...'
+    """
+    import inspect as _inspect
+    try:
+        func = check_registry.get(check_name)
+        if func is None:
+            return check_name
+        unwrapped = _inspect.unwrap(func)
+        name = getattr(unwrapped, "__name__", None)
+        return name if name and not name.startswith("<") else check_name
+    except Exception:
+        return check_name
+
+
+# ---------------------------------------------------------------------------
 # Transform application — with TRY_CAST gate
 # ---------------------------------------------------------------------------
 
@@ -744,9 +768,37 @@ def _compute_report(
             context = {"df": pending_df}
         else:
             # DuckDB-native path: keep conn open during check execution.
-            # Wrappers extract only the column(s) they need per check via
-            # targeted SELECT ... WHERE pk IN (...) queries.
+            # Pre-fetch all columns needed by Series checks in one query per
+            # report — replaces N individual SELECT queries (one per check param)
+            # with a single bulk fetch. alias_map ties params to columns in
+            # this report's source table only — no cross-table bleed.
             _keep_conn_for_checks = True
+
+            # Collect all Series param column names from contracts — stored once
+            # at registration time, read here. No re-inspection of wrapped funcs.
+            needed_cols: set[str] = set()
+            for n in all_names:
+                contract = check_registry.get_contract(n)
+                if contract.needs_series:
+                    for col in contract.series_columns:
+                        if col in all_columns:
+                            needed_cols.add(col)
+
+            # Single bulk fetch — all needed columns + pk for pending rows
+            col_cache: dict[str, "pd.Series"] = {}
+            if needed_cols and pk_col and pending_pks:
+                fetch_cols = list(needed_cols)
+                col_list = ", ".join(f'"{c}"' for c in fetch_cols)
+                placeholders = ", ".join("?" * len(pending_pks))
+                cache_df = conn.execute(
+                    f'SELECT {col_list} FROM "{source_table}"'
+                    f' WHERE CAST("{pk_col}" AS VARCHAR) IN ({placeholders})',
+                    list(pending_pks),
+                ).df()
+                for col in fetch_cols:
+                    if col in cache_df.columns:
+                        col_cache[col] = cache_df[col]
+
             pending_df = None
             context = {
                 "conn": conn,
@@ -754,6 +806,7 @@ def _compute_report(
                 "pending_pks": pending_pks,
                 "pk_col": pk_col,
                 "all_columns": all_columns,
+                "col_cache": col_cache,
             }
 
     finally:
@@ -829,7 +882,7 @@ def _compute_report(
                                     reason=f"Check '{check_name}' failed",
                                 ))
                     print(
-                        f"  [check] '{check_name}' — "
+                        f"  [check] '{_display_name(check_name, check_registry)}' — "
                         f"{failing_count} failure(s) → validation_block"
                     )
 
@@ -840,7 +893,7 @@ def _compute_report(
                 }
 
             except Exception as e:
-                print(f"  [check-fail] '{check_name}': {e}")
+                print(f"  [check-fail] '{_display_name(check_name, check_registry)}': {e}")
                 results[check_name] = {"status": "error", "error": str(e)}
 
         # 9. Apply transforms — context carries either {"df": ...} or DuckDB
@@ -916,7 +969,7 @@ def _write_report(
       - Watermark (advanced only when all_passed)
     """
     from proto_pipe.pipelines.flagging import write_validation_flags
-    from proto_pipe.io.db import upsert_validation_pass, table_exists
+    from proto_pipe.io.db import bulk_upsert_validation_pass, table_exists
 
     if bundle.status in ("skipped", "error"):
         return {
@@ -960,11 +1013,12 @@ def _write_report(
     if bundle.flag_records:
         write_validation_flags(conn, bundle.flag_records)
 
-    # Write validation_pass entries
-    for entry in bundle.pass_entries:
-        upsert_validation_pass(
-            conn, source_table, bundle.report_name,
-            entry["pk_value"], entry["row_hash"], entry["check_set_hash"], entry["status"],
+    # Bulk upsert validation_pass entries — one operation replaces N individual
+    # upserts. On first run with 1M records this is the dominant cost reduction:
+    # 1M INSERT ... ON CONFLICT statements → 1 DataFrame scan + INSERT.
+    if bundle.pass_entries:
+        bulk_upsert_validation_pass(
+            conn, source_table, bundle.report_name, bundle.pass_entries
         )
 
     # Advance watermark via DuckDB MAX — no pandas source_df needed.

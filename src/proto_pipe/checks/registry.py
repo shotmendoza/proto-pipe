@@ -5,7 +5,7 @@ import hashlib
 import inspect
 import uuid
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from typing import Callable
@@ -294,6 +294,10 @@ class CheckContract:
     needs_series: bool = False
     is_scalar: bool = False
     is_legacy: bool = False
+    series_columns: list = field(default_factory=list)
+    # Column names baked into Series params at registration time.
+    # Populated on the Series path so _compute_report can pre-fetch
+    # all needed columns in one bulk query — never re-derived at call time.
 
 
 @dataclass
@@ -424,6 +428,7 @@ def _wrap_series_input(
             table = context["table"]
             pending_pks = context["pending_pks"]
             pk_col = context["pk_col"]
+            col_cache = context.get("col_cache", {})
 
             call_kwargs = dict(baked_keywords)
             for param_name in series_params:
@@ -431,23 +436,33 @@ def _wrap_series_input(
                 if col_name is None:
                     raise ValueError(
                         f"Series param '{param_name}' has no column name baked in partial. "
-                        f"Ensure alias_map is configured for this function in reports_config.yaml."
+                        f"The alias_map for this check is missing an entry for '{param_name}'. "
+                        f"Run 'vp edit report' to add the mapping, or check reports_config.yaml."
                     )
-                if pk_col and pending_pks:
+                # Read from pre-fetched cache if available — avoids a query per check
+                if col_name in col_cache:
+                    call_kwargs[param_name] = col_cache[col_name]
+                elif pk_col and pending_pks:
                     placeholders = ", ".join("?" * len(pending_pks))
                     col_df = conn.execute(
                         f'SELECT "{col_name}" FROM "{table}"'
                         f' WHERE CAST("{pk_col}" AS VARCHAR) IN ({placeholders})',
                         list(pending_pks),
                     ).df()
+                    if col_name not in col_df.columns:
+                        raise ValueError(
+                            f"Series param '{param_name}' maps to column '{col_name}' "
+                            f"which is not in the table."
+                        )
+                    call_kwargs[param_name] = col_df[col_name]
                 else:
                     col_df = conn.execute(f'SELECT "{col_name}" FROM "{table}"').df()
-                if col_name not in col_df.columns:
-                    raise ValueError(
-                        f"Series param '{param_name}' maps to column '{col_name}' "
-                        f"which is not in the table."
-                    )
-                call_kwargs[param_name] = col_df[col_name]
+                    if col_name not in col_df.columns:
+                        raise ValueError(
+                            f"Series param '{param_name}' maps to column '{col_name}' "
+                            f"which is not in the table."
+                        )
+                    call_kwargs[param_name] = col_df[col_name]
             return inner(**call_kwargs)
 
         # ── Pandas path ────────────────────────────────────────────────────
@@ -461,7 +476,8 @@ def _wrap_series_input(
             if col_name is None:
                 raise ValueError(
                     f"Series param '{param_name}' has no column name baked in partial. "
-                    f"Ensure alias_map is configured for this function in reports_config.yaml."
+                    f"The alias_map for this check is missing an entry for '{param_name}'. "
+                    f"Run 'vp edit report' to add the mapping, or check reports_config.yaml."
                 )
             if col_name not in clean_df.columns:
                 raise ValueError(
@@ -679,7 +695,20 @@ def validate_check(
 
         series_wrapped = _wrap_series_input(func, series_param_names)
         wrapped_func = wrap_series_check(series_wrapped) if kind == "check" else series_wrapped
-        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, needs_series=True))
+
+        # Extract baked column names from the partial chain — stored once at
+        # registration time so _compute_report can pre-fetch all needed columns
+        # in a single bulk query without re-inspecting the wrapped function.
+        baked: dict = {}
+        inner = func
+        while isinstance(inner, functools.partial):
+            baked.update(inner.keywords)
+            inner = inner.func
+        col_names = [v for p, v in baked.items() if p in series_param_names and isinstance(v, str)]
+
+        return CheckAudit(CheckContract(
+            func=wrapped_func, kind=kind, needs_series=True, series_columns=col_names
+        ))
 
     # ── Scalar column-backed path ─────────────────────────────────────────────
     # Functions with str/int/float/unannotated params, no pd.DataFrame,

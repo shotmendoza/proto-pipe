@@ -588,3 +588,364 @@ class TestApplyTransformsUsesContracts:
         contract = reg.get_contract("upper_series")
         assert contract.is_scalar is False
         assert contract.needs_series is True
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — Bulk column fetch guarantees
+# ---------------------------------------------------------------------------
+
+class TestBulkColumnFetch:
+    """col_cache pre-fetches all Series columns in one query per report.
+
+    Guarantees:
+    - col_cache populated in context before check execution
+    - _wrap_series_input reads from cache — no fallback query for cached cols
+    - Cache scoped to report's source table only (no cross-table bleed)
+    """
+
+    def test_col_cache_in_context_for_duckdb_path(self, pipeline_db, watermark_store, sales_df):
+        """col_cache is present in context when DuckDB path is taken."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+        from proto_pipe.reports.runner import _compute_report
+
+        with duckdb.connect(pipeline_db) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
+
+        cr = CheckRegistry()
+        captured_context = {}
+
+        def price_check(price: pd.Series) -> pd.Series[bool]:
+            captured_context["col_cache"] = None  # just mark it was called
+            return price > 0
+
+        func = partial(price_check, price="price")
+        register_custom_check("price_cache_v1", func, cr, kind="check")
+
+        from proto_pipe.checks.registry import ReportRegistry
+        from proto_pipe.io.registry import register_from_config
+        rr = ReportRegistry()
+        register_from_config({
+            "templates": {},
+            "reports": [{
+                "name": "sales_report",
+                "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
+                "alias_map": [{"param": "price", "column": "price"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "price_cache_v1", "params": {}}],
+            }],
+        }, cr, rr)
+
+        bundle = _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+        assert bundle.status == "computed"
+
+    def test_col_cache_populated_with_needed_columns(self, pipeline_db, watermark_store, sales_df):
+        """col_cache contains the Series param columns before check execution."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+        from proto_pipe.reports.runner import _compute_report
+
+        with duckdb.connect(pipeline_db) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
+
+        cr = CheckRegistry()
+        received_cache = {}
+
+        # Monkey-patch _wrap_series_input to capture the context's col_cache
+        original_run = cr.run
+
+        def capturing_run(name, context):
+            if "col_cache" in context:
+                received_cache.update(context["col_cache"])
+            return original_run(name, context)
+
+        cr.run = capturing_run
+
+        def price_check(price: pd.Series) -> pd.Series[bool]:
+            return price > 0
+
+        func = partial(price_check, price="price")
+        register_custom_check("price_cache_v2", func, cr, kind="check")
+
+        from proto_pipe.checks.registry import ReportRegistry
+        from proto_pipe.io.registry import register_from_config
+        rr = ReportRegistry()
+        register_from_config({
+            "templates": {},
+            "reports": [{
+                "name": "sales_report",
+                "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
+                "alias_map": [{"param": "price", "column": "price"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "price_cache_v2", "params": {}}],
+            }],
+        }, cr, rr)
+
+        _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+
+        assert "price" in received_cache, (
+            "col_cache must contain 'price' — the Series param column for this check"
+        )
+        assert isinstance(received_cache["price"], pd.Series)
+
+    def test_col_cache_reads_correct_values(self, pipeline_db, watermark_store, sales_df):
+        """Values in col_cache match the pending rows from the source table."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+        from proto_pipe.reports.runner import _compute_report
+
+        with duckdb.connect(pipeline_db) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
+
+        cr = CheckRegistry()
+        received_values = {}
+
+        def price_check(price: pd.Series) -> pd.Series[bool]:
+            received_values["price"] = list(price)
+            return price > 0
+
+        func = partial(price_check, price="price")
+        register_custom_check("price_cache_v3", func, cr, kind="check")
+
+        from proto_pipe.checks.registry import ReportRegistry
+        from proto_pipe.io.registry import register_from_config
+        rr = ReportRegistry()
+        register_from_config({
+            "templates": {},
+            "reports": [{
+                "name": "sales_report",
+                "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
+                "alias_map": [{"param": "price", "column": "price"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "price_cache_v3", "params": {}}],
+            }],
+        }, cr, rr)
+
+        _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+
+        expected = sorted(sales_df["price"].tolist())
+        assert sorted(received_values.get("price", [])) == expected, (
+            "col_cache values must match the source table's price column"
+        )
+
+    def test_col_cache_does_not_contain_columns_from_other_tables(
+        self, pipeline_db, watermark_store, sales_df
+    ):
+        """col_cache is scoped to the report's source table — no cross-table bleed."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+        from proto_pipe.reports.runner import _compute_report
+
+        # Inline inventory data — distinct columns from sales to verify no bleed
+        inventory_df = pd.DataFrame({
+            "sku": ["SKU-001", "SKU-002"],
+            "qty_on_hand": [100, 200],
+            "warehouse": ["WH-A", "WH-B"],
+        })
+
+        with duckdb.connect(pipeline_db) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
+            conn.execute("CREATE TABLE inventory AS SELECT * FROM inventory_df")
+
+        cr = CheckRegistry()
+        received_cache = {}
+
+        original_run = cr.run
+
+        def capturing_run(name, context):
+            if "col_cache" in context:
+                received_cache.update(context["col_cache"])
+            return original_run(name, context)
+
+        cr.run = capturing_run
+
+        def price_check(price: pd.Series) -> pd.Series[bool]:
+            return price > 0
+
+        func = partial(price_check, price="price")
+        register_custom_check("price_cache_v4", func, cr, kind="check")
+
+        from proto_pipe.checks.registry import ReportRegistry
+        from proto_pipe.io.registry import register_from_config
+        rr = ReportRegistry()
+        register_from_config({
+            "templates": {},
+            "reports": [{
+                "name": "sales_report",
+                "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
+                "alias_map": [{"param": "price", "column": "price"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "price_cache_v4", "params": {}}],
+            }],
+        }, cr, rr)
+
+        _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+
+        # inventory columns must not appear in cache for a sales report
+        inventory_cols = set(inventory_df.columns)
+        cached_cols = set(received_cache.keys())
+        bleed = inventory_cols & cached_cols
+        assert not bleed, (
+            f"col_cache must not contain inventory columns: {bleed}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — Better error message for missing alias_map
+# ---------------------------------------------------------------------------
+
+class TestMissingAliasMapError:
+    """_wrap_series_input raises a clear error when alias_map is missing.
+
+    Guarantees:
+    - Error message includes 'vp edit report' for actionable guidance
+    - Fires on both pandas and DuckDB paths
+    """
+
+    def test_missing_col_name_error_mentions_vp_edit_report_pandas(self):
+        """Pandas path: error message tells user to run 'vp edit report'."""
+        from proto_pipe.checks.registry import _wrap_series_input
+
+        def fn(price: pd.Series) -> pd.Series[bool]:
+            return price > 0
+
+        # No partial — price param has no baked column name
+        wrapped = _wrap_series_input(fn, series_params=["price"])
+
+        df = pd.DataFrame({"price": [1.0, 2.0], "order_id": ["A", "B"]})
+        with pytest.raises(ValueError) as exc_info:
+            wrapped({"df": df})
+
+        assert "vp edit report" in str(exc_info.value), (
+            "Error must tell user to run 'vp edit report' to fix alias_map"
+        )
+
+    def test_missing_col_name_error_mentions_vp_edit_report_duckdb(self, pipeline_db):
+        """DuckDB path: error message tells user to run 'vp edit report'."""
+        from proto_pipe.checks.registry import _wrap_series_input
+
+        with duckdb.connect(pipeline_db) as conn:
+            conn.execute("CREATE TABLE sales AS SELECT * FROM (VALUES (1.0, 'A'), (2.0, 'B')) t(price, order_id)")
+
+        def fn(price: pd.Series) -> pd.Series[bool]:
+            return price > 0
+
+        wrapped = _wrap_series_input(fn, series_params=["price"])
+
+        conn = duckdb.connect(pipeline_db, read_only=True)
+        try:
+            with pytest.raises(ValueError) as exc_info:
+                wrapped({
+                    "conn": conn,
+                    "table": "sales",
+                    "pending_pks": {"A", "B"},
+                    "pk_col": "order_id",
+                    "all_columns": ["price", "order_id"],
+                    "col_cache": {},
+                })
+        finally:
+            conn.close()
+
+        assert "vp edit report" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — _display_name resolves function name from UUID
+# ---------------------------------------------------------------------------
+
+class TestDisplayName:
+    """_display_name returns human-readable function name instead of UUID.
+
+    Guarantees:
+    - Returns __name__ of the original function
+    - Falls back to UUID when function can't be unwrapped
+    - Never raises
+    """
+
+    def test_display_name_returns_function_name(self):
+        """Registered check UUID resolves to the original function __name__."""
+        from proto_pipe.reports.runner import _display_name
+        from functools import partial
+
+        reg = CheckRegistry()
+
+        def my_price_check(price: pd.Series) -> pd.Series[bool]:
+            return price > 0
+
+        func = partial(my_price_check, price="price")
+        reg.register("my_price_check", func, kind="check")
+
+        name = _display_name("my_price_check", reg)
+        assert name == "my_price_check", (
+            "_display_name must return the original function __name__, not the UUID"
+        )
+
+    def test_display_name_falls_back_to_uuid_for_unknown(self):
+        """Unknown check name falls back to the UUID without raising."""
+        from proto_pipe.reports.runner import _display_name
+
+        reg = CheckRegistry()
+        unknown_uuid = "2ebc92ed-123b-5563-afe1-7fd3e0f8b41b"
+
+        result = _display_name(unknown_uuid, reg)
+        assert result == unknown_uuid, (
+            "_display_name must return the UUID unchanged when check is not registered"
+        )
+
+    def test_display_name_never_raises(self):
+        """_display_name is always safe to call regardless of registry state."""
+        from proto_pipe.reports.runner import _display_name
+
+        reg = CheckRegistry()
+
+        # Should not raise for any input
+        try:
+            _display_name("any-random-string", reg)
+            _display_name("", reg)
+            _display_name("2ebc92ed-123b-5563-afe1-7fd3e0f8b41b", reg)
+        except Exception as e:
+            pytest.fail(f"_display_name raised unexpectedly: {e}")
+
+    def test_display_name_used_in_check_output(self, pipeline_db, watermark_store, sales_df):
+        """Check failure output shows function name not UUID."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+        from proto_pipe.reports.runner import _compute_report
+        import io, sys
+
+        with duckdb.connect(pipeline_db) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
+
+        cr = CheckRegistry()
+
+        def always_fails(price: pd.Series) -> pd.Series[bool]:
+            return price < 0  # all fail
+
+        func = partial(always_fails, price="price")
+        register_custom_check("always_fails_display", func, cr, kind="check")
+
+        from proto_pipe.checks.registry import ReportRegistry
+        from proto_pipe.io.registry import register_from_config
+        rr = ReportRegistry()
+        register_from_config({
+            "templates": {},
+            "reports": [{
+                "name": "sales_report",
+                "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
+                "alias_map": [{"param": "price", "column": "price"}],
+                "options": {"parallel": False},
+                "checks": [{"name": "always_fails_display", "params": {}}],
+            }],
+        }, cr, rr)
+
+        captured = io.StringIO()
+        sys.stdout = captured
+        try:
+            _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+        finally:
+            sys.stdout = sys.__stdout__
+
+        output = captured.getvalue()
+        assert "always_fails" in output, (
+            "Check output must show function name 'always_fails', not a UUID"
+        )

@@ -568,6 +568,53 @@ def upsert_validation_pass(
           datetime.now(timezone.utc)])
 
 
+def bulk_upsert_validation_pass(
+    conn: duckdb.DuckDBPyConnection,
+    table_name: str,
+    report_name: str,
+    entries: list[dict],
+) -> None:
+    """Bulk upsert validation_pass entries — replaces N individual upserts with one operation.
+
+    Follows the same pattern as bulk flag writes in ingest: accumulate entries
+    in memory during compute, write once in the sequential write phase.
+
+    entries: list of {pk_value, row_hash, check_set_hash, status}
+    table_name and report_name are the same for all entries in a report run.
+
+    For 1M records this replaces 1M individual INSERT ... ON CONFLICT statements
+    with a single DataFrame scan + INSERT, matching DuckDB's native bulk throughput.
+    """
+    if not entries:
+        return
+
+    import pandas as pd
+
+    now = datetime.now(timezone.utc)
+    entries_df = pd.DataFrame([{
+        "pk_value":       e["pk_value"],
+        "table_name":     table_name,
+        "report_name":    report_name,
+        "row_hash":       e["row_hash"],
+        "check_set_hash": e["check_set_hash"],
+        "status":         e["status"],
+        "validated_at":   now,
+    } for e in entries])
+
+    conn.execute("""
+        INSERT INTO validation_pass
+            (pk_value, table_name, report_name, row_hash, check_set_hash, status, validated_at)
+        SELECT pk_value, table_name, report_name, row_hash, check_set_hash, status, validated_at
+        FROM entries_df
+        ON CONFLICT (pk_value, table_name, report_name)
+        DO UPDATE SET
+            row_hash       = excluded.row_hash,
+            check_set_hash = excluded.check_set_hash,
+            status         = excluded.status,
+            validated_at   = excluded.validated_at
+    """)
+
+
 def get_validation_pass_hashes(
     conn: duckdb.DuckDBPyConnection,
     table_name: str,
