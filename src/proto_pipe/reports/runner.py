@@ -258,7 +258,9 @@ def _apply_transforms_with_gate(
                 df = _get_df()
                 try:
                     df = _apply_scalar_transform_duckdb(
-                        name, func, df, registry_types, alias_map=alias_map,
+                        name, func, df, registry_types,
+                        alias_map=alias_map,
+                        check_name=_display_name(name, check_registry),
                     )
                     _df = df  # keep _df in sync after mutation
                     continue
@@ -387,11 +389,16 @@ def _annotation_to_duckdb(ann) -> type:
 def _resolve_output_col(
     alias_map: list[dict],
     col_backed_params: dict[str, str],
+    check_name: str | None = None,
 ) -> str | None:
     """Resolve the _output write-back column for a given expanded check run.
 
     Matches the baked-in column values (col_backed_params) against the alias_map
     to determine the run index, then returns the corresponding _output column.
+
+    check_name: base function name (from _display_name) used to scope _output
+    entries to this specific transform. Without scoping, all transforms' _output
+    entries are merged and the wrong column may be selected.
 
     col_backed_params: {param_name: column_name} for all column-backed params
     in this registered expanded check (derived from the partial's keywords).
@@ -399,7 +406,14 @@ def _resolve_output_col(
     Returns None when no _output entries exist in alias_map (legacy transforms
     that write back to the input column fall through to the caller's fallback).
     """
-    output_cols = [e["column"] for e in alias_map if e["param"] == "_output"]
+    # Filter _output entries by check_name if present — scopes to this transform.
+    # Falls back to all _output entries for legacy alias_maps without "check" field.
+    output_entries = [
+        e for e in alias_map
+        if e["param"] == "_output"
+        and (check_name is None or e.get("check") == check_name or "check" not in e)
+    ]
+    output_cols = [e["column"] for e in output_entries]
     if not output_cols:
         return None
 
@@ -423,6 +437,7 @@ def _apply_scalar_transform_duckdb(
     df: pd.DataFrame,
     registry_types: dict[str, str],
     alias_map: list[dict] | None = None,
+    check_name: str | None = None,
 ) -> pd.DataFrame:
     """Apply a scalar transform via DuckDB Python UDF. Returns modified DataFrame.
 
@@ -461,7 +476,7 @@ def _apply_scalar_transform_duckdb(
             f"and no first-param column to operate on."
         )
 
-    output_col = _resolve_output_col(alias_map or [], col_backed) if alias_map else None
+    output_col = _resolve_output_col(alias_map or [], col_backed, check_name=check_name) if alias_map else None
     if output_col is None:
         first_col_param = next((p for p in all_params if p in col_backed), None)
         if first_col_param is None:

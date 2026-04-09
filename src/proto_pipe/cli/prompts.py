@@ -1165,7 +1165,7 @@ class ReportConfigPrompter:
                     ).ask()
                     if output_val is None:
                         return [], [], True
-                    accumulated_alias.append({"param": "_output", "column": output_val})
+                    accumulated_alias.append({"param": "_output", "column": output_val, "check": check_name})
                 else:
                     # Step 1: which param's column list should the output mirror?
                     # Only multi-column params (>1 entry) are offered as choices —
@@ -1197,7 +1197,7 @@ class ReportConfigPrompter:
                         # causes Enter-key bleed-through (the Enter that closed step 1
                         # immediately submits step 2's pre-checked items).
                         for col in multi_col_params[mirror_param]:
-                            accumulated_alias.append({"param": "_output", "column": col})
+                            accumulated_alias.append({"param": "_output", "column": col, "check": check_name})
                     else:
                         # Manual → user picks output columns freely from full column list.
                         output_choices = _make_col_choices(table_cols, registry_types)
@@ -1208,7 +1208,7 @@ class ReportConfigPrompter:
                         if output_vals is None:
                             return [], [], True
                         for col in output_vals:
-                            accumulated_alias.append({"param": "_output", "column": col})
+                            accumulated_alias.append({"param": "_output", "column": col, "check": check_name})
 
             record_param_history(conn, check_name, report_name, table, filled_params)
             entry = {"name": check_name}

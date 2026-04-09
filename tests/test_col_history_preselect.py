@@ -519,3 +519,156 @@ class TestOutputPromptParamMirror:
         )
         output_cols = [e["column"] for e in alias_entries if e["param"] == "_output"]
         assert output_cols == ["result"]
+
+
+# ---------------------------------------------------------------------------
+# _output scoping — check field written per transform
+# ---------------------------------------------------------------------------
+
+class TestOutputScopingCheckField:
+    """_output alias_map entries carry "check": check_name so the runner
+    can scope write-back to the correct transform.
+
+    Guarantees:
+    - n_runs==1 (single-select): _output entry has "check" == check_name
+    - n_runs>1 (mirror): all _output entries have "check" == check_name
+    - manual select: all _output entries have "check" == check_name
+    - Two transforms in the same _fill_params call write distinct "check" values
+    """
+
+    @pytest.fixture()
+    def single_transform_registry(self):
+        def transform_a(bar: float) -> "pd.Series":
+            pass
+        reg = CheckRegistry()
+        reg.register("transform_a", transform_a, kind="transform")
+        return reg
+
+    @pytest.fixture()
+    def two_transform_registry(self):
+        def transform_a(bar: float) -> "pd.Series":
+            pass
+        def transform_b(baz: float) -> "pd.Series":
+            pass
+        reg = CheckRegistry()
+        reg.register("transform_a", transform_a, kind="transform")
+        reg.register("transform_b", transform_b, kind="transform")
+        return reg
+
+    def test_single_run_output_carries_check_name(self, single_transform_registry):
+        """n_runs==1: _output entry has 'check' == 'transform_a'."""
+        prompter = _make_prompter_multi(single_transform_registry)
+        conn = MagicMock()
+
+        checkbox_call = [0]
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            m.ask.return_value = ["col_a"]  # single col → n_runs=1
+            return m
+
+        def capture_select(label, choices, default=None):
+            m = MagicMock()
+            m.ask.return_value = choices[0].value if hasattr(choices[0], 'value') else choices[0]
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox), \
+           patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            _, alias_entries, _ = prompter._fill_params(
+                selected_checks=["transform_a"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        output_entries = [e for e in alias_entries if e["param"] == "_output"]
+        assert output_entries, "Expected at least one _output entry"
+        for e in output_entries:
+            assert e.get("check") == "transform_a", (
+                f"_output entry must have check='transform_a', got {e}"
+            )
+
+    def test_multi_run_mirror_output_carries_check_name(self, single_transform_registry):
+        """n_runs>1 mirror path: all _output entries have 'check' == check_name."""
+        prompter = _make_prompter_multi(single_transform_registry)
+        conn = MagicMock()
+
+        checkbox_call = [0]
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            m.ask.return_value = ["col_a", "col_b"]  # two cols → n_runs=2
+            return m
+
+        def capture_select(label, choices, default=None):
+            # Step 1: pick first param as mirror
+            m = MagicMock()
+            m.ask.return_value = choices[0].value if hasattr(choices[0], 'value') else "bar"
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox), \
+           patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            _, alias_entries, _ = prompter._fill_params(
+                selected_checks=["transform_a"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        output_entries = [e for e in alias_entries if e["param"] == "_output"]
+        assert output_entries, "Expected _output entries for n_runs>1 mirror"
+        for e in output_entries:
+            assert e.get("check") == "transform_a", (
+                f"_output entry must have check='transform_a', got {e}"
+            )
+
+    def test_two_transforms_have_distinct_check_fields(self, two_transform_registry):
+        """Two transforms in the same _fill_params call write distinct check values."""
+        prompter = _make_prompter_multi(two_transform_registry)
+        conn = MagicMock()
+
+        checkbox_call = [0]
+
+        def capture_checkbox(label, choices):
+            checkbox_call[0] += 1
+            m = MagicMock()
+            # Each transform gets one col → n_runs=1 each → _output fires twice
+            m.ask.return_value = ["col_a"] if checkbox_call[0] % 2 == 1 else ["col_b"]
+            return m
+
+        def capture_select(label, choices, default=None):
+            m = MagicMock()
+            m.ask.return_value = choices[0].value if hasattr(choices[0], 'value') else choices[0]
+            return m
+
+        with _fill_params_stubs(
+            ["col_a", "col_b"],
+            {"col_a": "DOUBLE", "col_b": "DOUBLE"},
+        ), patch("proto_pipe.cli.prompts.questionary.checkbox", side_effect=capture_checkbox), \
+           patch("proto_pipe.cli.prompts.questionary.select", side_effect=capture_select):
+
+            _, alias_entries, _ = prompter._fill_params(
+                selected_checks=["transform_a", "transform_b"],
+                table="sales",
+                conn=conn,
+                report_name="test_report",
+            )
+
+        output_entries = [e for e in alias_entries if e["param"] == "_output"]
+        assert len(output_entries) == 2, (
+            f"Expected 2 _output entries (one per transform), got {len(output_entries)}"
+        )
+        check_values = {e.get("check") for e in output_entries}
+        assert check_values == {"transform_a", "transform_b"}, (
+            f"Each transform must have a distinct check field: {check_values}"
+        )
