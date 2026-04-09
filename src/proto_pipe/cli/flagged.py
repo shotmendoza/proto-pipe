@@ -1,14 +1,14 @@
 """Flagged and validated commands.
 
 vp flagged — view raw source_block (ingest conflicts)
-vp flagged edit  — enriched editable view built from source files via flagging.py
-vp flagged open  — export enriched view to incoming_dir, open for editing
+vp flagged edit — enriched editable view built from source files via flagging.py
+vp flagged open — export enriched view to incoming_dir, open for editing
 vp flagged clear — clear flags without applying corrections
 vp flagged retry — re-ingest corrected flagged export, bypass hash for accepted rows
 
-vp validated       — view raw validation_block (check/transform failures)
-vp validated edit  — enriched editable view joined to report table
-vp validated open  — export to incoming_dir for external editing
+vp validated — view raw validation_block (check/transform failures)
+vp validated edit — enriched editable view joined to report table
+vp validated open — export to incoming_dir for external editing
 vp validated clear — clear validation blocks without corrections
 vp validated retry — upsert corrected records back to report table
 
@@ -740,6 +740,8 @@ def validated_edit(report, key, sources_config, pipeline_db):
         source_table = None
 
     pk_col = key
+    if not pk_col and report_config:
+        pk_col = report_config.get("source", {}).get("primary_key")
     if not pk_col and source_table:
         pk_col = _resolve_primary_key(source_table, sources_config)
     if not pk_col:
@@ -869,7 +871,12 @@ def validated_open(report, key, sources_config, pipeline_db):
         source_table = None
 
     pk_col = key
+    if not pk_col and report_config:
+        # Read primary_key from the report's source config — this is the
+        # canonical location for report-layer primary keys (reports_config.yaml).
+        pk_col = report_config.get("source", {}).get("primary_key")
     if not pk_col and source_table:
+        # Fall back to sources_config.yaml if not set on the report source.
         pk_col = _resolve_primary_key(source_table, sources_config)
     if not pk_col:
         click.echo("[error] Cannot export without a primary key. Use --key.")
