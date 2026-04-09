@@ -429,7 +429,8 @@ class TestComputeReportContractGating:
         from proto_pipe.checks.registry import ReportRegistry
         from proto_pipe.io.registry import register_from_config
         rr = ReportRegistry()
-        register_from_config(config, cr, rr)
+        full_config = {"templates": {}, "reports": [config]}
+        register_from_config(full_config, cr, rr)
         report = rr.get("sales_report")
 
         # Must complete without error — DuckDB path fires for Series checks
@@ -462,7 +463,8 @@ class TestComputeReportContractGating:
         from proto_pipe.checks.registry import ReportRegistry
         from proto_pipe.io.registry import register_from_config
         rr = ReportRegistry()
-        register_from_config(config, cr, rr)
+        full_config = {"templates": {}, "reports": [config]}
+        register_from_config(full_config, cr, rr)
         report = rr.get("sales_report")
 
         bundle = _compute_report(report, cr, watermark_store, pipeline_db)
@@ -494,7 +496,8 @@ class TestComputeReportContractGating:
         from proto_pipe.checks.registry import ReportRegistry
         from proto_pipe.io.registry import register_from_config
         rr = ReportRegistry()
-        register_from_config(config, cr, rr)
+        full_config = {"templates": {}, "reports": [config]}
+        register_from_config(full_config, cr, rr)
         report = rr.get("sales_report")
 
         bundle = _compute_report(report, cr, watermark_store, pipeline_db)
@@ -562,7 +565,8 @@ class TestApplyTransformsUsesContracts:
         from proto_pipe.checks.registry import ReportRegistry
         from proto_pipe.io.registry import register_from_config
         rr = ReportRegistry()
-        register_from_config(config, cr, rr)
+        full_config = {"templates": {}, "reports": [config]}
+        register_from_config(full_config, cr, rr)
         report = rr.get("sales_report")
 
         # Must complete without error — contract routing works
