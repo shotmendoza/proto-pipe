@@ -298,6 +298,11 @@ class CheckContract:
     # Column names baked into Series params at registration time.
     # Populated on the Series path so _compute_report can pre-fetch
     # all needed columns in one bulk query — never re-derived at call time.
+    func_name: str = ""
+    # Original function __name__, resolved once at validate_check time by
+    # unwrapping the partial chain. Used by display_name() in prompts.py so
+    # the CLI can show human-readable names instead of UUIDs — never
+    # re-inspected at call time (inspect-once principle).
 
 
 @dataclass
@@ -635,6 +640,17 @@ def validate_check(
     """
     from proto_pipe.checks.result import wrap_series_check
 
+    # Resolve original function name once — stored on CheckContract so
+    # display_name() in prompts.py never needs to re-inspect (inspect-once rule).
+    # Unwrap partial chain first (transforms are registered as partials),
+    # then follow __wrapped__ (set by functools.wraps in wrap_series_check).
+    _inner = func
+    while isinstance(_inner, functools.partial):
+        _inner = _inner.func
+    import inspect as _inspect
+    _inner = _inspect.unwrap(_inner)
+    _func_name = getattr(_inner, "__name__", "") or ""
+
     if kind not in ("check", "transform"):
         reason = (
             f"kind must be 'check' or 'transform', got '{kind}'. "
@@ -670,7 +686,7 @@ def validate_check(
 
         df_wrapped = _wrap_dataframe_input(func, df_param, kind)
         wrapped_func = wrap_series_check(df_wrapped) if kind == "check" else df_wrapped
-        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, needs_dataframe=True))
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, needs_dataframe=True, func_name=_func_name))
 
     # ── Series-input path ────────────────────────────────────────────────────
     # Functions with pd.Series params and no pd.DataFrame param.
@@ -707,7 +723,8 @@ def validate_check(
         col_names = [v for p, v in baked.items() if p in series_param_names and isinstance(v, str)]
 
         return CheckAudit(CheckContract(
-            func=wrapped_func, kind=kind, needs_series=True, series_columns=col_names
+            func=wrapped_func, kind=kind, needs_series=True, series_columns=col_names,
+            func_name=_func_name
         ))
 
     # ── Scalar column-backed path ─────────────────────────────────────────────
@@ -755,7 +772,7 @@ def validate_check(
 
         scalar_wrapped = _wrap_scalar_column_input(func)
         wrapped_func = wrap_series_check(scalar_wrapped) if kind == "check" else scalar_wrapped
-        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, is_scalar=True))
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, is_scalar=True, func_name=_func_name))
     if inspector.empty_return_annotation():
         if kind == "check":
             reason = (
@@ -787,7 +804,7 @@ def validate_check(
         )
 
     wrapped_func = wrap_series_check(func) if kind == "check" else func
-    return CheckAudit(CheckContract(func=wrapped_func, kind=kind, is_legacy=True))
+    return CheckAudit(CheckContract(func=wrapped_func, kind=kind, is_legacy=True, func_name=_func_name))
 
 
 class CheckParamInspector:

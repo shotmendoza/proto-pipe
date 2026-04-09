@@ -1431,16 +1431,16 @@ def display_name(check_name: str, check_registry) -> str:
     concern. Business logic modules pass check_name (UUID) and the CLI layer
     resolves it for human-readable output.
 
-    Falls back to the UUID unchanged if the name cannot be resolved.
+    Reads func_name from CheckContract — resolved once at validate_check time
+    per the inspect-once principle. Never re-inspects the function or its
+    partial chain at call time.
+
+    Falls back to the UUID unchanged if the contract is unavailable.
     """
-    import inspect as _inspect
     try:
-        func = check_registry.get(check_name)
-        if func is None:
-            return check_name
-        unwrapped = _inspect.unwrap(func)
-        name = getattr(unwrapped, "__name__", None)
-        return name if name and not name.startswith("<") else check_name
+        contract = check_registry.get_contract(check_name)
+        name = contract.func_name
+        return name if name else check_name
     except Exception:
         return check_name
 
