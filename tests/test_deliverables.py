@@ -15,7 +15,7 @@ import duckdb
 import pandas as pd
 
 from proto_pipe.io.registry import resolve_filename, write_csv, write_xlsx_sheet
-from proto_pipe.reports.runner import run_deliverable
+from proto_pipe.reports.deliverable import run_deliverable
 
 
 # ---------------------------------------------------------------------------

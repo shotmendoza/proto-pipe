@@ -8,7 +8,7 @@ Usage pattern:
     if not prompter.run(existing_names, suggested_pattern):
         return  # cancelled
     config.add_or_update(prompter.source)
-    write_registry_types(conn, prompter.source["name"], prompter.confirmed_types)
+    write_registry_types(conn, prompter.source[ "name"], prompter.confirmed_types)
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import click
 import questionary
 
 from proto_pipe.constants import DUCKDB_TYPES, DATE_FORMATS
+from proto_pipe.reports.callbacks import ReportCallback, LogEntry
 
 
 def prompt_custom_export_path() -> "Path | None":
@@ -1635,3 +1636,71 @@ class ValidateProgressReporter(PipelineProgressReporter):
 
 # IngestProgressReporter — rich spinner for vp ingest
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ValidateReportCallback — structured log rendering for vp validate
+#
+# ADD THIS after the ValidateProgressReporter class in cli/prompts.py.
+# This renders LogEntry items from the compute phase via rich console.
+# ---------------------------------------------------------------------------
+
+class ValidateReportCallback(ReportCallback):
+    """Render structured LogEntry items from report computation via rich.
+
+    Used by vp validate to display compute-phase progress (pending counts,
+    check failures, transform warnings) and write-phase notifications
+    (table creation, deliverable writes).
+
+    Instantiated in cli/commands/validation.py, passed as callback= to
+    run_all_reports. The reports layer never imports this class — it only
+    sees the base ReportCallback type.
+    """
+
+    def __init__(self, check_registry) -> None:
+        self._check_registry = check_registry
+
+    def _resolve_name(self, check_name: str) -> str:
+        """Resolve check UUID to human-readable function name."""
+        return display_name(check_name, self._check_registry)
+
+    def on_log(self, entry: "LogEntry") -> None:
+        """Render a structured log entry to the terminal."""
+        level = entry.level
+        category = entry.category
+
+        if category == "skip":
+            click.echo(f"  [skip] {entry.message}")
+        elif category == "pending":
+            click.echo(
+                f"  [{entry.report_name}] {entry.count} pending record(s) of "
+                f"{entry.total} total"
+            )
+        elif category == "check" and level == "info":
+            name = self._resolve_name(entry.check_name) if entry.check_name else ""
+            click.echo(
+                f"  [check] '{name}' — {entry.count} failure(s) → validation_block"
+            )
+        elif category == "check" and level == "error":
+            click.echo(f"  [check-fail] {entry.message}")
+        elif category == "transform" and level == "warn":
+            click.echo(f"  [transform-warn] {entry.message}")
+        elif category == "transform" and level == "error":
+            click.echo(f"  [transform-fail] {entry.message}")
+        elif category == "transform" and level == "info":
+            click.echo(f"  [transform] {entry.message}")
+        elif category == "check_set_changed":
+            click.echo(f"  [warn] {entry.message}")
+        else:
+            click.echo(f"  [{level}] {entry.message}")
+
+    def on_write_done(
+        self, report_name: str, target_table: str, row_count: int, first_run: bool
+    ) -> None:
+        if first_run:
+            click.echo(
+                f"  [ok] Created report table '{target_table}' ({row_count} rows)"
+            )
+
+    def on_deliverable_written(self, path: str, row_count: int) -> None:
+        click.echo(f"  [ok] {path} ({row_count} rows)")

@@ -9,7 +9,7 @@ CLAUDE.md behavioral guarantees:
 from __future__ import annotations
 
 import pytest
-from proto_pipe.reports.runner import _resolve_output_col
+from proto_pipe.reports.transforms import _resolve_output_col
 
 
 def _entry(param, column, check=None):

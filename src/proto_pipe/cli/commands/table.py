@@ -1,14 +1,10 @@
 """Table commands — view, edit, and export pipeline tables."""
 
-from pathlib import Path
-
 import click
 import duckdb
 import pandas as pd
 
-from proto_pipe.io.config import config_path_or_override, load_config, load_settings
-from proto_pipe.constants import PIPELINE_TABLES
-from proto_pipe.io.db import get_all_tables
+from proto_pipe.io.config import config_path_or_override, load_config
 
 
 def get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
@@ -296,5 +292,73 @@ def table_cmd(table_name, edit, export, limit, pipeline_db):
     sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# vp table-reset (moved from cli/scaffold.py per REFACTOR_PLAN.md)
+# ---------------------------------------------------------------------------
+
+
+@click.command("table-reset")
+@click.option("--report", "report_name", default=None, help="Report name to reset.")
+@click.option("--reports-config", default=None, help="Override reports config path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def table_reset(report_name, reports_config, pipeline_db):
+    """Drop a report table and clear its ingest history so it re-ingests cleanly.
+
+    This is a destructive operation. The table is dropped from DuckDB and all
+    ingest_state entries for it are removed. The next `vp ingest` run recreates
+    the table from source files from scratch, including re-applying transforms.
+
+    \b
+    Example:
+      vp table-reset --report us_carrier
+    """
+    import questionary
+
+    from proto_pipe.io.ingest import reset_report
+
+    rep_cfg = config_path_or_override("reports_config", reports_config)
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+
+    config = load_config(rep_cfg)
+    available_reports = [r["name"] for r in config.get("reports", [])]
+
+    if not available_reports:
+        click.echo("  No reports configured. Run: vp new-report")
+        return
+
+    if not report_name:
+        report_name = questionary.select(
+            "Which report do you want to reset?",
+            choices=available_reports,
+        ).ask()
+        if not report_name:
+            click.echo("Cancelled.")
+            return
+
+    if report_name not in available_reports:
+        click.echo(f"  [error] Report '{report_name}' not found in {rep_cfg}")
+        return
+
+    report_cfg = next(r for r in config["reports"] if r["name"] == report_name)
+    table_name = report_cfg["source"]["table"]
+
+    click.echo(f"\n  Report:  {report_name}")
+    click.echo(f"  Table:   {table_name}")
+    click.echo(f"  DB:      {p_db}")
+    click.echo()
+
+    confirmed = questionary.confirm(
+        f"Drop '{table_name}' and clear its ingest history? This cannot be undone.",
+        default=False,
+    ).ask()
+    if not confirmed:
+        click.echo("Cancelled.")
+        return
+
+    reset_report(table_name, p_db)
+    click.echo(f"\n[ok] '{table_name}' reset. Run: vp ingest")
+
+
 def table_commands(cli: click.Group) -> None:
     cli.add_command(table_cmd)
+    cli.add_command(table_reset)

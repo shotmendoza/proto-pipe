@@ -18,7 +18,7 @@ import duckdb
 import pandas as pd
 import pytest
 
-from proto_pipe.reports.runner import (
+from proto_pipe.reports.transforms import (
     _apply_scalar_transform_duckdb,
     _apply_transforms_with_gate,
     _resolve_output_col,

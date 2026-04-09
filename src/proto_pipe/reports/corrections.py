@@ -26,8 +26,6 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from proto_pipe.io.ingest import load_file
-
 
 # ---------------------------------------------------------------------------
 # Export flagged rows
@@ -118,6 +116,9 @@ def import_corrections(
     build_source_flag_export — it may contain _flag_* columns which are stripped
     before the UPDATE.
 
+    Data loading uses DuckDB read_csv_auto per the "all data loading through
+    DuckDB" principle — pandas is never used in the data path.
+
     :param conn:              Open DuckDB connection to pipeline.db.
     :param table_name:        The table to update.
     :param corrections_path:  Path to the corrected CSV file.
@@ -125,10 +126,7 @@ def import_corrections(
     :return: dict with keys: updated, flagged_cleared, validation_cleared,
              not_found, not_found_keys.
     """
-    from pathlib import Path
-
     from proto_pipe.io.db import get_registry_types, upsert_via_staging
-    from proto_pipe.io.ingest import load_file
     from proto_pipe.io.migration import apply_declared_types
     from proto_pipe.pipelines.flagging import clear_flags
 
@@ -136,7 +134,12 @@ def import_corrections(
     if not path.exists():
         raise FileNotFoundError(f"Corrections file not found: {corrections_path}")
 
-    df = load_file(path)
+    # Load via DuckDB read_csv_auto — all data loading through DuckDB.
+    # Uses an in-memory connection to avoid schema conflicts with the
+    # pipeline DB connection (read_csv_auto creates a virtual table).
+    df = duckdb.execute(
+        "SELECT * FROM read_csv_auto(?)", [str(path)]
+    ).df()
 
     # Apply declared types from column_type_registry so write-back uses
     # confirmed types, not pandas inference from the CSV round-trip.
@@ -205,4 +208,3 @@ def import_corrections(
         "not_found": not_found,
         "not_found_keys": not_found_keys[:5],
     }
-

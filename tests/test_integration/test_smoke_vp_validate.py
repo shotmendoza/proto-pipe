@@ -909,11 +909,12 @@ class TestDisplayName:
         except Exception as e:
             pytest.fail(f"_display_name raised unexpectedly: {e}")
 
-    def test_display_name_used_in_check_output(self, pipeline_db, watermark_store, sales_df):
+    def test_display_name_used_in_check_output(
+        self, pipeline_db, watermark_store, sales_df
+    ):
         """Check failure output shows function name not UUID."""
         from proto_pipe.io.db import init_all_pipeline_tables
         from proto_pipe.reports.runner import _compute_report
-        import io, sys
 
         with duckdb.connect(pipeline_db) as conn:
             init_all_pipeline_tables(conn)
@@ -929,26 +930,33 @@ class TestDisplayName:
 
         from proto_pipe.checks.registry import ReportRegistry
         from proto_pipe.io.registry import register_from_config
+
         rr = ReportRegistry()
-        register_from_config({
-            "templates": {},
-            "reports": [{
-                "name": "sales_report",
-                "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
-                "alias_map": [{"param": "price", "column": "price"}],
-                "options": {"parallel": False},
-                "checks": [{"name": "always_fails_display", "params": {}}],
-            }],
-        }, cr, rr)
-
-        captured = io.StringIO()
-        sys.stdout = captured
-        try:
-            _compute_report(rr.get("sales_report"), cr, pipeline_db)
-        finally:
-            sys.stdout = sys.__stdout__
-
-        output = captured.getvalue()
-        assert "always_fails" in output, (
-            "Check output must show function name 'always_fails', not a UUID"
+        register_from_config(
+            {
+                "templates": {},
+                "reports": [
+                    {
+                        "name": "sales_report",
+                        "source": {
+                            "type": "duckdb",
+                            "path": pipeline_db,
+                            "table": "sales",
+                            "primary_key": "order_id",
+                        },
+                        "alias_map": [{"param": "price", "column": "price"}],
+                        "options": {"parallel": False},
+                        "checks": [{"name": "always_fails_display", "params": {}}],
+                    }
+                ],
+            },
+            cr,
+            rr,
         )
+
+        bundle = _compute_report(rr.get("sales_report"), cr, pipeline_db)
+
+        log_messages = " ".join(entry.message for entry in bundle.log)
+        assert (
+            "always_fails" in log_messages
+        ), "Check output must show function name 'always_fails', not a UUID"

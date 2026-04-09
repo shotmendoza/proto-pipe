@@ -12,7 +12,6 @@ from proto_pipe.cli.commands.new import new_commands
 from proto_pipe.cli.commands.refresh import refresh_commands
 from .quickstart import setup_commands
 from .reports import reports_commands
-from .scaffold import scaffold_commands
 from proto_pipe.cli.commands.table import table_commands
 from proto_pipe.cli.commands.validation import validation_commands
 from proto_pipe.cli.commands.view import view_commands
@@ -36,5 +35,4 @@ refresh_commands(cli)
 view_commands(cli)
 flagged_commands(cli)
 funcs_commands(cli)
-scaffold_commands(cli)
 table_commands(cli)

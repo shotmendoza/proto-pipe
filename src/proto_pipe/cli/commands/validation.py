@@ -65,9 +65,11 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
     else:
         reports = report_registry.all()
 
-    from proto_pipe.cli.prompts import ValidateProgressReporter
+    from proto_pipe.cli.prompts import ValidateProgressReporter, ValidateReportCallback
 
     click.echo(f"\nRunning validation across {len(reports)} report(s)...")
+
+    report_callback = ValidateReportCallback(check_registry)
 
     with ValidateProgressReporter(check_registry) as reporter:
         results = run_all_reports(
@@ -78,6 +80,7 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
             full_revalidation=full,
             on_report_done=reporter.on_report_done,
             report_names=[r["name"] for r in reports] if table else None,
+            callback=report_callback,
         )
 
     # Write pipeline events — one per completed/errored report

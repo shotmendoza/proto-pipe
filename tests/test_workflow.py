@@ -18,7 +18,8 @@ from proto_pipe.io.registry import register_from_config
 from proto_pipe.pipelines.watermark import WatermarkStore
 from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.pipelines.query import query_table
-from proto_pipe.reports.runner import run_deliverable, run_all_reports
+from proto_pipe.reports.deliverable import run_deliverable
+from proto_pipe.reports.runner import run_all_reports
 
 
 # ---------------------------------------------------------------------------
