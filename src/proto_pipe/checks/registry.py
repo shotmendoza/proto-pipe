@@ -273,19 +273,26 @@ class CheckContract:
     to access these flags — never access _checks directly.
 
     Attributes:
-        func:             The callable. For kind='check', wrapped with
-                          wrap_series_check so it returns CheckResult.
-        kind:             'check' or 'transform'.
-        needs_dataframe:  True if the function has a pd.DataFrame param.
-                          Requires a pandas roundtrip — pending_df must be loaded.
-        needs_series:     True if the function has pd.Series param(s) and no
-                          pd.DataFrame param. Can extract columns from DuckDB.
-        is_scalar:        True if the function has no pd.Series or pd.DataFrame
-                          params and no legacy context param. Per-row apply via
-                          pandas or DuckDB UDF.
-        is_legacy:        True if the function uses context: dict or a positional
-                          context param (legacy calling convention). Always routed
-                          to the pandas path — requires context["df"].
+        func:               The callable. For kind='check', wrapped with
+                            wrap_series_check so it returns CheckResult.
+        kind:               'check' or 'transform'.
+        needs_dataframe:    True if the function has a pd.DataFrame param.
+                            Requires a pandas roundtrip — pending_df must be loaded.
+        needs_series:       True if the function has pd.Series param(s) and no
+                            pd.DataFrame param. Can extract columns from DuckDB.
+        is_scalar:          True if the function has no pd.Series or pd.DataFrame
+                            params and no legacy context param. Per-row apply via
+                            pandas or DuckDB UDF.
+        is_legacy:          True if the function uses context: dict or a positional
+                            context param (legacy calling convention). Always routed
+                            to the pandas path — requires context["df"].
+        series_columns:     Column names baked into Series params at registration
+                            time. Used by _compute_report for bulk column pre-fetch.
+        func_name:          Original function __name__, resolved once at
+                            validate_check time. Used by display_name() in prompts.py.
+        col_backed_params:  {param_name: column_name} for all Series params baked
+                            at registration time. Used by the pandas transform
+                            write-back path to resolve the _output column.
     """
 
     func: Callable
@@ -299,10 +306,12 @@ class CheckContract:
     # Populated on the Series path so _compute_report can pre-fetch
     # all needed columns in one bulk query — never re-derived at call time.
     func_name: str = ""
-    # Original function __name__, resolved once at validate_check time by
-    # unwrapping the partial chain. Used by display_name() in prompts.py so
-    # the CLI can show human-readable names instead of UUIDs — never
-    # re-inspected at call time (inspect-once principle).
+    # Original function __name__, resolved once at validate_check time.
+    # Used by display_name() in prompts.py — never re-inspected at call time.
+    col_backed_params: dict = field(default_factory=dict)
+    # {param_name: column_name} for all Series params baked at registration time.
+    # Used by the pandas transform write-back path in runner.py to resolve the
+    # _output column via _resolve_output_col — eliminates runtime inspection.
 
 
 @dataclass
@@ -640,10 +649,7 @@ def validate_check(
     """
     from proto_pipe.checks.result import wrap_series_check
 
-    # Resolve original function name once — stored on CheckContract so
-    # display_name() in prompts.py never needs to re-inspect (inspect-once rule).
-    # Unwrap partial chain first (transforms are registered as partials),
-    # then follow __wrapped__ (set by functools.wraps in wrap_series_check).
+    # Resolve original function name once — stored on CheckContract (inspect-once rule).
     _inner = func
     while isinstance(_inner, functools.partial):
         _inner = _inner.func
@@ -722,9 +728,11 @@ def validate_check(
             inner = inner.func
         col_names = [v for p, v in baked.items() if p in series_param_names and isinstance(v, str)]
 
+        col_backed_map = {p: v for p, v in baked.items() if p in series_param_names and isinstance(v, str)}
         return CheckAudit(CheckContract(
-            func=wrapped_func, kind=kind, needs_series=True, series_columns=col_names,
-            func_name=_func_name
+            func=wrapped_func, kind=kind, needs_series=True,
+            series_columns=col_names, col_backed_params=col_backed_map,
+            func_name=_func_name,
         ))
 
     # ── Scalar column-backed path ─────────────────────────────────────────────

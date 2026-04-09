@@ -279,10 +279,21 @@ def _apply_transforms_with_gate(
                 modified_df = result.copy()
             elif isinstance(result, pd.Series):
                 col_name = result.name
+                # If result.name is missing or not in the table, fall back to
+                # the alias_map _output entry. Use col_backed_map from the
+                # CheckContract — extracted once at registration time per the
+                # inspect-once principle. Never re-inspect the partial at runtime.
+                if not col_name or col_name not in df.columns:
+                    _contract = check_registry.get_contract(name)
+                    col_name = _resolve_output_col(
+                        alias_map or [],
+                        _contract.col_backed_params if _contract else {},
+                        check_name=_resolve_display_name(name, check_registry),
+                    )
                 if not col_name or col_name not in df.columns:
                     print(
                         f"  [transform-warn] '{_resolve_display_name(name, check_registry)}' returned Series "
-                        f"with name={col_name!r} — not found in table, skipped"
+                        f"with name={result.name!r} — not found in table and no _output entry, skipped"
                     )
                     continue
                 modified_df = df.copy()
