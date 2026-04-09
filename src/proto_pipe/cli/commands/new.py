@@ -152,6 +152,7 @@ def new_source(sources_config, incoming_dir):
                 f"  Has 'vp db-init' been run? Types confirmed this session are lost.\n"
                 f"  Run 'vp db-init' then 'vp new source' again to re-confirm them."
             )
+    config.add_or_update(prompter.source)
     click.echo(f"\n[ok] Source '{prompter.source['name']}' added to {src_cfg}")
     click.echo("\nNext steps:")
     click.echo("1. Review the entry in sources_config.yaml if needed")
