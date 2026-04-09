@@ -171,6 +171,16 @@ def _resolve_display_name(check_name: str, check_registry) -> str:
     return display_name(check_name, check_registry)
 
 
+def _resolve_display_name(check_name: str, check_registry) -> str:
+    """Thin wrapper — delegates to prompts.display_name (canonical location).
+
+    display_name is a display concern and lives in cli/prompts.py per the
+    module responsibility rule. Lazy import avoids circular dependency.
+    """
+    from proto_pipe.cli.prompts import display_name
+    return display_name(check_name, check_registry)
+
+
 # ---------------------------------------------------------------------------
 # Transform application — with TRY_CAST gate
 # ---------------------------------------------------------------------------
@@ -254,7 +264,7 @@ def _apply_transforms_with_gate(
                     continue
                 except Exception as udf_exc:
                     print(
-                        f"  [transform] '{name}' DuckDB UDF failed ({udf_exc}) "
+                        f"  [transform] '{_resolve_display_name(name, check_registry)}' DuckDB UDF failed ({udf_exc}) "
                         f"— falling back to pandas"
                     )
 
@@ -271,7 +281,7 @@ def _apply_transforms_with_gate(
                 col_name = result.name
                 if not col_name or col_name not in df.columns:
                     print(
-                        f"  [transform-warn] '{name}' returned Series "
+                        f"  [transform-warn] '{_resolve_display_name(name, check_registry)}' returned Series "
                         f"with name={col_name!r} — not found in table, skipped"
                     )
                     continue
@@ -279,7 +289,7 @@ def _apply_transforms_with_gate(
                 modified_df[col_name] = result.values
             else:
                 print(
-                    f"  [transform-warn] '{name}' returned {type(result).__name__} "
+                    f"  [transform-warn] '{_resolve_display_name(name, check_registry)}' returned {type(result).__name__} "
                     f"(expected DataFrame or Series) — skipped"
                 )
                 continue
@@ -324,7 +334,7 @@ def _apply_transforms_with_gate(
                                 pk_value=pk_str,
                                 bad_columns=col,
                                 reason=(
-                                    f"[{col}] transform '{name}' produced "
+                                    f"[{col}] transform '{_resolve_display_name(name, check_registry)}' produced "
                                     f"'{row[1]}' which cannot be cast to {base_type}"
                                 )[:500],
                             ))
@@ -333,7 +343,7 @@ def _apply_transforms_with_gate(
 
                 if blocked_pks:
                     print(
-                        f"  [transform-warn] '{name}' produced {len(blocked_pks)} "
+                        f"  [transform-warn] '{_resolve_display_name(name, check_registry)}' produced {len(blocked_pks)} "
                         f"row(s) that failed TRY_CAST → validation_block"
                     )
                     modified_df = modified_df[
@@ -347,7 +357,7 @@ def _apply_transforms_with_gate(
             _df = df          # keep _df in sync so _get_df() returns updated df
 
         except Exception as e:
-            print(f"  [transform-fail] '{name}': {e} — skipped, table unchanged")
+            print(f"  [transform-fail] '{_resolve_display_name(name, check_registry)}': {e} — skipped, table unchanged")
 
     print(
         f"  [transform] {len(transform_names)} transform(s) applied to '{target_table}'"
@@ -450,7 +460,7 @@ def _apply_scalar_transform_duckdb(
     all_params = [p.name for p in sig.parameters.values()]
 
     if not all_params:
-        raise ValueError(f"Scalar transform '{name}' has no parameters")
+        raise ValueError(f"Scalar transform '{check_name or name}' has no parameters")
 
     col_backed: dict[str, str] = {}
     for param_name in all_params:
@@ -460,7 +470,7 @@ def _apply_scalar_transform_duckdb(
 
     if not col_backed:
         raise ValueError(
-            f"Scalar transform '{name}' has no column-backed params in alias_map "
+            f"Scalar transform '{check_name or name}' has no column-backed params in alias_map "
             f"and no first-param column to operate on."
         )
 
@@ -468,12 +478,12 @@ def _apply_scalar_transform_duckdb(
     if output_col is None:
         first_col_param = next((p for p in all_params if p in col_backed), None)
         if first_col_param is None:
-            raise ValueError(f"Cannot determine output column for transform '{name}'")
+            raise ValueError(f"Cannot determine output column for transform '{check_name or name}'")
         output_col = col_backed[first_col_param]
 
     if output_col not in df_cols:
         raise ValueError(
-            f"Output column '{output_col}' for transform '{name}' not in DataFrame"
+            f"Output column '{output_col}' for transform '{check_name or name}' not in DataFrame"
         )
 
     col_param_names = [p for p in all_params if p in col_backed]
@@ -591,7 +601,7 @@ def _apply_transforms(
                     working_df = working_df.copy()
                     working_df[col_name] = result.values
         except Exception as e:
-            print(f"  [transform-fail] '{name}': {e} — skipped")
+            print(f"  [transform-fail] '{_resolve_display_name(name, check_registry)}': {e} — skipped")
             failed.append(name)
 
     conn = duckdb.connect(pipeline_db)
@@ -1211,10 +1221,8 @@ def run_all_reports(
 ) -> list[dict]:
     """Execute all reports in dependency order.
 
-    report_names: optional list of report names to run. When provided, only
-    those reports execute. All reports are still used for dependency resolution
-    (target_to_name) so upstream failure propagation works correctly even when
-    a subset is selected.
+    report_names: optional list of report names to run. When provided only
+    those reports execute. All reports are used for dependency resolution.
 
     on_report_done: optional callback fired after each report completes.
     Receives the result dict (same shape as the return list entries).
@@ -1248,11 +1256,9 @@ def run_all_reports(
     from proto_pipe.io.db import ensure_pipeline_tables
 
     all_reports = report_registry.all()
-    # target_to_name uses ALL reports for dependency resolution — upstream
-    # failure propagation must work even when only a subset is being run.
+    # Build dependency map from ALL reports — needed for upstream failure propagation
+    # even when only a subset is being executed.
     target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in all_reports}
-
-    # Apply name filter after dependency map is built.
     reports = (
         [r for r in all_reports if r["name"] in set(report_names)]
         if report_names is not None
