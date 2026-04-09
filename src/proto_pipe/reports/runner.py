@@ -1207,8 +1207,14 @@ def run_all_reports(
     pipeline_db: str | None = None,
     full_revalidation: bool = False,
     on_report_done: "callable | None" = None,
+    report_names: "list[str] | None" = None,
 ) -> list[dict]:
     """Execute all reports in dependency order.
+
+    report_names: optional list of report names to run. When provided, only
+    those reports execute. All reports are still used for dependency resolution
+    (target_to_name) so upstream failure propagation works correctly even when
+    a subset is selected.
 
     on_report_done: optional callback fired after each report completes.
     Receives the result dict (same shape as the return list entries).
@@ -1241,9 +1247,18 @@ def run_all_reports(
     """
     from proto_pipe.io.db import ensure_pipeline_tables
 
-    reports = report_registry.all()
+    all_reports = report_registry.all()
+    # target_to_name uses ALL reports for dependency resolution — upstream
+    # failure propagation must work even when only a subset is being run.
+    target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in all_reports}
+
+    # Apply name filter after dependency map is built.
+    reports = (
+        [r for r in all_reports if r["name"] in set(report_names)]
+        if report_names is not None
+        else all_reports
+    )
     layers = _build_execution_layers(reports)
-    target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in reports}
 
     all_results: list[dict] = []
     failed_reports: set[str] = set()

@@ -77,12 +77,8 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
             pipeline_db=p_db,
             full_revalidation=full,
             on_report_done=reporter.on_report_done,
+            report_names=[r["name"] for r in reports] if table else None,
         )
-
-    if table:
-        results = [
-            r for r in results if r["report"] in {rpt["name"] for rpt in reports}
-        ]
 
     # Write pipeline events — one per completed/errored report
     events = []
