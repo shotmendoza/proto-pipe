@@ -45,8 +45,8 @@ def _make_prompter_multi(registry):
 
 @contextlib.contextmanager
 def _fill_params_stubs(table_cols, registry_types_result):
-    with patch("proto_pipe.cli.scaffold.get_table_columns", return_value=table_cols), \
-         patch("proto_pipe.cli.scaffold.get_param_suggestions", return_value=[]), \
+    with patch("proto_pipe.io.db.get_table_columns", return_value=table_cols), \
+         patch("proto_pipe.io.db.get_param_suggestions", return_value=[]), \
          patch("proto_pipe.io.db.get_registry_types", return_value=registry_types_result), \
          patch("proto_pipe.cli.prompts.click.echo"):
         yield
@@ -78,7 +78,7 @@ class TestCheckParamsHistoryWritePath:
 
         with _fill_params_stubs(["endt", "price"], {"endt": "DATE", "price": "DOUBLE"}), \
              patch("proto_pipe.cli.prompts.questionary.select", mock_select), \
-             patch("proto_pipe.cli.scaffold.record_param_history", mock_record):
+             patch("proto_pipe.io.db.record_param_history", mock_record):
 
             prompter.prompt_params(
                 selected_checks=["col_check"],
@@ -115,7 +115,7 @@ class TestCheckParamsHistoryWritePath:
             {"endt": "DATE", "expiry_date": "DATE", "price": "DOUBLE"},
         ), \
              patch("proto_pipe.cli.prompts.questionary.checkbox", mock_cb), \
-             patch("proto_pipe.cli.scaffold.record_param_history", mock_record):
+             patch("proto_pipe.io.db.record_param_history", mock_record):
 
             prompter.prompt_params(
                 selected_checks=["col_check"],
@@ -163,7 +163,7 @@ class TestCheckParamsHistoryWritePath:
         with _fill_params_stubs(["endt", "price"], {"endt": "DATE", "price": "DOUBLE"}), \
              patch("proto_pipe.cli.prompts.questionary.select", mock_select), \
              patch("proto_pipe.cli.prompts.questionary.text", mock_text), \
-             patch("proto_pipe.cli.scaffold.record_param_history", mock_record):
+             patch("proto_pipe.io.db.record_param_history", mock_record):
 
             prompter.prompt_params(
                 selected_checks=["scalar_check"],
@@ -198,7 +198,7 @@ class TestCheckParamsHistoryWritePath:
 
         with _fill_params_stubs(["endt"], {"endt": "DATE"}), \
              patch("proto_pipe.cli.prompts.questionary.select", mock_select), \
-             patch("proto_pipe.cli.scaffold.record_param_history", mock_record):
+             patch("proto_pipe.io.db.record_param_history", mock_record):
 
             prompter.prompt_params(
                 selected_checks=["col_check"],

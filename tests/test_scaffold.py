@@ -18,11 +18,13 @@ import pytest
 from proto_pipe.cli.scaffold import (
     _suggest_pattern,
     _scan_incoming,
+    _sort_views,
+    build_rich_sql_scaffold,
+)
+from proto_pipe.io.db import (
     record_param_history,
     get_param_suggestions,
     _similar_columns,
-    _sort_views,
-    build_rich_sql_scaffold,
 )
 
 # ---------------------------------------------------------------------------

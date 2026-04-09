@@ -729,3 +729,203 @@ def init_all_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
     init_check_registry_metadata(conn)
     init_column_type_registry(conn)
     init_pipeline_events(conn)
+
+
+# ---------------------------------------------------------------------------
+# check_params_history operations  (moved from cli/scaffold.py)
+# ---------------------------------------------------------------------------
+
+def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.6) -> list[str]:
+    """Return columns similar to param_value, ranked by similarity.
+
+    Substring matches are returned first; fuzzy matches (SequenceMatcher >= threshold)
+    follow.  Private helper used only by get_param_suggestions in this module.
+    """
+    from difflib import SequenceMatcher
+
+    substring = [
+        c for c in columns
+        if param_value.lower() in c.lower() or c.lower() in param_value.lower()
+    ]
+    fuzzy = [
+        c for c in columns
+        if c not in substring
+        and SequenceMatcher(None, param_value.lower(), c.lower()).ratio() >= threshold
+    ]
+    return substring + fuzzy
+
+
+def get_param_suggestions(
+    conn: duckdb.DuckDBPyConnection,
+    check_name: str,
+    param_name: str,
+    table_cols: list[str],
+) -> list[str]:
+    """Query check_params_history and return similar column suggestions.
+
+    Looks up past param_value entries for the given check+param, then uses
+    fuzzy/substring matching to find columns in the current source that are
+    similar to those historical values.  Returns a deduplicated, ordered list.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT DISTINCT param_value
+            FROM check_params_history
+            WHERE check_name = ? AND param_name = ?
+            ORDER BY recorded_at DESC
+            LIMIT 10
+        """, [check_name, param_name]).fetchall()
+    except Exception:
+        return []
+
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    for (value,) in rows:
+        if value:
+            for m in _similar_columns(value, table_cols):
+                if m not in seen:
+                    suggestions.append(m)
+                    seen.add(m)
+    return suggestions
+
+
+def get_column_param_history(
+    conn: duckdb.DuckDBPyConnection,
+    check_name: str,
+    param_name: str,
+) -> list[str]:
+    """Return historical column values for a check+param combination, most recent first.
+
+    Unlike get_param_suggestions, this returns the raw stored values without
+    similarity filtering against the current source's columns.  The caller
+    intersects with available columns and builds the precheck/default from
+    the result — because these are explicit user declarations, not guesses.
+
+    Used to pre-select columns in vp new report when the same check+param
+    has been configured on other sources.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT DISTINCT param_value
+            FROM check_params_history
+            WHERE check_name = ? AND param_name = ?
+            ORDER BY recorded_at DESC
+            LIMIT 20
+        """, [check_name, param_name]).fetchall()
+    except Exception:
+        return []
+
+    return [row[0] for row in rows if row[0]]
+
+
+def record_param_history(
+    conn: duckdb.DuckDBPyConnection,
+    check_name: str,
+    report_name: str,
+    table_name: str,
+    params: dict,
+) -> None:
+    """Store used param values in check_params_history.
+
+    Wrapped in try/except — check_params_history is not present in fresh
+    databases before migration.  Failures are silently ignored so commands
+    continue to work on unmigrated DBs.
+    """
+    for param_name, value in params.items():
+        if value is None:
+            continue
+        try:
+            conn.execute("""
+                INSERT INTO check_params_history
+                    (id, check_name, report_name, table_name, param_name, param_value, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [
+                str(uuid.uuid4()),
+                check_name,
+                report_name,
+                table_name,
+                param_name,
+                str(value),
+                datetime.now(timezone.utc),
+            ])
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Source-table queries  (moved from cli/scaffold.py)
+# ---------------------------------------------------------------------------
+
+def get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str]:
+    """Return tables in the pipeline DB that aren't yet in reports_config.
+
+    Queries information_schema.tables, then excludes known pipeline-internal
+    tables and tables already referenced by a configured report.
+    """
+    from proto_pipe.constants import PIPELINE_TABLES
+
+    configured = {r["source"]["table"] for r in reports_config.get("reports", [])}
+    conn = duckdb.connect(pipeline_db)
+    all_tables = conn.execute("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'main'
+    """).df()["table_name"].tolist()
+    conn.close()
+    return [t for t in all_tables if t not in PIPELINE_TABLES and t not in configured]
+
+
+def get_all_source_tables(
+    pipeline_db: str,
+    reports_config: dict,
+) -> list[tuple[str, int]]:
+    """Return all non-pipeline tables with their current report count.
+
+    Unlike get_unconfigured_tables, this returns ALL source tables — including
+    those that already have reports defined — annotated with how many reports
+    reference each table.  This allows vp new report to show all available
+    tables rather than filtering configured ones out, since one source table
+    can back multiple reports.
+
+    :param pipeline_db:     Path to the pipeline DuckDB file.
+    :param reports_config:  Reports config dict (may contain "reports" list).
+    :return:                Sorted list of (table_name, report_count) tuples.
+    """
+    from proto_pipe.constants import PIPELINE_TABLES
+
+    report_counts: dict[str, int] = {}
+    for r in reports_config.get("reports", []):
+        table = r.get("source", {}).get("table", "")
+        if table:
+            report_counts[table] = report_counts.get(table, 0) + 1
+
+    try:
+        conn = duckdb.connect(pipeline_db)
+        all_tables = conn.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'main'
+        """).df()["table_name"].tolist()
+        conn.close()
+    except Exception:
+        return []
+
+    return [
+        (t, report_counts.get(t, 0))
+        for t in sorted(all_tables)
+        if t not in PIPELINE_TABLES
+    ]
+
+
+def get_table_columns(pipeline_db: str, table: str) -> list[str]:
+    """Return column names for a table, excluding internal pipeline columns.
+
+    Opens its own short-lived connection.  Columns whose names begin with '_'
+    (e.g. _ingested_at, _row_hash) are excluded — they are pipeline-internal
+    and must never appear in check params or user-facing displays.
+    """
+    conn = duckdb.connect(pipeline_db)
+    cols = conn.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+        [table],
+    ).df()["column_name"].tolist()
+    conn.close()
+    return [c for c in cols if not c.startswith("_")]

@@ -202,7 +202,8 @@ def edit_report(report, reports_config, pipeline_db):
     from proto_pipe.checks.helpers import load_custom_checks_module
     from proto_pipe.io.db import init_check_registry_metadata
     from proto_pipe.cli.prompts import ReportConfigPrompter
-    from proto_pipe.cli.scaffold import get_original_func, get_unconfigured_tables
+    from proto_pipe.cli.scaffold import get_original_func
+    from proto_pipe.io.db import get_unconfigured_tables
 
     rep_cfg = config_path_or_override("reports_config", reports_config)
     p_db = config_path_or_override("pipeline_db", pipeline_db)

@@ -121,7 +121,7 @@ class TestVpNewReportSmoke:
                    return_value=mock_conn), \
              patch("proto_pipe.io.db.init_check_registry_metadata"), \
              patch("proto_pipe.checks.registry.CheckParamInspector.write_to_db"), \
-             patch("proto_pipe.cli.scaffold.get_table_columns", return_value=["price"]), \
+             patch("proto_pipe.io.db.get_table_columns", return_value=["price"]), \
              patch("proto_pipe.cli.scaffold.get_original_func", return_value=None), \
              patch("proto_pipe.cli.scaffold.get_check_first_sentence", return_value=""), \
              patch("proto_pipe.cli.scaffold.build_check_param_lines", return_value=[]), \
@@ -192,7 +192,7 @@ class TestVpNewReportSmoke:
                    return_value=mock_conn), \
              patch("proto_pipe.io.db.init_check_registry_metadata"), \
              patch("proto_pipe.checks.registry.CheckParamInspector.write_to_db"), \
-             patch("proto_pipe.cli.scaffold.get_table_columns", return_value=["price"]), \
+             patch("proto_pipe.io.db.get_table_columns", return_value=["price"]), \
              patch("proto_pipe.cli.scaffold.get_original_func", return_value=None), \
              patch("proto_pipe.cli.scaffold.get_check_first_sentence", return_value=""), \
              patch("proto_pipe.cli.scaffold.build_check_param_lines", return_value=[]), \

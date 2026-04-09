@@ -1,9 +1,6 @@
 """Scaffold commands — new-source, new-report, new-check, new-deliverable."""
 import inspect
 import re
-import uuid
-from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from graphlib import TopologicalSorter, CycleError
 from pathlib import Path
 from typing import Iterable
@@ -13,7 +10,6 @@ import duckdb
 import questionary
 
 from proto_pipe.io.config import config_path_or_override, load_config
-from proto_pipe.constants import PIPELINE_TABLES
 from proto_pipe.checks.registry import CheckRegistry, CheckParamInspector
 
 
@@ -106,45 +102,6 @@ def build_check_param_lines(
     return lines
 
 
-def _get_column_registry_hints(
-    pipeline_db: str,
-    columns: list[str],
-) -> dict[str, dict[str, str]]:
-    """Return {column_name: {source_name: declared_type}} from column_type_registry.
-
-    Used by new_source to show which sources have already declared a type for
-    each column, and to detect conflicts when multiple sources disagree.
-
-    Falls back to {} if the registry table doesn't exist yet (before vp db-init)
-    or if the DB file doesn't exist.
-
-    :param pipeline_db: Path to the pipeline DuckDB file.
-    :param columns:     Column names to look up.
-    :return: Nested dict mapping column → source → type.
-    """
-    try:
-        with duckdb.connect(pipeline_db) as conn:
-            if not columns:
-                return {}
-            placeholders = ", ".join(["?"] * len(columns))
-            rows = conn.execute(
-                f"""
-                SELECT column_name, source_name, declared_type
-                FROM column_type_registry
-                WHERE column_name IN ({placeholders})
-                ORDER BY column_name, recorded_at DESC
-            """,
-                columns,
-            ).fetchall()
-    except Exception:
-        return {}
-
-    result: dict[str, dict[str, str]] = {}
-    for col, source, dtype in rows:
-        result.setdefault(col, {})[source] = dtype
-    return result
-
-
 def filter_uningested(files: list[str], pipeline_db: str) -> list[str]:
     """Remove files already successfully logged in ingest_state."""
     try:
@@ -166,110 +123,6 @@ def filter_unconfigured(files: list[str], sources: list[dict]) -> list[str]:
 def _sorted_choices(items: list[str]) -> Iterable[str]:
     """Return items sorted case-insensitively for consistent prompt display."""
     return sorted(items, key=str.casefold)
-
-
-def _similar_columns(param_value: str, columns: list[str], threshold: float = 0.6) -> list[str]:
-    """Return columns similar to param_value, ranked by similarity."""
-    substring = [c for c in columns if param_value.lower() in c.lower() or c.lower() in param_value.lower()]
-    fuzzy = [
-        c for c in columns
-        if c not in substring
-           and SequenceMatcher(None, param_value.lower(), c.lower()).ratio() >= threshold
-    ]
-    return substring + fuzzy
-
-
-def get_param_suggestions(
-        conn: duckdb.DuckDBPyConnection,
-        check_name: str,
-        param_name: str,
-        table_cols: list[str],
-) -> list[str]:
-    """Query check_params_history and return similar column suggestions."""
-    try:
-        rows = conn.execute("""
-            SELECT DISTINCT param_value
-            FROM check_params_history
-            WHERE check_name = ? AND param_name = ?
-            ORDER BY recorded_at DESC
-            LIMIT 10
-        """, [check_name, param_name]).fetchall()
-    except Exception:
-        return []
-
-    suggestions = []
-    seen = set()
-    for (value,) in rows:
-        if value:
-            matches = _similar_columns(value, table_cols)
-            for m in matches:
-                if m not in seen:
-                    suggestions.append(m)
-                    seen.add(m)
-    return suggestions
-
-
-
-def get_column_param_history(
-    conn: "duckdb.DuckDBPyConnection",
-    check_name: str,
-    param_name: str,
-) -> list[str]:
-    """Return historical column values for a check+param combination, most recent first.
-
-    Unlike get_param_suggestions, this returns the raw stored values without
-    similarity filtering against the current source's columns. The caller
-    intersects with available columns and builds the precheck/default from
-    the result — because these are explicit user declarations, not guesses.
-
-    Used to pre-select columns in vp new report when the same check+param
-    has been configured on other sources.
-    """
-    try:
-        rows = conn.execute("""
-            SELECT DISTINCT param_value
-            FROM check_params_history
-            WHERE check_name = ? AND param_name = ?
-            ORDER BY recorded_at DESC
-            LIMIT 20
-        """, [check_name, param_name]).fetchall()
-    except Exception:
-        return []
-
-    return [row[0] for row in rows if row[0]]
-
-def record_param_history(
-    conn: duckdb.DuckDBPyConnection,
-    check_name: str,
-    report_name: str,
-    table_name: str,
-    params: dict,
-) -> None:
-    """Store used param values in check_params_history.
-
-    Wrapped in try/except — check_params_history is a legacy table not present
-    in fresh databases. Failures are silently ignored so scaffold commands
-    continue to work on DBs that haven't been migrated.
-    """
-    for param_name, value in params.items():
-        if value is None:
-            continue
-        try:
-            conn.execute("""
-                INSERT INTO check_params_history
-                    (id, check_name, report_name, table_name, param_name, param_value, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, [
-                str(uuid.uuid4()),
-                check_name,
-                report_name,
-                table_name,
-                param_name,
-                str(value),
-                datetime.now(timezone.utc),
-            ])
-        except Exception:
-            pass
 
 
 def _detect_view_dependencies(sql: str, known_views: list[str]) -> list[str]:
@@ -332,71 +185,6 @@ def _format_join_clause(
         f"LEFT JOIN {table} {alias}\n"
         f"    ON {base_alias}.<key> = {alias}.<key>  -- define join key"
     )
-
-
-def get_unconfigured_tables(pipeline_db: str, reports_config: dict) -> list[str]:
-    """Return tables in the pipeline DB that aren't yet in reports_config."""
-    configured = {r["source"]["table"] for r in reports_config.get("reports", [])}
-    conn = duckdb.connect(pipeline_db)
-    all_tables = conn.execute("""
-        SELECT table_name FROM information_schema.tables
-        WHERE table_schema = 'main'
-    """).df()["table_name"].tolist()
-    conn.close()
-    return [
-        t for t in all_tables
-        if t not in PIPELINE_TABLES and t not in configured
-    ]
-
-
-def get_all_source_tables(
-    pipeline_db: str,
-    reports_config: dict,
-) -> list[tuple[str, int]]:
-    """Return all non-pipeline tables with their current report count.
-
-    Unlike get_unconfigured_tables, this returns ALL source tables — including
-    those that already have reports defined — with an annotation showing how
-    many reports reference each table. This allows the vp new report prompt
-    to show all available tables rather than filtering configured ones out,
-    since one source table can back multiple reports.
-
-    :param pipeline_db:     Path to the pipeline DuckDB file.
-    :param reports_config:  Reports config dict (may contain "reports" list).
-    :return:                Sorted list of (table_name, report_count) tuples.
-    """
-    report_counts: dict[str, int] = {}
-    for r in reports_config.get("reports", []):
-        table = r.get("source", {}).get("table", "")
-        if table:
-            report_counts[table] = report_counts.get(table, 0) + 1
-
-    try:
-        conn = duckdb.connect(pipeline_db)
-        all_tables = conn.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_schema = 'main'
-        """).df()["table_name"].tolist()
-        conn.close()
-    except Exception:
-        return []
-
-    return [
-        (t, report_counts.get(t, 0))
-        for t in sorted(all_tables)
-        if t not in PIPELINE_TABLES
-    ]
-
-
-def get_table_columns(pipeline_db: str, table: str) -> list[str]:
-    """Return column names for a table, excluding internal pipeline columns."""
-    conn = duckdb.connect(pipeline_db)
-    cols = conn.execute(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
-        [table],
-    ).df()["column_name"].tolist()
-    conn.close()
-    return [c for c in cols if not c.startswith("_")]
 
 
 def _suggest_pattern(filename: str) -> str:
@@ -490,8 +278,6 @@ def get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
         for name, param in sig.parameters.items()
         if name != "context" and name not in df_params
     }
-
-
 
 
 # ---------------------------------------------------------------------------

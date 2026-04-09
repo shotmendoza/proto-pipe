@@ -12,13 +12,12 @@ import questionary
 from proto_pipe.cli.scaffold import (
     _scan_incoming,
     get_original_func,
-    get_unconfigured_tables,
-    get_all_source_tables,
     build_rich_sql_scaffold,
     _scan_macros,
     filter_unconfigured,
     _group_files_by_pattern,
 )
+from proto_pipe.io.db import get_unconfigured_tables, get_all_source_tables
 from proto_pipe.io.config import load_config, write_config, load_settings, config_path_or_override
 from proto_pipe.cli.prompts import SourceConfigPrompter
 from proto_pipe.constants import DEFAULT_SETTINGS_PATH

@@ -432,9 +432,9 @@ def _make_scalar_param_check():
 @contextlib.contextmanager
 def _fill_params_stubs(table_cols, registry_types_result):
     """Stubs for the DB-touching helpers called inside _fill_params."""
-    with patch("proto_pipe.cli.scaffold.get_table_columns", return_value=table_cols), \
-         patch("proto_pipe.cli.scaffold.get_param_suggestions", return_value=[]), \
-         patch("proto_pipe.cli.scaffold.record_param_history"), \
+    with patch("proto_pipe.io.db.get_table_columns", return_value=table_cols), \
+         patch("proto_pipe.io.db.get_param_suggestions", return_value=[]), \
+         patch("proto_pipe.io.db.record_param_history"), \
          patch("proto_pipe.io.db.get_registry_types", return_value=registry_types_result), \
          patch("proto_pipe.cli.prompts.click.echo"):
         yield

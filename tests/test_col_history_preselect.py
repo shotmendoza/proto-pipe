@@ -52,11 +52,11 @@ def _make_prompter_multi(registry):
 def _fill_params_stubs(table_cols, registry_types_result, col_history=None):
     """Stubs for DB-touching helpers. col_history controls what
     get_column_param_history returns (default: empty list)."""
-    with patch("proto_pipe.cli.scaffold.get_table_columns", return_value=table_cols), \
-         patch("proto_pipe.cli.scaffold.get_param_suggestions", return_value=[]), \
-         patch("proto_pipe.cli.scaffold.get_column_param_history",
+    with patch("proto_pipe.io.db.get_table_columns", return_value=table_cols), \
+         patch("proto_pipe.io.db.get_param_suggestions", return_value=[]), \
+         patch("proto_pipe.io.db.get_column_param_history",
                return_value=col_history or []), \
-         patch("proto_pipe.cli.scaffold.record_param_history"), \
+         patch("proto_pipe.io.db.record_param_history"), \
          patch("proto_pipe.io.db.get_registry_types", return_value=registry_types_result), \
          patch("proto_pipe.cli.prompts.click.echo"):
         yield
@@ -70,7 +70,7 @@ class TestGetColumnParamHistory:
 
     def test_returns_raw_values_ordered_by_recency(self):
         """Raw historical values returned without similarity filtering."""
-        from proto_pipe.cli.scaffold import get_column_param_history
+        from proto_pipe.io.db import get_column_param_history
 
         conn = MagicMock()
         conn.execute.return_value.fetchall.return_value = [
@@ -87,7 +87,7 @@ class TestGetColumnParamHistory:
 
     def test_returns_empty_on_db_error(self):
         """Falls back to empty list when check_params_history doesn't exist."""
-        from proto_pipe.cli.scaffold import get_column_param_history
+        from proto_pipe.io.db import get_column_param_history
 
         conn = MagicMock()
         conn.execute.side_effect = Exception("Table not found")
@@ -98,7 +98,7 @@ class TestGetColumnParamHistory:
 
     def test_filters_none_values(self):
         """None or empty param_value rows are excluded."""
-        from proto_pipe.cli.scaffold import get_column_param_history
+        from proto_pipe.io.db import get_column_param_history
 
         conn = MagicMock()
         conn.execute.return_value.fetchall.return_value = [

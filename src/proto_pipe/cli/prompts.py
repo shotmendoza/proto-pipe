@@ -615,7 +615,7 @@ class ReportConfigPrompter:
         Stores results in self.name, self.table, self.check_entries, self.alias_map.
         Returns True on completion, False if cancelled.
         """
-        from proto_pipe.cli.scaffold import get_table_columns
+        from proto_pipe.io.db import get_table_columns
 
         self.name = ""
         self.table = ""
@@ -904,15 +904,17 @@ class ReportConfigPrompter:
         """
         import inspect
         from proto_pipe.cli.scaffold import (
-            get_table_columns,
             get_original_func,
             get_check_params,
+            is_list_annotation,
+        )
+        from proto_pipe.io.db import (
+            get_table_columns,
             get_param_suggestions,
             get_column_param_history,
             record_param_history,
-            is_list_annotation,
+            get_registry_types,
         )
-        from proto_pipe.io.db import get_registry_types
 
         table_cols = sorted(get_table_columns(self._p_db, table))
         registry_types = get_registry_types(conn, columns=table_cols)
