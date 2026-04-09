@@ -94,6 +94,21 @@ class CheckRegistry:
             raise ValueError(f"No check registered under '{name}'")
         return self._checks[name].kind
 
+    def get_contract(self, name: str) -> "CheckContract":
+        """Return the full CheckContract for a registered name.
+
+        The contract carries the inspection flags set at registration time
+        (needs_dataframe, needs_series, is_scalar, is_legacy). Use this
+        instead of re-running CheckParamInspector at call time.
+
+        Callers must use this method — never access _checks directly.
+
+        :raises ValueError: if name is not registered
+        """
+        if name not in self._checks:
+            raise ValueError(f"No check registered under '{name}'")
+        return self._checks[name]
+
     def failed(self) -> dict[str, str]:
         """Return {name: failure_reason} for all checks that failed registration.
 
@@ -253,14 +268,32 @@ class CheckContract:
     CheckRegistry stores and communicates through CheckContract objects —
     anything in the registry has been signed off by CheckParamInspector.
 
+    Inspection results are stored here once at registration time so the runner
+    never needs to re-inspect a function. Use CheckRegistry.get_contract(name)
+    to access these flags — never access _checks directly.
+
     Attributes:
-        func: The callable. For kind='check', already wrapped with
-              wrap_series_check so it returns CheckResult.
-        kind: 'check' or 'transform'.
+        func:             The callable. For kind='check', wrapped with
+                          wrap_series_check so it returns CheckResult.
+        kind:             'check' or 'transform'.
+        needs_dataframe:  True if the function has a pd.DataFrame param.
+                          Requires a pandas roundtrip — pending_df must be loaded.
+        needs_series:     True if the function has pd.Series param(s) and no
+                          pd.DataFrame param. Can extract columns from DuckDB.
+        is_scalar:        True if the function has no pd.Series or pd.DataFrame
+                          params and no legacy context param. Per-row apply via
+                          pandas or DuckDB UDF.
+        is_legacy:        True if the function uses context: dict or a positional
+                          context param (legacy calling convention). Always routed
+                          to the pandas path — requires context["df"].
     """
 
     func: Callable
     kind: str = "check"
+    needs_dataframe: bool = False
+    needs_series: bool = False
+    is_scalar: bool = False
+    is_legacy: bool = False
 
 
 @dataclass
@@ -383,14 +416,46 @@ def _wrap_series_input(
 
     @functools.wraps(inner)
     def wrapper(context: dict):
+        # ── DuckDB-native path ─────────────────────────────────────────────
+        # Triggered when _compute_report determines no check needs a full
+        # pandas DataFrame. conn remains open (read_only=True) during execution.
+        if "conn" in context:
+            conn = context["conn"]
+            table = context["table"]
+            pending_pks = context["pending_pks"]
+            pk_col = context["pk_col"]
+
+            call_kwargs = dict(baked_keywords)
+            for param_name in series_params:
+                col_name = baked_keywords.get(param_name)
+                if col_name is None:
+                    raise ValueError(
+                        f"Series param '{param_name}' has no column name baked in partial. "
+                        f"Ensure alias_map is configured for this function in reports_config.yaml."
+                    )
+                if pk_col and pending_pks:
+                    placeholders = ", ".join("?" * len(pending_pks))
+                    col_df = conn.execute(
+                        f'SELECT "{col_name}" FROM "{table}"'
+                        f' WHERE CAST("{pk_col}" AS VARCHAR) IN ({placeholders})',
+                        list(pending_pks),
+                    ).df()
+                else:
+                    col_df = conn.execute(f'SELECT "{col_name}" FROM "{table}"').df()
+                if col_name not in col_df.columns:
+                    raise ValueError(
+                        f"Series param '{param_name}' maps to column '{col_name}' "
+                        f"which is not in the table."
+                    )
+                call_kwargs[param_name] = col_df[col_name]
+            return inner(**call_kwargs)
+
+        # ── Pandas path ────────────────────────────────────────────────────
         df: "pd.DataFrame" = context["df"]
         user_cols = [c for c in df.columns if not c.startswith("_")]
         clean_df = df[user_cols]
 
-        # Build the full kwargs dict starting from all baked constants
         call_kwargs = dict(baked_keywords)
-
-        # Replace each Series param's baked string with the actual column data
         for param_name in series_params:
             col_name = baked_keywords.get(param_name)
             if col_name is None:
@@ -405,11 +470,6 @@ def _wrap_series_input(
                     f"Available columns: {list(clean_df.columns)}"
                 )
             call_kwargs[param_name] = clean_df[col_name]
-
-        # Call the inner (unwrapped) function directly — not the partial.
-        # The partial's baked strings have already been replaced with Series
-        # in call_kwargs, so calling the partial would cause "multiple values"
-        # for the Series params. Calling inner with the full kwargs avoids this.
         return inner(**call_kwargs)
 
     return wrapper
@@ -444,15 +504,68 @@ def _wrap_scalar_column_input(func: "Callable") -> "Callable":
 
     @functools.wraps(inner)
     def wrapper(context: dict):
+        # ── DuckDB-native path ─────────────────────────────────────────────
+        if "conn" in context:
+            conn = context["conn"]
+            table = context["table"]
+            pending_pks = context["pending_pks"]
+            pk_col = context["pk_col"]
+            available_cols = context.get("all_columns", [])
+
+            col_backed: dict[str, str] = {}
+            constants: dict = {}
+            for param_name, val in baked_keywords.items():
+                if isinstance(val, str) and val in available_cols:
+                    col_backed[param_name] = val
+                else:
+                    constants[param_name] = val
+
+            if not col_backed:
+                return inner(**constants)
+
+            placeholders = ", ".join("?" * len(pending_pks)) if pk_col and pending_pks else None
+
+            if len(col_backed) == 1:
+                param_name, col_name = next(iter(col_backed.items()))
+                if placeholders and pk_col:
+                    col_df = conn.execute(
+                        f'SELECT "{col_name}" FROM "{table}"'
+                        f' WHERE CAST("{pk_col}" AS VARCHAR) IN ({placeholders})',
+                        list(pending_pks),
+                    ).df()
+                else:
+                    col_df = conn.execute(f'SELECT "{col_name}" FROM "{table}"').df()
+                result = col_df[col_name].apply(
+                    lambda val: inner(**{param_name: val}, **constants)
+                )
+                result.name = col_name
+                return result
+
+            # Multiple col-backed params — load all needed columns, apply row-wise
+            needed_cols = list({col for col in col_backed.values()})
+            col_list = ", ".join(f'"{c}"' for c in needed_cols)
+            if placeholders and pk_col:
+                subset_df = conn.execute(
+                    f'SELECT {col_list} FROM "{table}"'
+                    f' WHERE CAST("{pk_col}" AS VARCHAR) IN ({placeholders})',
+                    list(pending_pks),
+                ).df()
+            else:
+                subset_df = conn.execute(f'SELECT {col_list} FROM "{table}"').df()
+
+            def apply_row_duckdb(row):
+                row_kwargs = {p: row[col] for p, col in col_backed.items()}
+                row_kwargs.update(constants)
+                return inner(**row_kwargs)
+
+            return subset_df.apply(apply_row_duckdb, axis=1)
+
+        # ── Pandas path ────────────────────────────────────────────────────
         df: "pd.DataFrame" = context["df"]
         user_cols = [c for c in df.columns if not c.startswith("_")]
         clean_df = df[user_cols]
 
-        # Separate col-backed params (baked string value exists as a column)
-        # from broadcast constants (all other baked values).
-        # Col-backed detection is deferred to call time so the same registered
-        # function works correctly across different reports/tables.
-        col_backed: dict[str, str] = {}  # {param_name: col_name}
+        col_backed: dict[str, str] = {}
         constants: dict = {}
         for param_name, val in baked_keywords.items():
             if isinstance(val, str) and val in clean_df.columns:
@@ -461,13 +574,9 @@ def _wrap_scalar_column_input(func: "Callable") -> "Callable":
                 constants[param_name] = val
 
         if not col_backed:
-            # No col-backed params — all constants. Call once, no per-row apply.
             return inner(**constants)
 
         if len(col_backed) == 1:
-            # Single col-backed param — Series.apply is most efficient.
-            # Set result.name to the column name so transform write-back routing
-            # in _apply_transforms_with_gate can identify which column to update.
             param_name, col_name = next(iter(col_backed.items()))
             result = clean_df[col_name].apply(
                 lambda val: inner(**{param_name: val}, **constants)
@@ -475,9 +584,6 @@ def _wrap_scalar_column_input(func: "Callable") -> "Callable":
             result.name = col_name
             return result
 
-        # Multiple col-backed params — apply row-wise across needed columns.
-        # result.name is not set — transform write-back requires _output in
-        # alias_map or explicit column naming by the user.
         needed_cols = list({col for col in col_backed.values()})
         subset = clean_df[needed_cols]
 
@@ -548,7 +654,7 @@ def validate_check(
 
         df_wrapped = _wrap_dataframe_input(func, df_param, kind)
         wrapped_func = wrap_series_check(df_wrapped) if kind == "check" else df_wrapped
-        return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, needs_dataframe=True))
 
     # ── Series-input path ────────────────────────────────────────────────────
     # Functions with pd.Series params and no pd.DataFrame param.
@@ -573,7 +679,7 @@ def validate_check(
 
         series_wrapped = _wrap_series_input(func, series_param_names)
         wrapped_func = wrap_series_check(series_wrapped) if kind == "check" else series_wrapped
-        return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, needs_series=True))
 
     # ── Scalar column-backed path ─────────────────────────────────────────────
     # Functions with str/int/float/unannotated params, no pd.DataFrame,
@@ -620,7 +726,7 @@ def validate_check(
 
         scalar_wrapped = _wrap_scalar_column_input(func)
         wrapped_func = wrap_series_check(scalar_wrapped) if kind == "check" else scalar_wrapped
-        return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
+        return CheckAudit(CheckContract(func=wrapped_func, kind=kind, is_scalar=True))
     if inspector.empty_return_annotation():
         if kind == "check":
             reason = (
@@ -652,7 +758,7 @@ def validate_check(
         )
 
     wrapped_func = wrap_series_check(func) if kind == "check" else func
-    return CheckAudit(CheckContract(func=wrapped_func, kind=kind))
+    return CheckAudit(CheckContract(func=wrapped_func, kind=kind, is_legacy=True))
 
 
 class CheckParamInspector:

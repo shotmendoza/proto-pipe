@@ -59,7 +59,7 @@ class ReportBundle:
     # Report table management
     target_table: str | None = None
     source_table: str | None = None
-    source_df: pd.DataFrame | None = None   # full source — used for CREATE on first run
+    row_count: int = 0               # total rows in source table — for display only
     modified_df: pd.DataFrame | None = None  # pending records post-transform
     first_run: bool = False
     pending_pks: set = field(default_factory=set)
@@ -166,7 +166,7 @@ def _build_execution_layers(reports: list[dict]) -> list[list[dict]]:
 def _apply_transforms_with_gate(
     transform_names: list[str],
     check_registry: CheckRegistry,
-    df: pd.DataFrame,
+    context: dict,
     target_table: str,
     report_name: str,
     pk_col: str | None,
@@ -179,41 +179,64 @@ def _apply_transforms_with_gate(
     persist. This allows the compute phase to run in parallel across reports
     without contending on the DuckDB file lock.
 
-    For each transform:
-      - Scalar transform (no pd.Series/pd.DataFrame params) → DuckDB Python UDF
-        against an in-memory DB; falls back to pandas on UDF failure.
-      - Series/DataFrame transform → pandas execution → TRY_CAST gate via an
-        in-memory DuckDB connection → bad rows accumulated as FlagRecords.
+    Accepts either a pandas context {"df": pending_df} or a DuckDB context
+    {"conn": conn, "table": ..., "pending_pks": ..., "pk_col": ..., "all_columns": ...}.
+    For the DuckDB path, pending rows are loaded lazily only when a transform
+    needs them (Series/DataFrame transforms require pandas; scalar transforms
+    stay in DuckDB via UDF).
 
-    TRY_CAST uses duckdb.connect(':memory:') — it only queries the in-memory
-    modified_df, so no file connection is needed.
+    Uses CheckRegistry.get_contract() to read inspection flags set at
+    registration time — never re-runs CheckParamInspector at call time.
 
-    :return: (modified_df, flag_records) — modified_df is the pending records
-             DataFrame with all transforms applied; flag_records is the list of
-             TRY_CAST failures to write to validation_block.
+    TRY_CAST uses duckdb.connect(':memory:') — no file connection needed.
+
+    :return: (modified_df, flag_records)
     """
     from proto_pipe.pipelines.flagging import FlagRecord
     from proto_pipe.io.db import flag_id_for
 
     accumulated_flags: list[FlagRecord] = []
 
+    # Resolve working DataFrame for transforms that need pandas.
+    # On pandas path: already have df. On DuckDB path: load lazily on first need.
+    _df: pd.DataFrame | None = context.get("df")
+
+    def _get_df() -> pd.DataFrame:
+        """Load pending rows from DuckDB on first pandas-requiring transform."""
+        nonlocal _df
+        if _df is not None:
+            return _df
+        conn = context["conn"]
+        table = context["table"]
+        pending_pks = context["pending_pks"]
+        _pk_col = context["pk_col"]
+        if _pk_col and pending_pks:
+            placeholders = ", ".join("?" * len(pending_pks))
+            _df = conn.execute(
+                f'SELECT * FROM "{table}"'
+                f' WHERE CAST("{_pk_col}" AS VARCHAR) IN ({placeholders})',
+                list(pending_pks),
+            ).df()
+        else:
+            _df = conn.execute(f'SELECT * FROM "{table}"').df()
+        return _df
+
     for name in transform_names:
         try:
             func = check_registry.get(name)
-            inspector = CheckParamInspector(func) if func else None
+            # Use stored contract flags — never re-run CheckParamInspector.
+            # is_scalar: no Series/DataFrame params → DuckDB UDF path.
+            # needs_dataframe or needs_series: requires pandas execution.
+            contract = check_registry.get_contract(name)
+            is_scalar_transform = contract.is_scalar
 
-            # Route: scalar (no Series/DataFrame params) vs Series/DataFrame
-            is_scalar = (
-                inspector is not None
-                and not inspector.column_params()
-                and not inspector.dataframe_params()
-            )
-
-            if is_scalar:
+            if is_scalar_transform:
+                df = _get_df()
                 try:
                     df = _apply_scalar_transform_duckdb(
                         name, func, df, registry_types, alias_map=alias_map,
                     )
+                    _df = df  # keep _df in sync after mutation
                     continue
                 except Exception as udf_exc:
                     print(
@@ -221,7 +244,11 @@ def _apply_transforms_with_gate(
                         f"— falling back to pandas"
                     )
 
-            # Pandas execution path
+            # Pandas execution path — pass context directly to wrappers.
+            # Series/scalar wrappers handle both pandas and DuckDB context.
+            # DataFrame wrappers always receive pandas context (needs_dataframe
+            # forces the pandas path in _compute_report).
+            df = _get_df()
             result = check_registry.run(name, {"df": df})
 
             if isinstance(result, pd.DataFrame):
@@ -273,7 +300,7 @@ def _apply_transforms_with_gate(
                             continue
 
                         for row in failing.itertuples(index=False, name=None):
-                            pk_str = str(row[0])  # pk_val column
+                            pk_str = str(row[0])
                             blocked_pks.add(pk_str)
                             accumulated_flags.append(FlagRecord(
                                 id=flag_id_for(pk_str),
@@ -303,6 +330,7 @@ def _apply_transforms_with_gate(
                 continue
 
             df = modified_df  # carry forward for subsequent transforms
+            _df = df          # keep _df in sync so _get_df() returns updated df
 
         except Exception as e:
             print(f"  [transform-fail] '{name}': {e} — skipped, table unchanged")
@@ -310,7 +338,7 @@ def _apply_transforms_with_gate(
     print(
         f"  [transform] {len(transform_names)} transform(s) applied to '{target_table}'"
     )
-    return df, accumulated_flags
+    return _get_df(), accumulated_flags
 
 
 def _annotation_to_duckdb(ann) -> type:
@@ -613,6 +641,10 @@ def _compute_report(
     # makes Phase 1 parallel execution safe — all _compute_report calls are
     # reading, never writing.
     conn = duckdb.connect(pipeline_db, read_only=True)
+    # Flag: True only when the DuckDB-native path keeps conn open for check
+    # execution. Initialized before the try block so the finally clause can
+    # always read it — even when an early return fires inside the try.
+    _keep_conn_for_checks = False
     try:
         # 1. Compute check_set_hash
         check_entries = report_config.get("checks", [])
@@ -627,37 +659,41 @@ def _compute_report(
             )
             full_revalidation = True
 
-        # 3. Load full source table
+        # 3. Schema + row count — no full pandas load yet.
+        #    LIMIT 0: column names without transferring any rows.
+        #    count(*): scalar — confirms table is non-empty.
         try:
-            source_df = conn.execute(f'SELECT * FROM "{source_table}"').df()
+            schema_df = conn.execute(f'SELECT * FROM "{source_table}" LIMIT 0').df()
+            all_columns = list(schema_df.columns)
+            row_count = conn.execute(
+                f'SELECT count(*) FROM "{source_table}"'
+            ).fetchone()[0]
         except Exception as e:
             return ReportBundle(report_name=report_name, status="error", error=str(e))
 
-        if source_df.empty:
+        if row_count == 0:
             return ReportBundle(report_name=report_name, status="skipped")
 
-        # 4. Identify pending records via validation_pass
+        # 4. Identify pending records via validation_pass.
+        #    Hashes computed directly against source table — 1 SQL query
+        #    replaces N Python hash calls (same invariant as ingest.py).
         comparable_cols = [
-            c for c in source_df.columns
+            c for c in all_columns
             if not c.startswith("_") and c != pk_col
         ]
 
-        if pk_col and pk_col in source_df.columns:
-            # Compute all hashes in one DuckDB query — same performance invariant
-            # as ingest.py: N Python hash calls → 1 SQL query. compute_row_hash_sql
-            # produces the same md5 as the Python compute_row_hash function.
-            # Guard: empty comparable_cols → fall back to md5('') per CLAUDE.md.
+        if pk_col and pk_col in all_columns:
             hash_expr = (
                 compute_row_hash_sql(comparable_cols) if comparable_cols else "md5('')"
             )
             hash_df = conn.execute(f"""
                 SELECT CAST("{pk_col}" AS VARCHAR) AS pk_value,
                        {hash_expr} AS row_hash
-                FROM source_df
+                FROM "{source_table}"
             """).df()
             incoming = dict(zip(hash_df["pk_value"], hash_df["row_hash"]))
         else:
-            incoming = {str(i): "" for i in range(len(source_df))}
+            incoming = {str(i): "" for i in range(row_count)}
 
         if full_revalidation:
             pending_pks = set(incoming.keys())
@@ -674,100 +710,161 @@ def _compute_report(
             print(f"  [skip] '{report_name}' — no pending records")
             return ReportBundle(report_name=report_name, status="skipped")
 
-        # 5. Get pending records df
-        if pk_col and pk_col in source_df.columns:
-            pending_df = source_df[
-                source_df[pk_col].astype(str).isin(pending_pks)
-            ].copy()
-        else:
-            pending_df = source_df.copy()
-
         first_run = not table_exists(conn, target_table)
 
         # 6. Read registry_types for TRY_CAST gate (read-only)
-        registry_types = get_registry_types(conn, list(pending_df.columns))
+        registry_types = get_registry_types(conn, all_columns)
+
+        # 7. Determine execution path from contract flags — inspect once at
+        #    registration, read here. If any check or transform needs a full
+        #    pandas DataFrame, or uses the legacy context: dict convention,
+        #    load pending rows to pandas and close the connection early.
+        #    Otherwise keep conn open and pass a DuckDB context to wrappers —
+        #    they extract only the columns they need, per check.
+        all_names = report_config.get("resolved_checks", [])
+        needs_pandas = any(
+            check_registry.get_contract(n).needs_dataframe
+            or check_registry.get_contract(n).is_legacy
+            for n in all_names
+        )
+
+        if needs_pandas:
+            # Pandas path: load only pending rows, then close connection.
+            if pk_col and pk_col in all_columns:
+                placeholders = ", ".join("?" * len(pending_pks))
+                pending_df: pd.DataFrame | None = conn.execute(
+                    f'SELECT * FROM "{source_table}"'
+                    f' WHERE CAST("{pk_col}" AS VARCHAR) IN ({placeholders})',
+                    list(pending_pks),
+                ).df()
+            else:
+                pending_df = conn.execute(f'SELECT * FROM "{source_table}"').df()
+            conn.close()
+            conn = None
+            context = {"df": pending_df}
+        else:
+            # DuckDB-native path: keep conn open during check execution.
+            # Wrappers extract only the column(s) they need per check via
+            # targeted SELECT ... WHERE pk IN (...) queries.
+            _keep_conn_for_checks = True
+            pending_df = None
+            context = {
+                "conn": conn,
+                "table": source_table,
+                "pending_pks": pending_pks,
+                "pk_col": pk_col,
+                "all_columns": all_columns,
+            }
 
     finally:
-        conn.close()
+        # Close conn on early returns (error/skip/empty) and on the pandas path
+        # (pandas path already set conn=None, so this is a no-op for it).
+        # DuckDB-native path: _keep_conn_for_checks=True → leave open for checks.
+        if conn is not None and not _keep_conn_for_checks:
+            conn.close()
 
     print(
         f"  [{report_name}] {len(pending_pks)} pending record(s) of "
-        f"{len(source_df)} total"
+        f"{row_count} total"
     )
 
-    # 7. Run checks against pending records — all in memory
-    all_names = report_config.get("resolved_checks", [])
-    check_names = [n for n in all_names if check_registry.get_kind(n) == "check"]
-    transform_names = [
-        n for n in all_names if check_registry.get_kind(n) == "transform"
-    ]
+    try:
+        # 8. Run checks — wrappers handle context type transparently.
+        check_names = [n for n in all_names if check_registry.get_kind(n) == "check"]
+        transform_names = [
+            n for n in all_names if check_registry.get_kind(n) == "transform"
+        ]
 
-    context = {"df": pending_df}
-    results: dict[str, dict] = {}
-    accumulated_flags: list[FlagRecord] = []
+        results: dict[str, dict] = {}
+        accumulated_flags: list[FlagRecord] = []
 
-    for check_name in check_names:
-        try:
-            result = check_registry.run(check_name, context)
-            if isinstance(result, _CheckResult):
-                failing_mask = result.mask
-                failing_count = int(failing_mask.sum()) if failing_mask is not None else 0
-            elif isinstance(result, pd.Series) and result.dtype == bool:
-                failing_mask = ~result
-                failing_count = int(failing_mask.sum())
-            else:
-                failing_mask = None
-                failing_count = 0
+        for check_name in check_names:
+            try:
+                result = check_registry.run(check_name, context)
+                if isinstance(result, _CheckResult):
+                    failing_mask = result.mask
+                    failing_count = int(failing_mask.sum()) if failing_mask is not None else 0
+                elif isinstance(result, pd.Series) and result.dtype == bool:
+                    failing_mask = ~result
+                    failing_count = int(failing_mask.sum())
+                else:
+                    failing_mask = None
+                    failing_count = 0
 
-            if failing_count > 0 and failing_mask is not None:
-                failing_df = pending_df[failing_mask]
-                pk_idx = (
-                    list(failing_df.columns).index(pk_col)
-                    if pk_col and pk_col in failing_df.columns
-                    else None
-                )
-                for row in failing_df.itertuples(index=False, name=None):
-                    pk_val = str(row[pk_idx]) if pk_idx is not None else None
-                    accumulated_flags.append(FlagRecord(
-                        id=flag_id_for(pk_val),
-                        table_name=target_table,
-                        report_name=report_name,
-                        check_name=check_name,
-                        pk_value=pk_val,
-                        reason=f"Check '{check_name}' failed",
-                    ))
-                print(
-                    f"  [check] '{check_name}' — "
-                    f"{failing_count} failure(s) → validation_block"
-                )
+                if failing_count > 0 and failing_mask is not None:
+                    # Build failing rows for flag accumulation.
+                    # Pandas path: filter pending_df by mask.
+                    # DuckDB path: load failing PKs from the result Series index.
+                    if pending_df is not None:
+                        failing_df = pending_df[failing_mask]
+                        pk_idx = (
+                            list(failing_df.columns).index(pk_col)
+                            if pk_col and pk_col in failing_df.columns
+                            else None
+                        )
+                        for row in failing_df.itertuples(index=False, name=None):
+                            pk_val = str(row[pk_idx]) if pk_idx is not None else None
+                            accumulated_flags.append(FlagRecord(
+                                id=flag_id_for(pk_val),
+                                table_name=target_table,
+                                report_name=report_name,
+                                check_name=check_name,
+                                pk_value=pk_val,
+                                reason=f"Check '{check_name}' failed",
+                            ))
+                    else:
+                        # DuckDB path: the result Series index corresponds to
+                        # the order returned by the DuckDB query (pk IN filter).
+                        # Reconstruct failing PKs from pending_pks order.
+                        pk_list = list(pending_pks)
+                        for i, failed in enumerate(failing_mask):
+                            if failed and i < len(pk_list):
+                                pk_val = pk_list[i]
+                                accumulated_flags.append(FlagRecord(
+                                    id=flag_id_for(pk_val),
+                                    table_name=target_table,
+                                    report_name=report_name,
+                                    check_name=check_name,
+                                    pk_value=pk_val,
+                                    reason=f"Check '{check_name}' failed",
+                                ))
+                    print(
+                        f"  [check] '{check_name}' — "
+                        f"{failing_count} failure(s) → validation_block"
+                    )
 
-            results[check_name] = {
-                "status": "failed" if failing_count > 0 else "passed",
-                "result": result if isinstance(result, _CheckResult) else None,
-                "failed_count": failing_count,
-            }
+                results[check_name] = {
+                    "status": "failed" if failing_count > 0 else "passed",
+                    "result": result if isinstance(result, _CheckResult) else None,
+                    "failed_count": failing_count,
+                }
 
-        except Exception as e:
-            print(f"  [check-fail] '{check_name}': {e}")
-            results[check_name] = {"status": "error", "error": str(e)}
+            except Exception as e:
+                print(f"  [check-fail] '{check_name}': {e}")
+                results[check_name] = {"status": "error", "error": str(e)}
 
-    # 8. Apply transforms — returns (modified_df, transform_flag_records)
-    modified_df = pending_df
-    if transform_names:
-        modified_df, transform_flags = _apply_transforms_with_gate(
-            transform_names=transform_names,
-            check_registry=check_registry,
-            df=pending_df,
-            target_table=target_table,
-            report_name=report_name,
-            pk_col=pk_col,
-            registry_types=registry_types,
-            alias_map=alias_map,
-        )
-        accumulated_flags.extend(transform_flags)
+        # 9. Apply transforms — context carries either {"df": ...} or DuckDB
+        #    context. _apply_transforms_with_gate resolves df lazily if needed.
+        modified_df = pending_df  # None on DuckDB path until transforms load it
+        if transform_names:
+            modified_df, transform_flags = _apply_transforms_with_gate(
+                transform_names=transform_names,
+                check_registry=check_registry,
+                context=context,
+                target_table=target_table,
+                report_name=report_name,
+                pk_col=pk_col,
+                registry_types=registry_types,
+                alias_map=alias_map,
+            )
+            accumulated_flags.extend(transform_flags)
 
-    # 9. Compute validation_pass entries in memory
-    # Per-record status derived from accumulated flags — no DB query needed.
+    finally:
+        # Close DuckDB-native connection now that checks are complete.
+        if conn is not None:
+            conn.close()
+
+    # 10. Compute validation_pass entries in memory.
     all_passed = all(v.get("status") == "passed" for v in results.values())
     flagged_pks = {fr.pk_value for fr in accumulated_flags if fr.pk_value}
     pass_entries = []
@@ -789,7 +886,6 @@ def _compute_report(
         results=results,
         target_table=target_table,
         source_table=source_table,
-        source_df=source_df,
         modified_df=modified_df,
         first_run=first_run,
         pending_pks=pending_pks,
@@ -797,7 +893,7 @@ def _compute_report(
         flag_records=accumulated_flags,
         pass_entries=pass_entries,
         all_passed=all_passed,
-        timestamp_col=ts_col if ts_col in source_df.columns else None,
+        timestamp_col=ts_col if ts_col in all_columns else None,
         current_hash=current_hash,
     )
 
@@ -829,21 +925,18 @@ def _write_report(
             "error": bundle.error,
         }
 
-    source_df = bundle.source_df
+    source_table = bundle.source_table
     modified_df = bundle.modified_df
     pending_pks = bundle.pending_pks
     pk_col = bundle.pk_col
     target_table = bundle.target_table
-    source_table = bundle.source_table
 
     # Write report table
     if bundle.first_run:
-        # CREATE from full source (untransformed), then UPDATE pending rows with
-        # transform results. On first run pending_pks == all rows, so this covers
-        # the full table. _update_report_table is a no-op if no transforms ran
-        # (modified_df == pending_df with no changes).
-        conn.execute(f'CREATE TABLE "{target_table}" AS SELECT * FROM source_df')
-        print(f"  [ok] Created report table '{target_table}' ({len(source_df)} rows)")
+        # CREATE directly from source table in DuckDB — no Python DataFrame
+        # intermediate. source_df no longer stored in bundle.
+        conn.execute(f'CREATE TABLE "{target_table}" AS SELECT * FROM "{source_table}"')
+        print(f"  [ok] Created report table '{target_table}' ({bundle.row_count} rows)")
         if modified_df is not None and not modified_df.empty:
             _update_report_table(conn, target_table, modified_df, pk_col)
     else:
@@ -874,13 +967,16 @@ def _write_report(
             entry["pk_value"], entry["row_hash"], entry["check_set_hash"], entry["status"],
         )
 
-    # Advance watermark on full pass
-    if bundle.all_passed and bundle.timestamp_col and source_df is not None:
-        max_ts = source_df[bundle.timestamp_col].max()
-        if not isinstance(max_ts, datetime):
-            max_ts = datetime.fromisoformat(str(max_ts)).replace(tzinfo=timezone.utc)
-        with _watermark_lock:
-            watermark_store.set(bundle.report_name, max_ts)
+    # Advance watermark via DuckDB MAX — no pandas source_df needed.
+    if bundle.all_passed and bundle.timestamp_col and bundle.source_table:
+        max_ts_raw = conn.execute(
+            f'SELECT MAX("{bundle.timestamp_col}") FROM "{bundle.source_table}"'
+        ).fetchone()[0]
+        if max_ts_raw is not None:
+            if not isinstance(max_ts_raw, datetime):
+                max_ts_raw = datetime.fromisoformat(str(max_ts_raw)).replace(tzinfo=timezone.utc)
+            with _watermark_lock:
+                watermark_store.set(bundle.report_name, max_ts_raw)
 
     return {
         "report": bundle.report_name,

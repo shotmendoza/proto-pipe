@@ -196,7 +196,6 @@ class TestComputeReportError:
 
         bundle = _compute_report(config, cr, watermark_store, pipeline_db)
         assert bundle.status == "error"
-        assert bundle.source_df is None
         assert bundle.modified_df is None
         assert not bundle.flag_records
         assert not bundle.pass_entries
@@ -463,9 +462,9 @@ class TestUpdateReportTableFirstRunOnly:
     """CLAUDE.md gap 8: _update_report_table must be called on first run and
     never on subsequent runs.
 
-    First run: CREATE TABLE from source_df, then _update_report_table to apply
-    transforms. Subsequent run: DELETE + INSERT modified_df — transforms already
-    applied before write, no separate UPDATE needed.
+    First run: CREATE TABLE by copying the source table in DuckDB directly,
+    then _update_report_table to apply transforms. Subsequent run: DELETE +
+    INSERT modified_df — transforms already applied before write, no UPDATE needed.
     """
 
     def test_update_report_table_called_once_on_first_run(
@@ -474,13 +473,15 @@ class TestUpdateReportTableFirstRunOnly:
         """_update_report_table must be called exactly once when first_run=True."""
         _init_db(pipeline_db)
         conn = duckdb.connect(pipeline_db)
+        # Seed source table so _write_report can CREATE TABLE ... AS SELECT * FROM "sales"
+        conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
 
         bundle = ReportBundle(
             report_name="test",
             status="computed",
             target_table="sales_report",
             source_table="sales",
-            source_df=sales_df,
+            row_count=len(sales_df),
             modified_df=sales_df,
             first_run=True,
             pending_pks=set(sales_df["order_id"].astype(str)),
@@ -510,7 +511,6 @@ class TestUpdateReportTableFirstRunOnly:
             status="computed",
             target_table="sales_report",
             source_table="sales",
-            source_df=sales_df,
             modified_df=subsequent_row,
             first_run=False,
             pending_pks={str(sales_df.iloc[0]["order_id"])},
@@ -534,6 +534,8 @@ class TestUpdateReportTableFirstRunOnly:
         persisted correctly without a separate UPDATE step."""
         _init_db(pipeline_db)
         conn = duckdb.connect(pipeline_db)
+        # Seed source table so _write_report can CREATE TABLE ... AS SELECT * FROM "sales"
+        conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
 
         # First run — creates the report table from the full source
         first_bundle = ReportBundle(
@@ -541,7 +543,7 @@ class TestUpdateReportTableFirstRunOnly:
             status="computed",
             target_table="sales_report",
             source_table="sales",
-            source_df=sales_df,
+            row_count=len(sales_df),
             modified_df=sales_df,
             first_run=True,
             pending_pks=set(sales_df["order_id"].astype(str)),
@@ -558,7 +560,6 @@ class TestUpdateReportTableFirstRunOnly:
             status="computed",
             target_table="sales_report",
             source_table="sales",
-            source_df=sales_df,
             modified_df=changed,
             first_run=False,
             pending_pks={"ORD-001"},
