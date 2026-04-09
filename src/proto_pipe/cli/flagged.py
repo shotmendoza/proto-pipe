@@ -903,23 +903,30 @@ def validated_open(report, key, sources_config, pipeline_db):
 
 
 @validated_cmd.command("clear")
-@click.option("--report", required=True, help="Report name to clear failures for.")
+@click.option("--report", default=None, help="Report name to clear failures for. Omit to clear all reports.")
 @click.option("--check", default=None, help="Only clear failures for this check name.")
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 def validated_clear(report, check, yes, pipeline_db):
-    """Clear validation failures for a report without correcting them.
+    """Clear validation failures without correcting them.
+
+    Omit --report to clear all reports. Scope with --check to target
+    a specific check. Use --yes to skip the confirmation prompt.
 
     \b
     Examples:
+      vp validated clear
       vp validated clear --report van_report
       vp validated clear --report van_report --check null_check --yes
     """
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
-        count_query = "SELECT count(*) FROM validation_block WHERE report_name = ?"
-        count_params = [report]
+        count_query = "SELECT count(*) FROM validation_block WHERE 1=1"
+        count_params = []
+        if report:
+            count_query += " AND report_name = ?"
+            count_params.append(report)
         if check:
             count_query += " AND check_name = ?"
             count_params.append(check)
@@ -927,14 +934,16 @@ def validated_clear(report, check, yes, pipeline_db):
         count = conn.execute(count_query, count_params).fetchone()[0]
 
         if count == 0:
-            click.echo(f"  No validation failures to clear for '{report}'.")
+            scope_desc = f"'{report}'" if report else "all reports"
+            click.echo(f"  No validation failures to clear for {scope_desc}.")
             return
 
+        report_desc = f"'{report}'" if report else "all reports"
         scope = f"check '{check}'" if check else "all checks"
         if not yes:
             try:
                 click.confirm(
-                    f"Clear {count} failure(s) for '{report}' ({scope})? "
+                    f"Clear {count} failure(s) for {report_desc} ({scope})? "
                     f"This cannot be undone.",
                     abort=True,
                 )
@@ -942,14 +951,17 @@ def validated_clear(report, check, yes, pipeline_db):
                 click.echo("\n  Cancelled.")
                 return
 
-        del_query = "DELETE FROM validation_block WHERE report_name = ?"
-        del_params = [report]
+        del_query = "DELETE FROM validation_block WHERE 1=1"
+        del_params = []
+        if report:
+            del_query += " AND report_name = ?"
+            del_params.append(report)
         if check:
             del_query += " AND check_name = ?"
             del_params.append(check)
 
         conn.execute(del_query, del_params)
-        click.echo(f"[ok] {count} failure(s) cleared for '{report}' ({scope})")
+        click.echo(f"[ok] {count} failure(s) cleared for {report_desc} ({scope})")
     finally:
         conn.close()
 
