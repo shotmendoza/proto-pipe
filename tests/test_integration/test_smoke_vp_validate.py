@@ -434,7 +434,7 @@ class TestComputeReportContractGating:
         report = rr.get("sales_report")
 
         # Must complete without error — DuckDB path fires for Series checks
-        bundle = _compute_report(report, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(report, cr, pipeline_db)
         assert bundle.status == "computed", f"Expected computed, got {bundle.status}: {bundle.error}"
 
     def test_dataframe_check_takes_pandas_path(self, pipeline_db, watermark_store, sales_df):
@@ -467,7 +467,7 @@ class TestComputeReportContractGating:
         register_from_config(full_config, cr, rr)
         report = rr.get("sales_report")
 
-        bundle = _compute_report(report, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(report, cr, pipeline_db)
         assert bundle.status == "computed", f"Expected computed, got {bundle.status}: {bundle.error}"
 
     def test_legacy_check_takes_pandas_path(self, pipeline_db, watermark_store, sales_df):
@@ -500,7 +500,7 @@ class TestComputeReportContractGating:
         register_from_config(full_config, cr, rr)
         report = rr.get("sales_report")
 
-        bundle = _compute_report(report, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(report, cr, pipeline_db)
         assert bundle.status == "computed"
 
     def test_no_checks_takes_duckdb_path(self, pipeline_db, watermark_store, sales_df):
@@ -522,7 +522,7 @@ class TestComputeReportContractGating:
             "resolved_checks": [],
         }
 
-        bundle = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(config, cr, pipeline_db)
         assert bundle.status == "computed"
 
 
@@ -570,7 +570,7 @@ class TestApplyTransformsUsesContracts:
         report = rr.get("sales_report")
 
         # Must complete without error — contract routing works
-        bundle = _compute_report(report, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(report, cr, pipeline_db)
         assert bundle.status == "computed"
 
     def test_series_transform_contract_is_not_scalar(self):
@@ -636,7 +636,7 @@ class TestBulkColumnFetch:
             }],
         }, cr, rr)
 
-        bundle = _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+        bundle = _compute_report(rr.get("sales_report"), cr, pipeline_db)
         assert bundle.status == "computed"
 
     def test_col_cache_populated_with_needed_columns(self, pipeline_db, watermark_store, sales_df):
@@ -681,7 +681,7 @@ class TestBulkColumnFetch:
             }],
         }, cr, rr)
 
-        _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+        _compute_report(rr.get("sales_report"), cr, pipeline_db)
 
         assert "price" in received_cache, (
             "col_cache must contain 'price' — the Series param column for this check"
@@ -721,7 +721,7 @@ class TestBulkColumnFetch:
             }],
         }, cr, rr)
 
-        _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+        _compute_report(rr.get("sales_report"), cr, pipeline_db)
 
         expected = sorted(sales_df["price"].tolist())
         assert sorted(received_values.get("price", [])) == expected, (
@@ -779,7 +779,7 @@ class TestBulkColumnFetch:
             }],
         }, cr, rr)
 
-        _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+        _compute_report(rr.get("sales_report"), cr, pipeline_db)
 
         # inventory columns must not appear in cache for a sales report
         inventory_cols = set(inventory_df.columns)
@@ -944,7 +944,7 @@ class TestDisplayName:
         captured = io.StringIO()
         sys.stdout = captured
         try:
-            _compute_report(rr.get("sales_report"), cr, watermark_store, pipeline_db)
+            _compute_report(rr.get("sales_report"), cr, pipeline_db)
         finally:
             sys.stdout = sys.__stdout__
 

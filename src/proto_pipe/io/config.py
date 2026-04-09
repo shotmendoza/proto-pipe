@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ruamel.yaml import YAML
 
-from proto_pipe.constants import _DEFAULTS, DEFAULT_SETTINGS_PATH
+from proto_pipe.constants import DEFAULTS, DEFAULT_SETTINGS_PATH
 
 
 # TODO: Create an abstract class for the Config. Lot's of shared methods.
@@ -374,9 +374,9 @@ def load_settings(path: Path = DEFAULT_SETTINGS_PATH) -> dict:
     :rtype: dict
     """
     if not path.exists():
-        return copy.deepcopy(_DEFAULTS)
+        return copy.deepcopy(DEFAULTS)
     loaded = load_config(path)
-    merged = copy.deepcopy(_DEFAULTS)
+    merged = copy.deepcopy(DEFAULTS)
 
     # Merge paths sub-dict explicitly so defaults fill any missing keys
     merged["paths"].update(loaded.get("paths", {}))

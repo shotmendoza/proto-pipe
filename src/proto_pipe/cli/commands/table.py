@@ -11,7 +11,7 @@ from proto_pipe.constants import PIPELINE_TABLES
 from proto_pipe.io.db import get_all_tables
 
 
-def _get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
+def get_table_df(conn: duckdb.DuckDBPyConnection, table: str, limit: int):
     """Return a DataFrame for the given table."""
     return conn.execute(f'SELECT * FROM "{table}" LIMIT {limit}').df()
 

@@ -92,7 +92,7 @@ DUCKDB_TYPE_MAP: dict[str, type] = {
     "BOOLEAN":     bool,
     "BOOL":        bool,
 }
-_DEFAULTS = {
+DEFAULTS: dict = {
     "paths": {
         "sources_config": "config/sources_config.yaml",
         "reports_config": "config/reports_config.yaml",
@@ -108,7 +108,7 @@ _DEFAULTS = {
     "multi_select_params": True,
     "macros_dir": "macros",
 }
-VALID_PATH_KEYS = list(_DEFAULTS["paths"].keys())
+VALID_PATH_KEYS = list(DEFAULTS["paths"].keys())
 
 NULLABLE_EXTENSION_DTYPES = (
     pd.Int8Dtype,

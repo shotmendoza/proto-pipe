@@ -417,7 +417,7 @@ def edit_table(table_name, table, pipeline_db):
       vp edit table sales
       vp edit table --table sales
     """
-    from proto_pipe.cli.commands.table import _get_table_df, get_reviewer
+    from proto_pipe.cli.commands.table import get_table_df, get_reviewer
     from proto_pipe.io.config import SourceConfig, load_settings
     from proto_pipe.reports.corrections import import_corrections
     import tempfile
@@ -454,7 +454,7 @@ def edit_table(table_name, table, pipeline_db):
             )
             return
 
-        df = _get_table_df(conn, name, limit=500)
+        df = get_table_df(conn, name, limit=500)
         if df.empty:
             click.echo(f"'{name}' is empty.")
             return

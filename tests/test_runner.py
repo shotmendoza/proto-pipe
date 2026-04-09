@@ -217,7 +217,7 @@ class TestRunAllReports:
 
 import pytest
 
-from proto_pipe.reports.runner import _build_execution_layers, _get_target_table
+from proto_pipe.reports.runner import _build_execution_layers, get_target_table
 
 
 def _report(name: str, source_table: str, target_table: str | None = None) -> dict:

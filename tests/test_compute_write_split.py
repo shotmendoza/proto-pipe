@@ -129,7 +129,7 @@ class TestComputeReportSkipped:
         cr = CheckRegistry()
 
         # First run — computes and writes
-        bundle1 = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle1 = _compute_report(config, cr, pipeline_db)
         assert bundle1.status == "computed"
 
         write_conn = duckdb.connect(pipeline_db)
@@ -137,7 +137,7 @@ class TestComputeReportSkipped:
         write_conn.close()
 
         # Second run — all PKs already in validation_pass with matching hashes
-        bundle2 = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle2 = _compute_report(config, cr, pipeline_db)
         assert bundle2.status == "skipped", (
             "CLAUDE.md gap 8: _compute_report must return status='skipped' "
             "when all records are already in validation_pass"
@@ -152,12 +152,12 @@ class TestComputeReportSkipped:
         config = _make_report_config(pipeline_db, "sales", "order_id")
         cr = CheckRegistry()
 
-        bundle1 = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle1 = _compute_report(config, cr, pipeline_db)
         write_conn = duckdb.connect(pipeline_db)
         _write_report(write_conn, bundle1, watermark_store)
         write_conn.close()
 
-        bundle2 = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle2 = _compute_report(config, cr, pipeline_db)
         assert bundle2.status == "skipped"
         assert not bundle2.pending_pks, "Skipped bundle must have no pending_pks"
         assert not bundle2.flag_records, "Skipped bundle must have no flag_records"
@@ -180,7 +180,7 @@ class TestComputeReportError:
         config = _make_report_config(pipeline_db, "nonexistent_table", "id")
         cr = CheckRegistry()
 
-        bundle = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(config, cr, pipeline_db)
 
         assert bundle.status == "error", (
             "CLAUDE.md gap 8: _compute_report must return status='error' "
@@ -194,7 +194,7 @@ class TestComputeReportError:
         config = _make_report_config(pipeline_db, "nonexistent_table", "id")
         cr = CheckRegistry()
 
-        bundle = _compute_report(config, cr, watermark_store, pipeline_db)
+        bundle = _compute_report(config, cr, pipeline_db)
         assert bundle.status == "error"
         assert bundle.modified_df is None
         assert not bundle.flag_records
@@ -213,7 +213,7 @@ class TestComputeReportError:
         config = _make_report_config(pipeline_db, "sales", "order_id")
         cr = CheckRegistry()
 
-        _compute_report(config, cr, watermark_store, pipeline_db)
+        _compute_report(config, cr, pipeline_db)
 
         assert _count(pipeline_db, "validation_block") == 0, (
             "CLAUDE.md gap 8: compute phase must not write to validation_block — "

@@ -9,10 +9,10 @@ Validation flow (vp validate):
   6. Advance watermark only when all checks passed
 
 Parallel execution model:
-  _compute_report  — read-only, parallelisable. Opens short-lived read connection,
+  _compute_report — read-only, parallelisable. Opens short-lived read connection,
                      runs all checks/transforms in memory, returns ReportBundle.
-  _write_report    — sequential, shared connection. Persists ReportBundle to DuckDB.
-  run_all_reports  — Phase 1: parallel _compute_report per layer via ThreadPoolExecutor.
+  _write_report — sequential, shared connection. Persists ReportBundle to DuckDB.
+  run_all_reports — Phase 1: parallel _compute_report per layer via ThreadPoolExecutor.
                      Phase 2: sequential _write_report with one shared connection.
 
 Report table lifecycle:
@@ -31,13 +31,12 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-from proto_pipe.checks.runner import run_checks
 from proto_pipe.checks.result import CheckOutcome
 from proto_pipe.io.registry import resolve_filename, write_xlsx_sheet, write_csv
-from proto_pipe.pipelines.watermark import WatermarkStore, _watermark_lock
-from proto_pipe.checks.registry import CheckRegistry, ReportRegistry, CheckParamInspector
+from proto_pipe.pipelines.watermark import WatermarkStore, watermark_lock
+from proto_pipe.checks.registry import CheckRegistry, ReportRegistry
 from proto_pipe.constants import DUCKDB_TYPE_MAP
-from proto_pipe.pipelines.query import _log_run, init_report_runs_table
+from proto_pipe.pipelines.query import log_run, init_report_runs_table
 
 
 @dataclass
@@ -79,7 +78,7 @@ class ReportBundle:
 # Dependency inference helpers
 # ---------------------------------------------------------------------------
 
-def _get_target_table(report_config: dict) -> str:
+def get_target_table(report_config: dict) -> str:
     """Compute the output table name for a report config.
 
     Uses explicit target_table if set in config, otherwise defaults to
@@ -100,7 +99,7 @@ def _build_execution_layers(reports: list[dict]) -> list[list[dict]]:
     Dependency rule
     ---------------
     Report B depends on report A when B.source.table matches A's target_table.
-    target_table is resolved via _get_target_table: explicit config value first,
+    target_table is resolved via get_target_table: explicit config value first,
     falling back to '<source_table>_report'.
 
     Execution contract
@@ -118,7 +117,7 @@ def _build_execution_layers(reports: list[dict]) -> list[list[dict]]:
     name_to_report: dict[str, dict] = {r["name"]: r for r in reports}
 
     # Map each report's output table back to the report name that produces it.
-    target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in reports}
+    target_to_name: dict[str, str] = {get_target_table(r): r["name"] for r in reports}
 
     # Build directed edges: dependencies[B] = {A, ...} means B depends on A.
     dependencies: dict[str, set[str]] = {r["name"]: set() for r in reports}
@@ -290,7 +289,7 @@ def _apply_transforms_with_gate(
                 modified_df[col_name] = result.values
             else:
                 print(
-                    f"  [transform-warn] '{_resolve_display_name(name, check_registry)}' returned {type(result).__name__} "
+                    f"[transform-warn] '{_resolve_display_name(name, check_registry)}' returned {type(result).__name__}"
                     f"(expected DataFrame or Series) — skipped"
                 )
                 continue
@@ -321,7 +320,8 @@ def _apply_transforms_with_gate(
                                 WHERE TRY_CAST("{col}" AS {base_type}) IS NULL
                                 AND "{col}" IS NOT NULL
                             """).df()
-                        except Exception:
+                        except Exception as e:
+                            print(e)
                             continue
 
                         for row in failing.itertuples(index=False, name=None):
@@ -344,7 +344,7 @@ def _apply_transforms_with_gate(
 
                 if blocked_pks:
                     print(
-                        f"  [transform-warn] '{_resolve_display_name(name, check_registry)}' produced {len(blocked_pks)} "
+                        f"[transform-warn] '{_resolve_display_name(name, check_registry)}' produced {len(blocked_pks)}"
                         f"row(s) that failed TRY_CAST → validation_block"
                     )
                     modified_df = modified_df[
@@ -524,8 +524,8 @@ def _apply_scalar_transform_duckdb(
     finally:
         try:
             mem_conn.remove_function(udf_name)
-        except Exception:
-            pass
+        except Exception as e:
+            print(e)
         mem_conn.close()
 
 
@@ -586,7 +586,6 @@ def _update_report_table(
 def _compute_report(
     report_config: dict,
     check_registry: CheckRegistry,
-    watermark_store: WatermarkStore,
     pipeline_db: str,
     full_revalidation: bool = False,
 ) -> ReportBundle:
@@ -600,9 +599,7 @@ def _compute_report(
     """
     from proto_pipe.pipelines.flagging import (
         FlagRecord,
-        write_validation_flags,
         compute_check_set_hash,
-        compute_row_hash,
         compute_row_hash_sql,
     )
     from proto_pipe.io.db import (
@@ -948,7 +945,7 @@ def _write_report(
       - Watermark (advanced only when all_passed)
     """
     from proto_pipe.pipelines.flagging import write_validation_flags
-    from proto_pipe.io.db import bulk_upsert_validation_pass, table_exists
+    from proto_pipe.io.db import bulk_upsert_validation_pass
 
     if bundle.status in ("skipped", "error"):
         return {
@@ -1008,7 +1005,7 @@ def _write_report(
         if max_ts_raw is not None:
             if not isinstance(max_ts_raw, datetime):
                 max_ts_raw = datetime.fromisoformat(str(max_ts_raw)).replace(tzinfo=timezone.utc)
-            with _watermark_lock:
+            with watermark_lock:
                 watermark_store.set(bundle.report_name, max_ts_raw)
 
     return {
@@ -1030,8 +1027,6 @@ def run_report(
     pipeline_db is required. Used directly when a single report is run
     outside of run_all_reports (e.g. from tests or vp validate --table).
     """
-    report_name = report_config["name"]
-
     # Bootstrap pipeline tables before _compute_report reads validation_pass.
     # run_report is callable directly (e.g. from tests, vp validate --table)
     # without going through run_all_reports, so it cannot rely on the
@@ -1045,7 +1040,7 @@ def run_report(
         _boot.close()
 
     bundle = _compute_report(
-        report_config, check_registry, watermark_store, pipeline_db, full_revalidation
+        report_config, check_registry, pipeline_db, full_revalidation
     )
 
     conn = duckdb.connect(pipeline_db)
@@ -1058,12 +1053,12 @@ def run_report(
 # Deliverable runner — unchanged
 # ---------------------------------------------------------------------------
 
+
 def run_deliverable(
     deliverable: dict,
     report_dataframes: dict[str, pd.DataFrame],
     output_dir: str,
     pipeline_db_path: str,
-    cli_overrides: dict | None = None,
     run_date: str | None = None,
 ) -> list[str]:
     """Write output files for a deliverable and log each report run."""
@@ -1089,7 +1084,7 @@ def run_deliverable(
             sheet = report_cfg.get("sheet", report_name)
             df = report_dataframes.get(report_name, pd.DataFrame())
             sheets[sheet] = df
-            _log_run(
+            log_run(
                 conn, name, report_name, filename, str(out_dir),
                 report_cfg.get("filters"), len(df), fmt, run_date,
             )
@@ -1109,7 +1104,7 @@ def run_deliverable(
             df = report_dataframes.get(report_name, pd.DataFrame())
 
             write_csv(df, output_path)
-            _log_run(
+            log_run(
                 conn, name, report_name, filename, str(out_dir),
                 report_cfg.get("filters"), len(df), fmt, run_date,
             )
@@ -1173,7 +1168,7 @@ def run_all_reports(
     all_reports = report_registry.all()
     # Build dependency map from ALL reports — needed for upstream failure propagation
     # even when only a subset is being executed.
-    target_to_name: dict[str, str] = {_get_target_table(r): r["name"] for r in all_reports}
+    target_to_name: dict[str, str] = {get_target_table(r): r["name"] for r in all_reports}
     reports = (
         [r for r in all_reports if r["name"] in set(report_names)]
         if report_names is not None
@@ -1228,7 +1223,7 @@ def run_all_reports(
                 futures = {
                     executor.submit(
                         _compute_report,
-                        r, check_registry, watermark_store,
+                        r, check_registry,
                         pipeline_db, full_revalidation,
                     ): r["name"]
                     for r in runnable

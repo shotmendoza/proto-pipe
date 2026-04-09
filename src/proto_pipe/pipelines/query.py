@@ -127,7 +127,7 @@ def _merge_filters(base: dict, overrides: dict) -> None:
         base[filter_type].extend(overrides[filter_type])
 
 
-def _log_run(
+def log_run(
     conn,
         deliverable_name,
         report_name,

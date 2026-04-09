@@ -61,4 +61,4 @@ class WatermarkStore:
         return {row[0]: row[1] for row in rows}
 
 
-_watermark_lock = Lock()
+watermark_lock = Lock()

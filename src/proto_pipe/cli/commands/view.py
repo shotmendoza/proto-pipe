@@ -372,7 +372,7 @@ def view_lineage(
       vp view lineage --deliverable monthly_pack
     """
     from proto_pipe.io.config import SourceConfig, ReportConfig, DeliverableConfig
-    from proto_pipe.reports.runner import _get_target_table
+    from proto_pipe.reports.runner import get_target_table
 
     p_db = config_path_or_override("pipeline_db",         pipeline_db)
     src_cfg = config_path_or_override("sources_config",      sources_config)
@@ -433,7 +433,7 @@ def view_lineage(
     # ── Build graph ──────────────────────────────────────────────────────────
     # Map each report's output table → report name (for dependency inference)
     target_to_report: dict[str, str] = {
-        _get_target_table(r): r["name"] for r in all_reports
+        get_target_table(r): r["name"] for r in all_reports
     }
     # Map source table name → source config entry
     table_to_source: dict[str, dict] = {
