@@ -145,7 +145,7 @@ class TestCheckParamsHistoryWritePath:
         column param write path — they go through filled_params only."""
         from proto_pipe.checks.registry import CheckRegistry
 
-        def check_with_scalar(col: str, threshold: float) -> "pd.Series[bool]":
+        def check_with_scalar(col: pd.Series, threshold: float) -> "pd.Series[bool]":
             return pd.Series([True])
 
         reg = CheckRegistry()

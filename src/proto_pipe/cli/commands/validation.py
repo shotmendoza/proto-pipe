@@ -84,9 +84,11 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
         click.echo(f"\n  {r['report']} [{status}]")
         if status == "completed":
             for check_name, outcome in r["results"].items():
+                from proto_pipe.reports.runner import _display_name
+                display = _display_name(check_name, check_registry)
                 mark = "✓" if outcome["status"] == "passed" else "✗"
                 failed_count = outcome.get("failed_count", 0)
-                click.echo(f"{mark} {check_name}")
+                click.echo(f"{mark} {display}")
                 if outcome["status"] == "failed" and failed_count:
                     click.echo(
                         f"{failed_count} row(s) failed → validation_block"
