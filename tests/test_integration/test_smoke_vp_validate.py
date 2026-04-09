@@ -2,12 +2,12 @@
 
 Patching strategy per test_cli_commands.py convention:
   - config_path_or_override → command module namespace (module-level import)
-  - load_config             → command module namespace (module-level import)
-  - load_custom_checks      → proto_pipe.checks.helpers (lazy import inside fn)
-  - register_from_config    → proto_pipe.io.registry (lazy import inside fn)
-  - run_all_reports         → proto_pipe.reports.runner (lazy import inside fn)
-  - write_pipeline_events   → proto_pipe.io.db (lazy import inside fn)
-  - pipeline DB             → real temp DB initialized with pipeline tables
+  - load_config → command module namespace (module-level import)
+  - load_custom_checks → proto_pipe.checks.helpers (lazy import inside fn)
+  - register_from_config → proto_pipe.io.registry (lazy import inside fn)
+  - run_all_reports → proto_pipe.reports.runner (lazy import inside fn)
+  - write_pipeline_events → proto_pipe.io.db (lazy import inside fn)
+  - pipeline DB → real temp DB initialized with pipeline tables
 """
 from __future__ import annotations
 
@@ -155,3 +155,68 @@ class TestVpValidateSmoke:
             result = runner.invoke(validate)
         assert result.exit_code == 0, result.output
         assert "No validation failures" in result.output or "✓" in result.output
+
+    def test_validate_shows_function_name_not_uuid(self, tmp_path, pipeline_db, watermark_db):
+        """Check output shows human-readable function name, not UUID.
+
+        validation.py calls _display_name(check_name, check_registry) for each
+        check in results. The UUID key is the registered name; _display_name
+        resolves it to the original function __name__.
+        """
+        _init_db(pipeline_db)
+        rep_cfg = str(tmp_path / "reports_config.yaml")
+        runner = CliRunner()
+
+        fake_uuid = "2ebc92ed-123b-5563-afe1-7fd3e0f8b41b"
+        fake_results = [{"report": "sales_report", "status": "completed", "results": {
+            fake_uuid: {"status": "failed", "failed_count": 3},
+        }}]
+
+        with (
+            patch("proto_pipe.cli.commands.validation.config_path_or_override", side_effect=_cfg(pipeline_db, watermark_db, rep_cfg)),
+            patch("proto_pipe.cli.commands.validation.load_config", return_value=_EMPTY_CONFIG),
+            patch("proto_pipe.checks.helpers.load_custom_checks"),
+            patch("proto_pipe.io.registry.register_from_config"),
+            patch("proto_pipe.reports.runner.run_all_reports", return_value=fake_results),
+            patch("proto_pipe.io.db.write_pipeline_events"),
+            patch("proto_pipe.reports.runner._display_name", return_value="price_check"),
+        ):
+            result = runner.invoke(validate)
+
+        assert result.exit_code == 0, result.output
+        assert "price_check" in result.output, (
+            "Function name 'price_check' must appear in validation output"
+        )
+        assert fake_uuid not in result.output, (
+            "UUID must not appear in validation output — _display_name should replace it"
+        )
+        assert "3 row(s) failed" in result.output, (
+            "Failure count line must still appear alongside the function name"
+        )
+
+    def test_validate_passed_check_shows_function_name(self, tmp_path, pipeline_db, watermark_db):
+        """Passed checks also show function name with ✓ mark, not UUID."""
+        _init_db(pipeline_db)
+        rep_cfg = str(tmp_path / "reports_config.yaml")
+        runner = CliRunner()
+
+        fake_uuid = "2ebc92ed-123b-5563-afe1-7fd3e0f8b41b"
+        fake_results = [{"report": "sales_report", "status": "completed", "results": {
+            fake_uuid: {"status": "passed", "failed_count": 0},
+        }}]
+
+        with (
+            patch("proto_pipe.cli.commands.validation.config_path_or_override", side_effect=_cfg(pipeline_db, watermark_db, rep_cfg)),
+            patch("proto_pipe.cli.commands.validation.load_config", return_value=_EMPTY_CONFIG),
+            patch("proto_pipe.checks.helpers.load_custom_checks"),
+            patch("proto_pipe.io.registry.register_from_config"),
+            patch("proto_pipe.reports.runner.run_all_reports", return_value=fake_results),
+            patch("proto_pipe.io.db.write_pipeline_events"),
+            patch("proto_pipe.reports.runner._display_name", return_value="price_check"),
+        ):
+            result = runner.invoke(validate)
+
+        assert result.exit_code == 0, result.output
+        assert "price_check" in result.output
+        assert fake_uuid not in result.output
+        assert "✓" in result.output
