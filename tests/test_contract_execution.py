@@ -850,11 +850,14 @@ class TestMissingAliasMapError:
 
 
 # ---------------------------------------------------------------------------
-# Fix 3 — _display_name resolves function name from UUID
+# Fix 3 — display_name resolves function name from UUID
 # ---------------------------------------------------------------------------
 
 class TestDisplayName:
-    """_display_name returns human-readable function name instead of UUID.
+    """display_name returns human-readable function name instead of UUID.
+
+    display_name now lives in proto_pipe.cli.prompts (moved from runner)
+    per the module responsibility rule — display concerns belong in the CLI layer.
 
     Guarantees:
     - Returns __name__ of the original function
@@ -864,7 +867,7 @@ class TestDisplayName:
 
     def test_display_name_returns_function_name(self):
         """Registered check UUID resolves to the original function __name__."""
-        from proto_pipe.reports.runner import _display_name
+        from proto_pipe.cli.prompts import display_name
         from functools import partial
 
         reg = CheckRegistry()
@@ -875,34 +878,34 @@ class TestDisplayName:
         func = partial(my_price_check, price="price")
         reg.register("my_price_check", func, kind="check")
 
-        name = _display_name("my_price_check", reg)
+        name = display_name("my_price_check", reg)
         assert name == "my_price_check", (
             "_display_name must return the original function __name__, not the UUID"
         )
 
     def test_display_name_falls_back_to_uuid_for_unknown(self):
         """Unknown check name falls back to the UUID without raising."""
-        from proto_pipe.reports.runner import _display_name
+        from proto_pipe.cli.prompts import display_name
 
         reg = CheckRegistry()
         unknown_uuid = "2ebc92ed-123b-5563-afe1-7fd3e0f8b41b"
 
-        result = _display_name(unknown_uuid, reg)
+        result = display_name(unknown_uuid, reg)
         assert result == unknown_uuid, (
             "_display_name must return the UUID unchanged when check is not registered"
         )
 
     def test_display_name_never_raises(self):
         """_display_name is always safe to call regardless of registry state."""
-        from proto_pipe.reports.runner import _display_name
+        from proto_pipe.cli.prompts import display_name
 
         reg = CheckRegistry()
 
         # Should not raise for any input
         try:
-            _display_name("any-random-string", reg)
-            _display_name("", reg)
-            _display_name("2ebc92ed-123b-5563-afe1-7fd3e0f8b41b", reg)
+            display_name("any-random-string", reg)
+            display_name("", reg)
+            display_name("2ebc92ed-123b-5563-afe1-7fd3e0f8b41b", reg)
         except Exception as e:
             pytest.fail(f"_display_name raised unexpectedly: {e}")
 

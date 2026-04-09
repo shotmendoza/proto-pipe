@@ -1424,15 +1424,87 @@ class DeliverableConfigPrompter:
 
 
 # ---------------------------------------------------------------------------
-# IngestProgressReporter — rich spinner for vp ingest
+def display_name(check_name: str, check_registry) -> str:
+    """Resolve a check UUID to the original function __name__.
+
+    Belongs in prompts.py — this is a display concern, not a business logic
+    concern. Business logic modules pass check_name (UUID) and the CLI layer
+    resolves it for human-readable output.
+
+    Falls back to the UUID unchanged if the name cannot be resolved.
+    """
+    import inspect as _inspect
+    try:
+        func = check_registry.get(check_name)
+        if func is None:
+            return check_name
+        unwrapped = _inspect.unwrap(func)
+        name = getattr(unwrapped, "__name__", None)
+        return name if name and not name.startswith("<") else check_name
+    except Exception:
+        return check_name
+
+
+# ---------------------------------------------------------------------------
+# Progress reporters — rich spinner base + per-pipeline subclasses
 # ---------------------------------------------------------------------------
 
-class IngestProgressReporter:
-    """Rich progress display for vp ingest. Lives in prompts.py (UI layer).
+class PipelineProgressReporter:
+    """Abstract base class for rich spinner progress reporters.
+
+    Owns the rich Progress lifecycle (__enter__/__exit__), the console print
+    method, and the spinner update method. Subclasses add pipeline-specific
+    callbacks (on_file_start/done, on_report_start/done, etc.).
+
+    Never instantiated directly — always use a concrete subclass.
+
+    DRY: spinner setup (SpinnerColumn + TextColumn + TimeElapsedColumn +
+    transient=True) is defined once here and inherited by all reporters.
+    Adding a new reporter for deliverables or other pipelines requires only
+    adding the pipeline-specific callbacks — no spinner boilerplate.
+    """
+
+    def __init__(self) -> None:
+        self._progress = None
+        self._task = None
+
+    def __enter__(self) -> "PipelineProgressReporter":
+        from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            transient=True,
+        )
+        self._progress.start()
+        self._task = self._progress.add_task(self._initial_description(), total=None)
+        return self
+
+    def __exit__(self, *_args) -> None:
+        if self._progress:
+            self._progress.stop()
+
+    def _initial_description(self) -> str:
+        """Override in subclass to set the initial spinner text."""
+        return "Working..."
+
+    def _update_spinner(self, description: str) -> None:
+        """Update the spinner text. Safe to call before __enter__."""
+        if self._progress is not None and self._task is not None:
+            self._progress.update(self._task, description=description)
+
+    def _print(self, message: str) -> None:
+        """Print a persistent line via rich console (survives spinner clearing)."""
+        if self._progress is not None:
+            self._progress.console.print(message)
+
+
+class IngestProgressReporter(PipelineProgressReporter):
+    """Rich progress display for vp ingest.
 
     Displays a spinner with the current filename and elapsed time while each
-    file is being processed. Uses transient=True so the spinner clears when
-    done, leaving the existing [ok]/[fail] print lines as the primary output.
+    file is being processed. Extends PipelineProgressReporter — spinner
+    lifecycle and print helpers are inherited.
 
     Usage in cli/data.py:
         with IngestProgressReporter() as reporter:
@@ -1447,35 +1519,17 @@ class IngestProgressReporter:
     """
 
     def __init__(self) -> None:
-        self._progress = None
-        self._task = None
+        super().__init__()
         self._ok = 0
         self._failed = 0
         self._skipped = 0
 
-    def __enter__(self) -> "IngestProgressReporter":
-        from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-        self._progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-            transient=True,
-        )
-        self._progress.start()
-        self._task = self._progress.add_task("Waiting for files...", total=None)
-        return self
-
-    def __exit__(self, *_args) -> None:
-        if self._progress:
-            self._progress.stop()
+    def _initial_description(self) -> str:
+        return "Waiting for files..."
 
     def on_file_start(self, filename: str) -> None:
         """Called by ingest_directory before each file is processed."""
-        if self._progress is not None and self._task is not None:
-            self._progress.update(
-                self._task,
-                description=f"[cyan]{filename}[/cyan]",
-            )
+        self._update_spinner(f"[cyan]{filename}[/cyan]")
 
     def on_file_done(self, filename: str, result: dict) -> None:
         """Called by ingest_directory after each file completes."""
@@ -1489,10 +1543,93 @@ class IngestProgressReporter:
             parts = [f"{rows} row(s) loaded"]
             if flagged:
                 parts.append(f"{flagged} blocked")
-            self._progress.console.print(f"  [ok] {filename} ({', '.join(parts)})")
+            self._print(f"  [ok] {filename} ({', '.join(parts)})")
         elif status == "failed":
             self._failed += 1
-            self._progress.console.print(f"  [error] {filename}: {message}")
+            self._print(f"  [error] {filename}: {message}")
         elif status == "skipped":
             self._skipped += 1
-            self._progress.console.print(f"  [skip] {filename}")
+            self._print(f"  [skip] {filename}")
+
+
+class ValidateProgressReporter(PipelineProgressReporter):
+    """Rich streaming progress display for vp validate.
+
+    Displays a spinner showing the current report being validated. Each time
+    a report completes, a persistent colored result line is printed and the
+    spinner moves to the next report. Check-level results (pass/fail/error)
+    are printed under each report line.
+
+    Color conventions per CLAUDE.md:
+      passed  → green ✓
+      failed  → bold red ✗ + failure count
+      error   → bold red
+      skipped → dim
+
+    Usage in cli/commands/validation.py:
+        with ValidateProgressReporter(check_registry) as reporter:
+            results = run_all_reports(
+                ...,
+                on_report_done=reporter.on_report_done,
+            )
+
+    No rich imports in reports/runner.py — callback is a plain callable,
+    zero coupling between business logic and the display layer.
+    """
+
+    def __init__(self, check_registry) -> None:
+        super().__init__()
+        self._check_registry = check_registry
+        self._completed = 0
+        self._failed = 0
+        self._skipped = 0
+
+    def _initial_description(self) -> str:
+        return "Starting validation..."
+
+    def on_report_start(self, report_name: str) -> None:
+        """Called by run_all_reports before each report is processed."""
+        self._update_spinner(f"[cyan]{report_name}[/cyan]")
+
+    def on_report_done(self, result: dict) -> None:
+        """Called by run_all_reports after each report completes."""
+        report_name = result.get("report", "")
+        status = result.get("status", "")
+
+        if status == "completed":
+            self._completed += 1
+            results = result.get("results", {})
+            has_failures = any(
+                v.get("status") in ("failed", "error") for v in results.values()
+            )
+            header_style = "bold red" if has_failures else "bold green"
+            self._print(f"\n  [{header_style}]{report_name}[/{header_style}] [completed]")
+
+            for check_name, outcome in results.items():
+                name = display_name(check_name, self._check_registry)
+                check_status = outcome.get("status", "")
+                failed_count = outcome.get("failed_count", 0)
+
+                if check_status == "passed":
+                    self._print(f"    [green]✓[/green] {name}")
+                elif check_status == "failed":
+                    self._print(f"    [bold red]✗[/bold red] {name}")
+                    self._print(
+                        f"      [dim]{failed_count} row(s) failed → validation_block[/dim]"
+                    )
+                elif check_status == "error":
+                    self._print(f"    [bold red]✗ {name}: {outcome.get('error', '')}[/bold red]")
+
+        elif status == "skipped":
+            self._skipped += 1
+            self._print(f"\n  [dim]{report_name} [skipped — no pending records][/dim]")
+
+        elif status == "error":
+            self._failed += 1
+            self._print(
+                f"\n  [bold red]{report_name} [error]: {result.get('error', '')}[/bold red]"
+            )
+
+
+# IngestProgressReporter — rich spinner for vp ingest
+# ---------------------------------------------------------------------------

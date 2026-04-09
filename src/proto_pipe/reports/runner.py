@@ -159,28 +159,16 @@ def _build_execution_layers(reports: list[dict]) -> list[list[dict]]:
     return layers
 
 
-# ---------------------------------------------------------------------------
-# Display name resolution
-# ---------------------------------------------------------------------------
+def _resolve_display_name(check_name: str, check_registry) -> str:
+    """Thin wrapper — delegates to prompts.display_name (the canonical location).
 
-def _display_name(check_name: str, check_registry: CheckRegistry) -> str:
-    """Return a human-readable name for a check UUID.
-
-    Unwraps the registered function to its original __name__. Falls back
-    to the UUID if the name cannot be resolved — always safe to call.
-
-    Used in print statements so users see 'price_check' not '2ebc92ed-...'
+    display_name is a display concern and lives in cli/prompts.py per the
+    module responsibility rule. This wrapper avoids a top-level import of
+    prompts in reports/runner.py (which would create a circular dependency).
+    Lazy import inside the function breaks the cycle.
     """
-    import inspect as _inspect
-    try:
-        func = check_registry.get(check_name)
-        if func is None:
-            return check_name
-        unwrapped = _inspect.unwrap(func)
-        name = getattr(unwrapped, "__name__", None)
-        return name if name and not name.startswith("<") else check_name
-    except Exception:
-        return check_name
+    from proto_pipe.cli.prompts import display_name
+    return display_name(check_name, check_registry)
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +248,7 @@ def _apply_transforms_with_gate(
                     df = _apply_scalar_transform_duckdb(
                         name, func, df, registry_types,
                         alias_map=alias_map,
-                        check_name=_display_name(name, check_registry),
+                        check_name=_resolve_display_name(name, check_registry),
                     )
                     _df = df  # keep _df in sync after mutation
                     continue
@@ -897,7 +885,7 @@ def _compute_report(
                                     reason=f"Check '{check_name}' failed",
                                 ))
                     print(
-                        f"  [check] '{_display_name(check_name, check_registry)}' — "
+                        f"  [check] '{_resolve_display_name(check_name, check_registry)}' — "
                         f"{failing_count} failure(s) → validation_block"
                     )
 
@@ -908,7 +896,7 @@ def _compute_report(
                 }
 
             except Exception as e:
-                print(f"  [check-fail] '{_display_name(check_name, check_registry)}': {e}")
+                print(f"  [check-fail] '{_resolve_display_name(check_name, check_registry)}': {e}")
                 results[check_name] = {"status": "error", "error": str(e)}
 
         # 9. Apply transforms — context carries either {"df": ...} or DuckDB
@@ -1218,8 +1206,14 @@ def run_all_reports(
     parallel_reports: bool = True,
     pipeline_db: str | None = None,
     full_revalidation: bool = False,
+    on_report_done: "callable | None" = None,
 ) -> list[dict]:
     """Execute all reports in dependency order.
+
+    on_report_done: optional callback fired after each report completes.
+    Receives the result dict (same shape as the return list entries).
+    Used by ValidateProgressReporter in cli/prompts.py for streaming output.
+    Business logic is unchanged — the callback is a display concern only.
 
     Reports are sorted into execution layers via _build_execution_layers.
     Reports in the same layer have no dependencies on each other.
@@ -1287,6 +1281,8 @@ def run_all_reports(
                     full_revalidation=full_revalidation,
                 )
                 all_results.append(result)
+                if on_report_done:
+                    on_report_done(result)
                 if result.get("status") == "error":
                     failed_reports.add(r["name"])
         else:
@@ -1319,6 +1315,8 @@ def run_all_reports(
                 for bundle in bundles:
                     result = _write_report(conn, bundle, watermark_store)
                     all_results.append(result)
+                    if on_report_done:
+                        on_report_done(result)
                     if result.get("status") == "error":
                         failed_reports.add(bundle.report_name)
             finally:

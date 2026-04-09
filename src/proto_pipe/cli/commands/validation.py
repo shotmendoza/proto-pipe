@@ -65,38 +65,24 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
     else:
         reports = report_registry.all()
 
+    from proto_pipe.cli.prompts import ValidateProgressReporter
+
     click.echo(f"\nRunning validation across {len(reports)} report(s)...")
-    results = run_all_reports(
-        report_registry,
-        check_registry,
-        watermark_store,
-        pipeline_db=p_db,
-        full_revalidation=full,
-    )
+
+    with ValidateProgressReporter(check_registry) as reporter:
+        results = run_all_reports(
+            report_registry,
+            check_registry,
+            watermark_store,
+            pipeline_db=p_db,
+            full_revalidation=full,
+            on_report_done=reporter.on_report_done,
+        )
 
     if table:
         results = [
             r for r in results if r["report"] in {rpt["name"] for rpt in reports}
         ]
-
-    for r in results:
-        status = r["status"]
-        click.echo(f"\n  {r['report']} [{status}]")
-        if status == "completed":
-            for check_name, outcome in r["results"].items():
-                from proto_pipe.reports.runner import _display_name
-                display = _display_name(check_name, check_registry)
-                mark = "✓" if outcome["status"] == "passed" else "✗"
-                failed_count = outcome.get("failed_count", 0)
-                click.echo(f"{mark} {display}")
-                if outcome["status"] == "failed" and failed_count:
-                    click.echo(
-                        f"{failed_count} row(s) failed → validation_block"
-                    )
-                elif outcome["status"] == "error":
-                    click.echo(f"{outcome.get('error', '')}")
-        elif status == "skipped":
-            click.echo("No pending records.")
 
     # Write pipeline events — one per completed/errored report
     events = []
