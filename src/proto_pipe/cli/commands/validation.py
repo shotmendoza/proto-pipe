@@ -130,9 +130,9 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
                 f"{report_count} report(s)."
             )
             click.echo("\nTo review and fix:")
-            click.echo("  vp validated               — browse failures by report")
-            click.echo("  vp validated open <report> — export for external editing")
-            click.echo("  vp validated edit --report <report> — edit inline")
+            click.echo("  vp errors report             — browse failures by report")
+            click.echo("  vp errors report export      — export for external editing")
+            click.echo("  vp errors report edit        — edit inline")
         else:
             click.echo("\n✓  No validation failures.")
     finally:

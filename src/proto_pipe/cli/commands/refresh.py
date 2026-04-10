@@ -1,4 +1,4 @@
-"""Refresh commands — vp refresh source, vp refresh report.
+"""Refresh commands — vp refresh source, vp refresh report, vp refresh views.
 
 Cleans up stale flags for records that have already been resolved.
 
@@ -33,6 +33,7 @@ def refresh_cmd():
       vp refresh source sales
       vp refresh report
       vp refresh report daily_sales_validation
+      vp refresh views
     """
     pass
 
@@ -224,6 +225,47 @@ def refresh_report(report_name, yes, pipeline_db):
             f"[ok] {count} resolved flag(s) cleared from validation_block for {scope}."
         )
 
+    except Exception as e:
+        click.echo(f"[error] {e}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# vp refresh views  (was: vp refresh-views)
+# ---------------------------------------------------------------------------
+
+
+@refresh_cmd.command("views")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--views-config", default=None, help="Override views config path.")
+def refresh_views_cmd(pipeline_db, views_config):
+    """Drop and recreate all views from views_config.yaml.
+
+    Run this after editing a view SQL file. Views are also refreshed
+    automatically during run-all before deliverables are produced.
+
+    \b
+    Example:
+      vp refresh views
+    """
+    import duckdb
+
+    from proto_pipe.reports.views import load_views_config, refresh_views
+
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    v_cfg = config_path_or_override("views_config", views_config)
+
+    views = load_views_config(v_cfg)
+    if not views:
+        click.echo(f"[skip] No views defined in {v_cfg}")
+        return
+
+    click.echo(f"\nRefreshing {len(views)} view(s) from: {v_cfg}")
+    conn = duckdb.connect(p_db)
+    try:
+        refresh_views(conn, views)
+        click.echo("\nDone.")
     except Exception as e:
         click.echo(f"[error] {e}")
     finally:

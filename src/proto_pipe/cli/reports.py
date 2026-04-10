@@ -1,4 +1,4 @@
-"""Report commands — pull-report, run-all, refresh-views."""
+"""Report commands — deliver, run-all."""
 
 import click
 
@@ -8,9 +8,9 @@ from ..io.config import config_path_or_override, load_config
 
 
 # ---------------------------------------------------------------------------
-# pull-report
+# deliver  (was: pull-report)
 # ---------------------------------------------------------------------------
-@click.command("pull-report")
+@click.command("deliver")
 @click.argument("deliverable_name")
 @click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
 @click.option("--deliverables-config", default=None, help="Override deliverables config path.")
@@ -18,7 +18,7 @@ from ..io.config import config_path_or_override, load_config
 @click.option("--date-from", default=None, help="Override date filter from (YYYY-MM-DD).")
 @click.option("--date-to", default=None, help="Override date filter to (YYYY-MM-DD).")
 @click.option("--date-col", default=None, help="Column to apply --date-from/--date-to on.")
-def pull_report(
+def deliver(
         deliverable_name,
         pipeline_db,
         deliverables_config,
@@ -35,8 +35,8 @@ def pull_report(
 
     \b
     Example:
-      vp pull-report monthly_sales_pack
-      vp pull-report monthly_sales_pack --date-from 2026-01-01 --date-to 2026-03-31 --date-col order_date
+      vp deliver monthly_sales_pack
+      vp deliver monthly_sales_pack --date-from 2026-01-01 --date-to 2026-03-31 --date-col order_date
     """
     import duckdb
 
@@ -78,7 +78,6 @@ def pull_report(
         sql_file = report_cfg.get("sql_file")
 
         if sql_file:
-            # sql_file path — execute SQL directly, skip filter system entirely
             try:
                 df = query_table(conn, table=None, sql_file=sql_file)
                 report_dataframes[report_name] = df
@@ -86,8 +85,6 @@ def pull_report(
             except Exception as e:
                 click.echo(f"  [error] Could not execute sql_file for '{report_name}': {e}")
         else:
-            # Filter path — look up source table from reports_config
-            # Find the source table for this report from reports_config
             if report_name not in report_defs:
                 click.echo(f"  [warn] Report '{report_name}' not found in reports_config.yaml, skipping")
                 continue
@@ -135,9 +132,9 @@ def run_all(
         deliverable,
         ignore_flagged
 ):
-    """Chain ingest → validate → pull-report in one command.
+    """Chain ingest → validate → deliver in one command.
 
-    Stops before pull-report if flagged rows exist, unless --ignore-flagged is set.
+    Stops before deliver if flagged rows exist, unless --ignore-flagged is set.
     Auto-fixed rows are applied during validate. Complex cases are written to
     the source_block table for manual review.
 
@@ -231,8 +228,8 @@ def run_all(
         click.echo(
             "These are rows that arrived with conflicting values for existing records."
         )
-        click.echo("Run: vp flagged — to see a breakdown by table")
-        click.echo("Run: vp flagged open <table> — to export for correction")
+        click.echo("Run: vp errors source — to see a breakdown by table")
+        click.echo("Run: vp errors source export --open — to export for correction")
         click.echo("Re-run with --ignore-flagged to produce the deliverable anyway.")
         return
 
@@ -244,7 +241,7 @@ def run_all(
         click.echo(
             f"\n⚠  {val_flag_count} validation failure(s) found. Deliverable will still be produced."
         )
-        click.echo("Run: vp validated — to review by report")
+        click.echo("Run: vp errors report — to review by report")
 
     # Step 4 — Refresh views
     click.echo("\n── Refresh Views ───────────────────────────")
@@ -259,9 +256,9 @@ def run_all(
     else:
         click.echo("[skip] No views defined")
 
-    # Step 5 — Pull report
+    # Step 5 — Deliver
     if deliverable:
-        click.echo("\n── Pull Report ─────────────────────────────")
+        click.echo("\n── Deliver ─────────────────────────────────")
         del_config = load_config(del_cfg)
         deliverables = {d["name"]: d for d in del_config.get("deliverables", [])}
 
@@ -307,50 +304,8 @@ def run_all(
 
 
 # ---------------------------------------------------------------------------
-# refresh-views
-# ---------------------------------------------------------------------------
-
-
-@click.command("refresh-views")
-@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-@click.option("--views-config", default=None, help="Override views config path.")
-def refresh_views_cmd(pipeline_db, views_config):
-    """Drop and recreate all views from views_config.yaml.
-
-    Run this after editing a view SQL file. Views are also refreshed
-    automatically during run-all before deliverables are produced.
-
-    \b
-    Example:
-      vp refresh-views
-    """
-    import duckdb
-
-    from proto_pipe.reports.views import load_views_config, refresh_views
-
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    v_cfg = config_path_or_override("views_config", views_config)
-
-    views = load_views_config(v_cfg)
-    if not views:
-        click.echo(f"[skip] No views defined in {v_cfg}")
-        return
-
-    click.echo(f"\nRefreshing {len(views)} view(s) from: {v_cfg}")
-    conn = duckdb.connect(p_db)
-    try:
-        refresh_views(conn, views)
-        click.echo("\nDone.")
-    except Exception as e:
-        click.echo(f"[error] {e}")
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 def reports_commands(cli):
-    cli.add_command(pull_report)
+    cli.add_command(deliver)
     cli.add_command(run_all)
-    cli.add_command(refresh_views_cmd)
