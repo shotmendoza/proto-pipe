@@ -266,6 +266,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
     rep_cfg = config_path_or_override("reports_config", reports_config)
     src_cfg = config_path_or_override("sources_config", sources_config)
     settings = load_settings()
+    pipeline_db = settings["paths"].get("pipeline_db")
     sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
 
     config = DeliverableConfig(del_cfg)
@@ -285,7 +286,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
         sql_dir=sql_directory,
     )
 
-    if not prompter.run(config.names(), available_reports):
+    if not prompter.run(config.names(), available_reports, pipeline_db=pipeline_db):
         click.echo("Cancelled.")
         return
 

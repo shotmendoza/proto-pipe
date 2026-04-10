@@ -1255,12 +1255,19 @@ class DeliverableConfigPrompter:
     # ---------------------------------------------------------------------------
     # run() — full deliverable config flow
     # ---------------------------------------------------------------------------
-
-    def run(self, existing_names: list[str], available_reports: list[str]) -> bool:
+    def run(
+        self,
+        existing_names: list[str],
+        available_reports: list[str],
+        pipeline_db: str | None = None,
+    ) -> bool:
         """Run the full deliverable configuration flow.
 
         Stores the completed deliverable dict in self.deliverable.
         Returns True on completion, False if cancelled.
+
+        :param pipeline_db: Path to pipeline DB. Required for column discovery.
+                            Optional to preserve backward compatibility with edit flow.
         """
         self.deliverable = {}
 
@@ -1286,7 +1293,39 @@ class DeliverableConfigPrompter:
                 " you'll need to join them in your SQL file."
             )
 
-        sql_file = self.prompt_sql(name, selected_reports)
+        # Column selection + SQL generation (when pipeline_db available)
+        sql_file = None
+        if pipeline_db:
+            report_columns = self.prompt_columns(selected_reports, pipeline_db)
+            if report_columns is None:
+                return False
+
+            join_specs = []
+            if len(selected_reports) > 1:
+                join_specs = self.prompt_joins(report_columns)
+                if join_specs is None:
+                    return False
+
+            order_by = self.prompt_order_by(report_columns)
+
+            from proto_pipe.cli.scaffold import (
+                DeliverableSQLSpec,
+                build_deliverable_sql,
+            )
+
+            spec = DeliverableSQLSpec(
+                deliverable_name=name,
+                report_columns=report_columns,
+                join_specs=join_specs,
+                order_by=order_by,
+            )
+
+            sql_content = build_deliverable_sql(spec)
+            sql_file = self._write_sql_file(name, sql_content)
+        else:
+            # Fallback: old behavior for edit flow or when no DB available
+            sql_file = self.prompt_sql(name, selected_reports)
+
         report_entries = self.prompt_report_entries(selected_reports, fmt)
 
         self.deliverable = {
@@ -1299,6 +1338,172 @@ class DeliverableConfigPrompter:
             self.deliverable["sql_file"] = sql_file
 
         return True
+
+    # --- New methods to add to DeliverableConfigPrompter ---
+
+    def prompt_columns(
+        self,
+        selected_reports: list[str],
+        pipeline_db: str,
+    ) -> dict[str, list[str]] | None:
+        """For each selected report, show its columns and let the user pick.
+
+        Returns {report_name: [selected_columns]} or None if cancelled.
+        Uses get_table_columns from io/db.py (Rule 15 — reuse existing).
+        """
+        from proto_pipe.io.db import get_table_columns
+
+        report_columns: dict[str, list[str]] = {}
+
+        for report_name in selected_reports:
+            columns = get_table_columns(pipeline_db, report_name)
+            if not columns:
+                click.echo(
+                    f"\n  [warn] No columns found for report '{report_name}'."
+                    f" Has 'vp validate' been run?"
+                )
+                continue
+
+            selected = questionary.checkbox(
+                f"Columns from '{report_name}':",
+                choices=[
+                    questionary.Choice(col, value=col, checked=True) for col in columns
+                ],
+            ).ask()
+
+            if selected is None:
+                return None
+            if not selected:
+                click.echo(
+                    f"  [warn] No columns selected for '{report_name}' — skipping."
+                )
+                continue
+
+            report_columns[report_name] = selected
+
+        if not report_columns:
+            click.echo("  No columns selected from any report.")
+            return None
+
+        return report_columns
+
+    def prompt_joins(
+        self,
+        report_columns: dict[str, list[str]],
+    ) -> list | None:
+        """Prompt for join configuration between report pairs.
+
+        For each pair (base, other), asks:
+        - Which column in the left table is the join key
+        - Which column in the right table is the join key
+        - What type of join (LEFT, INNER, FULL OUTER)
+
+        Returns list[JoinSpec] or None if cancelled.
+        """
+        from proto_pipe.cli.scaffold import JoinSpec
+
+        reports = list(report_columns.keys())
+        if len(reports) < 2:
+            return []
+
+        base_report = reports[0]
+        join_specs = []
+
+        for other_report in reports[1:]:
+            click.echo(f"\n  Join: {base_report} → {other_report}")
+
+            # Left key from base report
+            left_cols = report_columns[base_report]
+            left_key = questionary.select(
+                f"  Join key in '{base_report}':",
+                choices=left_cols,
+            ).ask()
+            if left_key is None:
+                return None
+
+            # Right key from other report
+            right_cols = report_columns[other_report]
+            right_key = questionary.select(
+                f"  Matching key in '{other_report}':",
+                choices=right_cols,
+            ).ask()
+            if right_key is None:
+                return None
+
+            # Join type
+            join_type = questionary.select(
+                "  Join type:",
+                choices=[
+                    questionary.Choice(
+                        "LEFT JOIN — all rows from left, matching from right",
+                        value="LEFT",
+                    ),
+                    questionary.Choice(
+                        "INNER JOIN — only matching rows", value="INNER"
+                    ),
+                    questionary.Choice(
+                        "FULL OUTER JOIN — all rows from both", value="FULL OUTER"
+                    ),
+                ],
+                default="LEFT",
+            ).ask()
+            if join_type is None:
+                return None
+
+            join_specs.append(
+                JoinSpec(
+                    left_table=base_report,
+                    right_table=other_report,
+                    left_key=left_key,
+                    right_key=right_key,
+                    join_type=join_type,
+                )
+            )
+
+        return join_specs
+
+    def prompt_order_by(
+        self,
+        report_columns: dict[str, list[str]],
+    ) -> str | None:
+        """Prompt for an optional ORDER BY column.
+
+        Shows columns from the first (base) report. Returns column name or None.
+        """
+        reports = list(report_columns.keys())
+        if not reports:
+            return None
+
+        base_cols = report_columns[reports[0]]
+        add_order = questionary.confirm("Add an ORDER BY clause?", default=False).ask()
+        if not add_order:
+            return None
+
+        col = questionary.select(
+            "Order by which column?",
+            choices=base_cols,
+        ).ask()
+
+        return col
+
+    def _write_sql_file(self, name: str, sql_content: str) -> str:
+        """Write generated SQL to the sql_dir. Returns the file path as string."""
+        from pathlib import Path
+
+        sql_path = Path(self._sql_dir) / f"{name}.sql"
+        sql_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if sql_path.exists():
+            overwrite = questionary.confirm(
+                f"{sql_path} already exists. Overwrite?"
+            ).ask()
+            if not overwrite:
+                click.echo(f"  [skip] Keeping existing {sql_path}")
+                return str(sql_path)
+
+        sql_path.write_text(sql_content)
+        click.echo(f"  [ok]   {sql_path}")
+        return str(sql_path)
 
     # ---------------------------------------------------------------------------
     # Individual prompt methods
