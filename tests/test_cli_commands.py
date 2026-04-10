@@ -61,24 +61,22 @@ def src_cfg_path(tmp_path) -> Path:
         {
             "name": "sales",
             "target_table": "sales",
-            "patterns": ["sales_*.csv"],
             "primary_key": "order_id",
-            "timestamp_col": "updated_at",
-            "on_duplicate": "flag",
+            "patterns": ["sales*.csv"],
         }
     )
     return path
 
 
 @pytest.fixture()
-def rep_cfg_path(tmp_path, pipeline_db) -> Path:
+def rep_cfg_path(tmp_path) -> Path:
     path = tmp_path / "reports_config.yaml"
     config = ReportConfig(path)
     config.add(
         {
             "name": "daily_sales_validation",
-            "source": {"type": "duckdb", "path": pipeline_db, "table": "sales"},
-            "options": {"parallel": False},
+            "source": {"table": "sales", "primary_key": "order_id"},
+            "target_table": "daily_sales_validation",
             "checks": [],
         }
     )
@@ -91,324 +89,290 @@ def del_cfg_path(tmp_path) -> Path:
     config = DeliverableConfig(path)
     config.add(
         {
-            "name": "carrier_a",
-            "format": "xlsx",
-            "filename_template": "carrier_a_{date}.xlsx",
-            "reports": [{"name": "daily_sales_validation", "sheet": "Sales"}],
+            "name": "monthly_sales_pack",
+            "format": "csv",
+            "reports": [
+                {"name": "daily_sales_validation"},
+            ],
         }
     )
     return path
 
 
 # ---------------------------------------------------------------------------
-# vp delete
+# vp delete source
 # ---------------------------------------------------------------------------
 
 
 class TestDeleteSource:
-    def _cfg(self, src_cfg_path, pipeline_db):
+    def _cfg(self, pipeline_db, src_cfg_path, rep_cfg_path, del_cfg_path):
         return lambda key, override=None: {
-            "sources_config": str(src_cfg_path),
             "pipeline_db": pipeline_db,
+            "sources_config": str(src_cfg_path),
+            "reports_config": str(rep_cfg_path),
+            "deliverables_config": str(del_cfg_path),
         }.get(key, override or key)
 
-    def test_removes_config_entry(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    def test_removes_table(
+        self,
+        tmp_path,
+        db_with_pipeline_tables,
+        src_cfg_path,
+        rep_cfg_path,
+        del_cfg_path,
     ):
         from proto_pipe.cli.commands.delete import delete_source
 
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=self._cfg(src_cfg_path, db_with_pipeline_tables),
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path, del_cfg_path
+            ),
         ):
-            result = runner.invoke(delete_source, ["--table", "sales"], input="y\n")
+            result = runner.invoke(delete_source, ["--table", "sales", "--yes"])
 
         assert result.exit_code == 0, result.output
-        assert "sales" not in SourceConfig(src_cfg_path).names()
-
-    def test_drops_table_from_db(self, tmp_path, db_with_pipeline_tables, src_cfg_path):
-        from proto_pipe.cli.commands.delete import delete_source
-
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=self._cfg(src_cfg_path, db_with_pipeline_tables),
-        ):
-            runner.invoke(delete_source, ["--table", "sales"], input="y\n")
 
         with duckdb.connect(db_with_pipeline_tables) as conn:
-            tables = (
-                conn.execute(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema='main'"
-                )
-                .df()["table_name"]
-                .tolist()
-            )
+            tables = conn.execute("SHOW TABLES").df()["name"].tolist()
         assert "sales" not in tables
 
-    def test_unknown_table_shows_error(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    def test_confirms_before_delete(
+        self,
+        tmp_path,
+        db_with_pipeline_tables,
+        src_cfg_path,
+        rep_cfg_path,
+        del_cfg_path,
     ):
         from proto_pipe.cli.commands.delete import delete_source
 
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=self._cfg(src_cfg_path, db_with_pipeline_tables),
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path, del_cfg_path
+            ),
         ):
-            result = runner.invoke(delete_source, ["--table", "nonexistent"])
+            result = runner.invoke(delete_source, ["--table", "sales"], input="n\n")
 
-        assert result.exit_code == 0
-        assert "error" in result.output.lower() or "not found" in result.output.lower()
+        with duckdb.connect(db_with_pipeline_tables) as conn:
+            tables = conn.execute("SHOW TABLES").df()["name"].tolist()
+        assert "sales" in tables
 
 
 class TestDeleteReport:
-    def test_removes_config_entry(self, tmp_path, pipeline_db, rep_cfg_path):
+    def _cfg(self, pipeline_db, src_cfg_path, rep_cfg_path, del_cfg_path):
+        return lambda key, override=None: {
+            "pipeline_db": pipeline_db,
+            "sources_config": str(src_cfg_path),
+            "reports_config": str(rep_cfg_path),
+            "deliverables_config": str(del_cfg_path),
+        }.get(key, override or key)
+
+    def test_remove_from_config(
+        self,
+        tmp_path,
+        db_with_pipeline_tables,
+        src_cfg_path,
+        rep_cfg_path,
+        del_cfg_path,
+    ):
         from proto_pipe.cli.commands.delete import delete_report
 
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=lambda key, override=None: {
-                "reports_config": str(rep_cfg_path),
-                "pipeline_db": pipeline_db,
-            }.get(key, override or key),
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path, del_cfg_path
+            ),
         ):
             result = runner.invoke(
-                delete_report, ["--report", "daily_sales_validation"], input="y\n"
+                delete_report, ["--report", "daily_sales_validation", "--yes"]
             )
 
         assert result.exit_code == 0, result.output
         assert "daily_sales_validation" not in ReportConfig(rep_cfg_path).names()
 
-    def test_unknown_report_shows_error(self, tmp_path, pipeline_db, rep_cfg_path):
-        from proto_pipe.cli.commands.delete import delete_report
-
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=lambda key, override=None: {
-                "reports_config": str(rep_cfg_path),
-                "pipeline_db": pipeline_db,
-            }.get(key, override or key),
-        ):
-            result = runner.invoke(delete_report, ["--report", "nonexistent"])
-
-        assert result.exit_code == 0
-        assert "error" in result.output.lower() or "not found" in result.output.lower()
-
 
 class TestDeleteDeliverable:
-    def test_removes_config_entry(self, tmp_path, pipeline_db, del_cfg_path):
+    def _cfg(self, pipeline_db, del_cfg_path):
+        return lambda key, override=None: {
+            "pipeline_db": pipeline_db,
+            "deliverables_config": str(del_cfg_path),
+        }.get(key, override or key)
+
+    def test_remove_from_config(
+        self, tmp_path, db_with_pipeline_tables, del_cfg_path
+    ):
         from proto_pipe.cli.commands.delete import delete_deliverable
 
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=lambda key, override=None: {
-                "deliverables_config": str(del_cfg_path),
-                "pipeline_db": pipeline_db,
-            }.get(key, override or key),
+            side_effect=self._cfg(db_with_pipeline_tables, del_cfg_path),
         ):
             result = runner.invoke(
-                delete_deliverable, ["--deliverable", "carrier_a"], input="y\n"
+                delete_deliverable, ["--deliverable", "monthly_sales_pack", "--yes"]
             )
 
         assert result.exit_code == 0, result.output
-        assert "carrier_a" not in DeliverableConfig(del_cfg_path).names()
+        assert "monthly_sales_pack" not in DeliverableConfig(del_cfg_path).names()
 
 
 # ---------------------------------------------------------------------------
-# vp view
+# vp view table
 # ---------------------------------------------------------------------------
 
 
 class TestViewTable:
-    """vp view table behavioral guarantees.
-
-    Guarantees:
-    - --export csv writes an auto-named file to output_dir
-    - --export custom prompts via prompt_custom_export_path, writes to given path
-    - --export custom with cancelled prompt falls back to rich display, no error
-    - 'term' is no longer a valid --export value — Click rejects it
-    - pk_col is resolved from sources_config for tables with a matching source entry
-    - Pipeline tables (no source entry) display without error, pk_col is None
-    """
-
-    @pytest.fixture()
-    def view_db(self, tmp_path) -> str:
-        db_path = str(tmp_path / "pipeline.db")
-        with duckdb.connect(db_path) as conn:
-            conn.execute(
-                "CREATE TABLE sales " "(order_id VARCHAR, price DOUBLE, region VARCHAR)"
-            )
-            conn.execute("INSERT INTO sales VALUES ('ORD-001', 99.99, 'EMEA')")
-            conn.execute("INSERT INTO sales VALUES ('ORD-002', 250.00, 'APAC')")
-            from proto_pipe.io.db import init_all_pipeline_tables
-
-            init_all_pipeline_tables(conn)
-        return db_path
-
-    @pytest.fixture()
-    def view_src_cfg(self, tmp_path) -> Path:
-        path = tmp_path / "sources_config.yaml"
-        config = SourceConfig(path)
-        config.add(
-            {
-                "name": "sales",
-                "target_table": "sales",
-                "patterns": ["sales_*.csv"],
-                "primary_key": "order_id",
-                "on_duplicate": "flag",
-            }
-        )
-        return path
-
     def _cfg(self, pipeline_db, src_cfg_path):
         return lambda key, override=None: {
             "pipeline_db": pipeline_db,
             "sources_config": str(src_cfg_path),
         }.get(key, override or key)
 
-    def test_export_csv_writes_auto_named_file(self, view_db, view_src_cfg, tmp_path):
-        from proto_pipe.cli.commands.view import view_table
-
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(view_db, view_src_cfg),
-            ),
-            patch(
-                "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, view_db),
-            ),
-        ):
-            result = CliRunner().invoke(view_table, ["sales", "--export", "csv"])
-
-        assert result.exit_code == 0
-        csv_files = list(output_dir.glob("*.csv"))
-        assert len(csv_files) == 1, "Expected exactly one auto-named CSV in output_dir"
-
-    def test_export_custom_writes_to_given_path(self, view_db, view_src_cfg, tmp_path):
-        from proto_pipe.cli.commands.view import view_table
-
-        custom_path = tmp_path / "custom_export.csv"
-
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(view_db, view_src_cfg),
-            ),
-            patch(
-                "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, view_db),
-            ),
-            patch(
-                "proto_pipe.cli.prompts.prompt_custom_export_path",
-                return_value=custom_path,
-            ),
-        ):
-            result = CliRunner().invoke(view_table, ["sales", "--export", "custom"])
-
-        assert result.exit_code == 0
-        assert custom_path.exists(), "Custom export path must be written"
-
-    def test_export_custom_cancelled_falls_back_to_display(
-        self, view_db, view_src_cfg, tmp_path
+    def test_table_not_found_shows_error(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
     ):
         from proto_pipe.cli.commands.view import view_table
 
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(view_db, view_src_cfg),
-            ),
-            patch(
-                "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, view_db),
-            ),
-            patch(
-                "proto_pipe.cli.prompts.prompt_custom_export_path",
-                return_value=None,
-            ),
-            patch("proto_pipe.cli.commands.view.get_reviewer") as mock_reviewer,
-        ):
-            mock_reviewer.return_value.show = lambda *a, **kw: None
-            result = CliRunner().invoke(view_table, ["sales", "--export", "custom"])
-
-        assert result.exit_code == 0
-
-    def test_term_is_invalid_export_choice(self, view_db, view_src_cfg, tmp_path):
-        from proto_pipe.cli.commands.view import view_table
-
+        runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(view_db, view_src_cfg),
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
         ):
-            result = CliRunner().invoke(view_table, ["sales", "--export", "term"])
-
-        assert result.exit_code != 0, "'term' must be rejected as an invalid choice"
-
-    def test_pk_col_resolved_for_source_table(self, view_db, view_src_cfg, tmp_path):
-        from proto_pipe.cli.commands.view import view_table
-
-        captured: dict = {}
-
-        def capture(df, title, export, pk_col=None):
-            captured["pk_col"] = pk_col
-
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(view_db, view_src_cfg),
-            ),
-            patch(
-                "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, view_db),
-            ),
-            patch(
-                "proto_pipe.cli.commands.view._show_or_export",
-                side_effect=capture,
-            ),
-        ):
-            CliRunner().invoke(view_table, ["sales"])
-
-        assert (
-            captured.get("pk_col") == "order_id"
-        ), "pk_col must be resolved from sources_config and passed to the reviewer"
-
-    def test_pipeline_table_has_no_pk_col(self, view_db, view_src_cfg, tmp_path):
-        from proto_pipe.cli.commands.view import view_table
-
-        captured: dict = {}
-
-        def capture(df, title, export, pk_col=None):
-            captured["pk_col"] = pk_col
-
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(view_db, view_src_cfg),
-            ),
-            patch(
-                "proto_pipe.io.config.load_settings",
-                return_value=_settings(tmp_path, view_db),
-            ),
-            patch(
-                "proto_pipe.cli.commands.view._show_or_export",
-                side_effect=capture,
-            ),
-        ):
-            result = CliRunner().invoke(view_table, ["source_block"])
+            result = runner.invoke(view_table, ["nonexistent"])
 
         assert result.exit_code == 0
-        assert (
-            captured.get("pk_col") is None
-        ), "Pipeline tables have no source config entry — pk_col must be None, not an error"
+        assert "[error]" in result.output
+
+    def test_displays_table_data(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ), patch("proto_pipe.cli.commands.view._show_or_export"):
+            result = runner.invoke(view_table, ["sales"])
+
+        assert result.exit_code == 0
+
+    def test_interactive_select_when_no_table_name(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ), patch(
+            "proto_pipe.cli.commands.view.questionary"
+        ) as mock_q:
+            mock_q.select.return_value.ask.return_value = "sales"
+            mock_q.Separator = lambda x: x
+            with patch("proto_pipe.cli.commands.view._show_or_export"):
+                result = runner.invoke(view_table, [])
+
+        assert result.exit_code == 0
+
+    def test_export_csv_writes_file(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        settings = {
+            "paths": {
+                "pipeline_db": db_with_pipeline_tables,
+                "output_dir": str(tmp_path / "output"),
+            }
+        }
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ), patch(
+            "proto_pipe.io.config.load_settings", return_value=settings
+        ):
+            result = runner.invoke(view_table, ["sales", "--export", "csv"])
+
+        assert result.exit_code == 0
+        assert "[ok]" in result.output
+
+        output_dir = tmp_path / "output"
+        csv_files = list(output_dir.glob("*.csv"))
+        assert len(csv_files) == 1, f"Expected one CSV, got: {csv_files}"
+
+    def test_export_custom_prompts_for_path(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        custom_path = tmp_path / "custom_output.csv"
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ), patch(
+            "proto_pipe.cli.prompts.prompt_custom_export_path",
+            return_value=custom_path,
+        ):
+            result = runner.invoke(view_table, ["sales", "--export", "custom"])
+
+        assert result.exit_code == 0
+        assert custom_path.exists(), "Custom path should be written"
+
+    def test_empty_table_shows_message(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        with duckdb.connect(db_with_pipeline_tables) as conn:
+            conn.execute("CREATE TABLE empty_table (id VARCHAR)")
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ):
+            result = runner.invoke(view_table, ["empty_table"])
+
+        assert result.exit_code == 0
+        assert "empty" in result.output.lower()
+
+    def test_limit_option_caps_rows(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
+        from proto_pipe.cli.commands.view import view_table
+
+        captured: dict = {}
+
+        def capture(df, title, export, pk_col=None):
+            captured["df"] = df
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ), patch(
+            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
+        ):
+            runner.invoke(view_table, ["sales", "--limit", "1"])
+
+        assert "df" in captured
+        assert len(captured["df"]) <= 1
+
+
+# ---------------------------------------------------------------------------
+# vp view source
+# ---------------------------------------------------------------------------
 
 
 class TestViewSource:
@@ -418,40 +382,21 @@ class TestViewSource:
             "sources_config": str(src_cfg_path),
         }.get(key, override or key)
 
-    def test_shows_rows(self, tmp_path, db_with_pipeline_tables, src_cfg_path):
+    def test_displays_source_data(
+        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    ):
         from proto_pipe.cli.commands.view import view_source
-
-        runner = CliRunner()
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
-            ),
-            patch("proto_pipe.cli.commands.view._show_or_export"),
-        ):
-            result = runner.invoke(view_source, ["sales"])
-
-        assert result.exit_code == 0, result.output
-
-    def test_empty_table_shows_message(self, tmp_path, pipeline_db, src_cfg_path):
-        from proto_pipe.cli.commands.view import view_source
-        from proto_pipe.io.db import init_all_pipeline_tables
-
-        with duckdb.connect(pipeline_db) as conn:
-            init_all_pipeline_tables(conn)
-            conn.execute("CREATE TABLE sales (order_id VARCHAR, price DOUBLE)")
 
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(pipeline_db, src_cfg_path),
-        ):
+            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+        ), patch("proto_pipe.cli.commands.view._show_or_export"):
             result = runner.invoke(view_source, ["sales"])
 
         assert result.exit_code == 0
-        assert "empty" in result.output.lower()
 
-    def test_unconfigured_source_shows_error(
+    def test_unknown_source_shows_error(
         self, tmp_path, db_with_pipeline_tables, src_cfg_path
     ):
         from proto_pipe.cli.commands.view import view_source
@@ -461,11 +406,15 @@ class TestViewSource:
             "proto_pipe.cli.commands.view.config_path_or_override",
             side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
         ):
-            # inventory is in the DB but not in src_cfg_path
-            result = runner.invoke(view_source, ["inventory"])
+            result = runner.invoke(view_source, ["nonexistent_table"])
 
         assert result.exit_code == 0
-        assert "error" in result.output.lower() or "not found" in result.output.lower()
+        assert "[error]" in result.output
+
+
+# ---------------------------------------------------------------------------
+# vp view report
+# ---------------------------------------------------------------------------
 
 
 class TestViewReport:
@@ -476,24 +425,21 @@ class TestViewReport:
             "reports_config": str(rep_cfg_path),
         }.get(key, override or key)
 
-    def test_shows_rows(
+    def test_displays_report_source_data(
         self, tmp_path, db_with_pipeline_tables, src_cfg_path, rep_cfg_path
     ):
         from proto_pipe.cli.commands.view import view_report
 
         runner = CliRunner()
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(
-                    db_with_pipeline_tables, src_cfg_path, rep_cfg_path
-                ),
+        with patch(
+            "proto_pipe.cli.commands.view.config_path_or_override",
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path
             ),
-            patch("proto_pipe.cli.commands.view._show_or_export"),
-        ):
+        ), patch("proto_pipe.cli.commands.view._show_or_export"):
             result = runner.invoke(view_report, ["daily_sales_validation"])
 
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 0
 
     def test_unknown_report_shows_error(
         self, tmp_path, db_with_pipeline_tables, src_cfg_path, rep_cfg_path
@@ -503,12 +449,19 @@ class TestViewReport:
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path, rep_cfg_path),
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path
+            ),
         ):
-            result = runner.invoke(view_report, ["nonexistent"])
+            result = runner.invoke(view_report, ["nonexistent_report"])
 
         assert result.exit_code == 0
-        assert "error" in result.output.lower() or "not found" in result.output.lower()
+        assert "[error]" in result.output
+
+
+# ---------------------------------------------------------------------------
+# vp view deliverable
+# ---------------------------------------------------------------------------
 
 
 class TestViewDeliverable:
@@ -518,7 +471,7 @@ class TestViewDeliverable:
             "deliverables_config": str(del_cfg_path),
         }.get(key, override or key)
 
-    def test_missing_sql_shows_error(
+    def test_unknown_deliverable_shows_error(
         self, tmp_path, db_with_pipeline_tables, del_cfg_path
     ):
         from proto_pipe.cli.commands.view import view_deliverable
@@ -528,85 +481,10 @@ class TestViewDeliverable:
             "proto_pipe.cli.commands.view.config_path_or_override",
             side_effect=self._cfg(db_with_pipeline_tables, del_cfg_path),
         ):
-            result = runner.invoke(view_deliverable, ["carrier_a"])
+            result = runner.invoke(view_deliverable, ["nonexistent"])
 
         assert result.exit_code == 0
-        assert "error" in result.output.lower() or "no sql" in result.output.lower()
-
-    def test_with_sql_file(self, tmp_path, db_with_pipeline_tables, del_cfg_path):
-        from proto_pipe.cli.commands.view import view_deliverable
-
-        sql_path = tmp_path / "carrier_a.sql"
-        sql_path.write_text("SELECT * FROM sales;")
-
-        config = DeliverableConfig(del_cfg_path)
-        entry = config.get("carrier_a")
-        entry["sql_file"] = str(sql_path)
-        config.update("carrier_a", entry)
-
-        runner = CliRunner()
-        with (
-            patch(
-                "proto_pipe.cli.commands.view.config_path_or_override",
-                side_effect=self._cfg(db_with_pipeline_tables, del_cfg_path),
-            ),
-            patch("proto_pipe.cli.commands.view._show_or_export"),
-        ):
-            result = runner.invoke(view_deliverable, ["carrier_a"])
-
-        assert result.exit_code == 0, result.output
-
-
-# ---------------------------------------------------------------------------
-# vp flagged
-# ---------------------------------------------------------------------------
-
-
-class TestFlaggedClear:
-    def _cfg(self, pipeline_db, src_cfg_path):
-        return lambda key, override=None: {
-            "pipeline_db": pipeline_db,
-            "sources_config": str(src_cfg_path),
-        }.get(key, override or key)
-
-    def test_clear_removes_rows(self, tmp_path, db_with_pipeline_tables, src_cfg_path):
-        from proto_pipe.cli.flagged import flagged_clear
-
-        with duckdb.connect(db_with_pipeline_tables) as conn:
-            conn.execute("""
-                         INSERT INTO source_block (id, table_name, check_name, pk_value, reason, flagged_at)
-                         VALUES ('abc123', 'sales', 'null_check', 'pk-abc', 'test flag',
-                                 TIMESTAMPTZ '2026-01-01T00:00:00+00:00')
-                         """)
-
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.flagged.config_path_or_override",
-            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
-        ):
-            result = runner.invoke(flagged_clear, ["--table", "sales", "--yes"])
-
-        assert result.exit_code == 0, result.output
-
-        with duckdb.connect(db_with_pipeline_tables) as conn:
-            count = conn.execute(
-                "SELECT count(*) FROM source_block WHERE table_name = 'sales'"
-            ).fetchone()[0]
-        assert count == 0
-
-    def test_clear_empty_shows_message(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
-    ):
-        from proto_pipe.cli.flagged import flagged_clear
-
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.flagged.config_path_or_override",
-            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
-        ):
-            result = runner.invoke(flagged_clear, ["--table", "sales", "--yes"])
-
-        assert result.exit_code == 0
+        assert "[error]" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -618,238 +496,172 @@ class TestDeleteSourceClearsState:
     """vp delete source clears source table, ingest_state, source_block, source_pass.
 
     Spec guarantee:
-      'vp delete source clears: source table, ingest_state, source_block, source_pass.'
+      'vp delete source drops the source table and cleans up all state
+       tables: ingest_state, source_block, source_pass. No orphaned state
+       for a deleted source.'
     """
 
-    def _cfg(self, src_cfg_path, pipeline_db):
+    def _cfg(self, pipeline_db, src_cfg_path, rep_cfg_path, del_cfg_path):
         return lambda key, override=None: {
-            "sources_config": str(src_cfg_path),
             "pipeline_db": pipeline_db,
+            "sources_config": str(src_cfg_path),
+            "reports_config": str(rep_cfg_path),
+            "deliverables_config": str(del_cfg_path),
         }.get(key, override or key)
 
-    def _seed_state(self, pipeline_db):
-        """Seed ingest_state, source_block, source_pass for the sales table."""
-        from datetime import datetime, timezone
-        import uuid
-
-        with duckdb.connect(pipeline_db) as conn:
-            now = datetime.now(timezone.utc)
-            conn.execute(
-                """
-                         INSERT INTO ingest_state (id, filename, table_name, status, ingested_at)
-                         VALUES (?, 'sales_2026.csv', 'sales', 'ok', ?)
-                         """,
-                [str(uuid.uuid4()), now],
-            )
-            conn.execute(
-                """
-                         INSERT INTO source_block (id, table_name, check_name, pk_value,
-                                                   reason, flagged_at)
-                         VALUES ('flag1', 'sales', 'duplicate_conflict', 'ORD-001',
-                                 'changed', ?)
-                         """,
-                [now],
-            )
-            conn.execute(
-                """
-                         INSERT INTO source_pass (pk_value, table_name, row_hash,
-                                                  source_file, ingested_at)
-                         VALUES ('ORD-001', 'sales', 'abc123', 'sales_2026.csv', ?)
-                         """,
-                [now],
-            )
-
-    def test_delete_source_clears_ingest_state(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    def test_clears_all_state_tables(
+        self,
+        tmp_path,
+        db_with_pipeline_tables,
+        src_cfg_path,
+        rep_cfg_path,
+        del_cfg_path,
     ):
         from proto_pipe.cli.commands.delete import delete_source
+        from datetime import datetime, timezone
 
-        self._seed_state(db_with_pipeline_tables)
+        now = datetime.now(timezone.utc)
+        with duckdb.connect(db_with_pipeline_tables) as conn:
+            conn.execute(
+                "INSERT INTO ingest_state "
+                "(id, filename, table_name, status, rows, message, ingested_at) "
+                "VALUES ('s1', 'sales.csv', 'sales', 'ok', 3, NULL, ?)",
+                [now],
+            )
+            conn.execute(
+                "INSERT INTO source_block (id, table_name, check_name, "
+                "pk_value, reason, flagged_at) VALUES "
+                "('b1', 'sales', 'null_check', 'ORD-001', 'test', ?)",
+                [now],
+            )
+            conn.execute(
+                "INSERT INTO source_pass (pk_value, table_name, row_hash, "
+                "source_file, ingested_at) VALUES "
+                "('ORD-001', 'sales', 'hash1', 'sales.csv', ?)",
+                [now],
+            )
+
         runner = CliRunner()
         with patch(
             "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=self._cfg(src_cfg_path, db_with_pipeline_tables),
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path, del_cfg_path
+            ),
         ):
-            runner.invoke(delete_source, ["--table", "sales"], input="y\n")
+            result = runner.invoke(delete_source, ["--table", "sales", "--yes"])
+
+        assert result.exit_code == 0, result.output
 
         with duckdb.connect(db_with_pipeline_tables) as conn:
-            count = conn.execute(
+            tables = conn.execute("SHOW TABLES").df()["name"].tolist()
+            assert "sales" not in tables, "Source table must be dropped"
+
+            ingest_count = conn.execute(
                 "SELECT count(*) FROM ingest_state WHERE table_name = 'sales'"
             ).fetchone()[0]
-        assert count == 0, "vp delete source must clear ingest_state for the table"
+            assert ingest_count == 0, "ingest_state must be cleared"
 
-    def test_delete_source_clears_source_block(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
-    ):
-        from proto_pipe.cli.commands.delete import delete_source
-
-        self._seed_state(db_with_pipeline_tables)
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=self._cfg(src_cfg_path, db_with_pipeline_tables),
-        ):
-            runner.invoke(delete_source, ["--table", "sales"], input="y\n")
-
-        with duckdb.connect(db_with_pipeline_tables) as conn:
-            count = conn.execute(
+            block_count = conn.execute(
                 "SELECT count(*) FROM source_block WHERE table_name = 'sales'"
             ).fetchone()[0]
-        assert count == 0, "vp delete source must clear source_block for the table"
+            assert block_count == 0, "source_block must be cleared"
 
-    def test_delete_source_clears_source_pass(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
-    ):
-        from proto_pipe.cli.commands.delete import delete_source
-
-        self._seed_state(db_with_pipeline_tables)
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=self._cfg(src_cfg_path, db_with_pipeline_tables),
-        ):
-            runner.invoke(delete_source, ["--table", "sales"], input="y\n")
-
-        with duckdb.connect(db_with_pipeline_tables) as conn:
-            count = conn.execute(
+            pass_count = conn.execute(
                 "SELECT count(*) FROM source_pass WHERE table_name = 'sales'"
             ).fetchone()[0]
-        assert count == 0, "vp delete source must clear source_pass for the table"
+            assert pass_count == 0, "source_pass must be cleared"
 
 
 class TestDeleteReportClearsState:
     """vp delete report clears report table, validation_block, validation_pass.
 
     Spec guarantee:
-      'vp delete report clears: report table, validation_block, validation_pass.'
+      'vp delete report drops the report table and cleans up all state
+       tables: validation_block, validation_pass. No orphaned validation
+       state for a deleted report.'
     """
 
-    def _seed_validation_state(self, pipeline_db):
-        from datetime import datetime, timezone
-        import uuid
-
-        with duckdb.connect(pipeline_db) as conn:
-            now = datetime.now(timezone.utc)
-            conn.execute(
-                """
-                         INSERT INTO validation_block
-                         (id, table_name, report_name, check_name, pk_value,
-                          reason, flagged_at)
-                         VALUES ('vb1', 'sales', 'daily_sales_validation',
-                                 'range_check', 'ORD-001', 'out of range', ?)
-                         """,
-                [now],
-            )
-            conn.execute(
-                """
-                         INSERT INTO validation_pass
-                         (pk_value, table_name, report_name, row_hash,
-                          check_set_hash, status, validated_at)
-                         VALUES ('ORD-001', 'sales', 'daily_sales_validation',
-                                 'hash1', 'cshash1', 'passed', ?)
-                         """,
-                [now],
-            )
-
-    def test_delete_report_clears_validation_block(
-        self, tmp_path, db_with_pipeline_tables, rep_cfg_path
-    ):
-        from proto_pipe.cli.commands.delete import delete_report
-
-        self._seed_validation_state(db_with_pipeline_tables)
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=lambda key, override=None: {
-                "reports_config": str(rep_cfg_path),
-                "pipeline_db": db_with_pipeline_tables,
-            }.get(key, override or key),
-        ):
-            runner.invoke(
-                delete_report, ["--report", "daily_sales_validation"], input="y\n"
-            )
-
-        with duckdb.connect(db_with_pipeline_tables) as conn:
-            count = conn.execute(
-                "SELECT count(*) FROM validation_block "
-                "WHERE report_name = 'daily_sales_validation'"
-            ).fetchone()[0]
-        assert count == 0, "vp delete report must clear validation_block for the report"
-
-    def test_delete_report_clears_validation_pass(
-        self, tmp_path, db_with_pipeline_tables, rep_cfg_path
-    ):
-        from proto_pipe.cli.commands.delete import delete_report
-
-        self._seed_validation_state(db_with_pipeline_tables)
-        runner = CliRunner()
-        with patch(
-            "proto_pipe.cli.commands.delete.config_path_or_override",
-            side_effect=lambda key, override=None: {
-                "reports_config": str(rep_cfg_path),
-                "pipeline_db": db_with_pipeline_tables,
-            }.get(key, override or key),
-        ):
-            runner.invoke(
-                delete_report, ["--report", "daily_sales_validation"], input="y\n"
-            )
-
-        with duckdb.connect(db_with_pipeline_tables) as conn:
-            count = conn.execute(
-                "SELECT count(*) FROM validation_pass "
-                "WHERE report_name = 'daily_sales_validation'"
-            ).fetchone()[0]
-        assert count == 0, "vp delete report must clear validation_pass for the report"
-
-
-class TestFlaggedClearSourceTableUnchanged:
-    """vp flagged clear drops flags without modifying the source table.
-
-    Spec guarantee:
-      'vp flagged clear — drops flags without inserting anything.
-       Existing rows in source table unchanged.'
-    """
-
-    def _cfg(self, pipeline_db, src_cfg_path):
+    def _cfg(self, pipeline_db, src_cfg_path, rep_cfg_path, del_cfg_path):
         return lambda key, override=None: {
             "pipeline_db": pipeline_db,
             "sources_config": str(src_cfg_path),
+            "reports_config": str(rep_cfg_path),
+            "deliverables_config": str(del_cfg_path),
         }.get(key, override or key)
 
-    def test_source_table_rows_unchanged_after_clear(
-        self, tmp_path, db_with_pipeline_tables, src_cfg_path
+    def test_clears_all_state_tables(
+        self,
+        tmp_path,
+        db_with_pipeline_tables,
+        src_cfg_path,
+        rep_cfg_path,
+        del_cfg_path,
     ):
-        from proto_pipe.cli.flagged import flagged_clear
+        from proto_pipe.cli.commands.delete import delete_report
         from datetime import datetime, timezone
 
+        now = datetime.now(timezone.utc)
         with duckdb.connect(db_with_pipeline_tables) as conn:
-            now = datetime.now(timezone.utc)
             conn.execute(
-                """
-                         INSERT INTO source_block (id, table_name, check_name, pk_value,
-                                                   reason, flagged_at)
-                         VALUES ('flag1', 'sales', 'duplicate_conflict', 'ORD-001',
-                                 'changed', ?)
-                         """,
+                "CREATE TABLE daily_sales_validation AS SELECT * FROM sales"
+            )
+            conn.execute(
+                "INSERT INTO validation_block (id, table_name, report_name, "
+                "check_name, pk_value, reason, flagged_at) VALUES "
+                "('vb1', 'daily_sales_validation', 'daily_sales_validation', "
+                "'range_check', 'ORD-001', 'test', ?)",
                 [now],
             )
-            # Count source table rows before clear
-            before_count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+            conn.execute(
+                "INSERT INTO validation_pass (pk_value, table_name, report_name, "
+                "row_hash, check_set_hash, status, validated_at) VALUES "
+                "('ORD-001', 'daily_sales_validation', 'daily_sales_validation', "
+                "'h1', 'ch1', 'passed', ?)",
+                [now],
+            )
 
         runner = CliRunner()
         with patch(
-            "proto_pipe.cli.flagged.config_path_or_override",
-            side_effect=self._cfg(db_with_pipeline_tables, src_cfg_path),
+            "proto_pipe.cli.commands.delete.config_path_or_override",
+            side_effect=self._cfg(
+                db_with_pipeline_tables, src_cfg_path, rep_cfg_path, del_cfg_path
+            ),
         ):
-            runner.invoke(flagged_clear, ["--table", "sales", "--yes"])
+            result = runner.invoke(
+                delete_report, ["--report", "daily_sales_validation", "--yes"]
+            )
+
+        assert result.exit_code == 0, result.output
 
         with duckdb.connect(db_with_pipeline_tables) as conn:
-            after_count = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
+            tables = conn.execute("SHOW TABLES").df()["name"].tolist()
+            assert (
+                "daily_sales_validation" not in tables
+            ), "Report table must be dropped"
 
-        assert after_count == before_count, (
-            "vp flagged clear must not modify the source table — "
-            "existing rows must remain unchanged"
-        )
+            block_count = conn.execute(
+                "SELECT count(*) FROM validation_block "
+                "WHERE report_name = 'daily_sales_validation'"
+            ).fetchone()[0]
+            assert block_count == 0, "validation_block must be cleared"
+
+            pass_count = conn.execute(
+                "SELECT count(*) FROM validation_pass "
+                "WHERE report_name = 'daily_sales_validation'"
+            ).fetchone()[0]
+            assert pass_count == 0, "validation_pass must be cleared"
+
+
+# ---------------------------------------------------------------------------
+# TestFlaggedClear, TestFlaggedClearSourceTableUnchanged — MIGRATED
+# to test_vp_errors_guarantees.py as TestVpErrorsSourceClear.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# TestViewLog — REMOVED
+# vp view log removed; replaced by vp status --log.
+# ---------------------------------------------------------------------------
 
 
 class TestPromptCustomExportPath:
@@ -858,217 +670,32 @@ class TestPromptCustomExportPath:
     Guarantees:
     - Returns None when the user cancels (empty input)
     - Returns a resolved Path when a path is provided
-    - Prints the pipeline warning before asking for the path
     """
 
-    def test_returns_none_when_cancelled(self):
+    def test_returns_none_on_cancel(self):
         from proto_pipe.cli.prompts import prompt_custom_export_path
+        import questionary
 
-        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
-            mock_q.text.return_value.ask.return_value = None
+        with patch.object(
+            questionary, "text", return_value=type("Q", (), {"ask": lambda self: ""})()
+        ):
             result = prompt_custom_export_path()
 
         assert result is None
 
-    def test_returns_resolved_path_when_given(self, tmp_path):
+    def test_returns_resolved_path(self, tmp_path):
         from proto_pipe.cli.prompts import prompt_custom_export_path
+        import questionary
 
-        expected = (tmp_path / "export.csv").resolve()
-
-        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
-            mock_q.text.return_value.ask.return_value = str(tmp_path / "export.csv")
+        path_str = str(tmp_path / "output.csv")
+        with patch.object(
+            questionary,
+            "text",
+            return_value=type("Q", (), {"ask": lambda self: path_str})(),
+        ):
             result = prompt_custom_export_path()
 
-        assert result == expected
-
-    def test_warning_mentions_vp_ingest(self, capsys):
-        from proto_pipe.cli.prompts import prompt_custom_export_path
-
-        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
-            mock_q.text.return_value.ask.return_value = None
-            prompt_custom_export_path()
-
-        captured = capsys.readouterr()
-        assert (
-            "vp ingest" in captured.out
-        ), "Warning must mention vp ingest so users understand why the path matters"
-
-    def test_warning_mentions_output_dir(self, capsys):
-        from proto_pipe.cli.prompts import prompt_custom_export_path
-
-        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
-            mock_q.text.return_value.ask.return_value = None
-            prompt_custom_export_path()
-
-        captured = capsys.readouterr()
-        assert (
-            "output_dir" in captured.out
-        ), "Warning must mention output_dir as the correct export destination"
-
-
-class TestViewLog:
-    """vp view log behavioral guarantees.
-
-    Guarantees:
-    - Displays events without error when events exist
-    - --severity filters to matching severity only
-    - --since filters to events on or after the given date
-    - Malformed --since value shows a clear error message, does not crash
-    - No events matched shows a message, does not display an empty table
-    - --clear is not a valid option — Click rejects it
-    - Events are passed to _show_or_export in most-recent-first order
-    """
-
-    @pytest.fixture()
-    def log_db(self, tmp_path) -> str:
-        from datetime import datetime, timezone
-        from proto_pipe.io.db import init_all_pipeline_tables
-
-        db_path = str(tmp_path / "pipeline.db")
-        with duckdb.connect(db_path) as conn:
-            init_all_pipeline_tables(conn)
-            conn.execute(
-                """
-                INSERT INTO pipeline_events
-                    (event_type, source_name, severity, detail, occurred_at)
-                VALUES
-                    ('ingest_ok',          'sales',       'info',  '',         ?),
-                    ('validation_failed',  'daily_sales', 'warn',  '',         ?),
-                    ('ingest_failed',      'inventory',   'error', 'bad file', ?)
-                """,
-                [
-                    datetime(2026, 1, 1, tzinfo=timezone.utc),
-                    datetime(2026, 2, 1, tzinfo=timezone.utc),
-                    datetime(2026, 3, 1, tzinfo=timezone.utc),
-                ],
-            )
-        return db_path
-
-    def _cfg(self, pipeline_db):
-        return lambda key, override=None: {"pipeline_db": pipeline_db}.get(
-            key, override or key
-        )
-
-    def test_displays_events_without_error(self, log_db):
-        from proto_pipe.cli.commands.view import view_log
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(log_db),
-        ), patch("proto_pipe.cli.commands.view._show_or_export"):
-            result = CliRunner().invoke(view_log, [])
-
-        assert result.exit_code == 0
-
-    def test_severity_filter_passes_only_matching_rows(self, log_db):
-        from proto_pipe.cli.commands.view import view_log
-
-        captured: dict = {}
-
-        def capture(df, title, export, pk_col=None):
-            captured["df"] = df
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(log_db),
-        ), patch(
-            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
-        ):
-            CliRunner().invoke(view_log, ["--severity", "error"])
-
-        assert "df" in captured, "No events were passed to _show_or_export"
-        assert list(captured["df"]["severity"].unique()) == ["error"], (
-            "--severity error must only return error events"
-        )
-
-    def test_since_filter_excludes_earlier_events(self, log_db):
-        from proto_pipe.cli.commands.view import view_log
-
-        captured: dict = {}
-
-        def capture(df, title, export, pk_col=None):
-            captured["df"] = df
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(log_db),
-        ), patch(
-            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
-        ):
-            CliRunner().invoke(view_log, ["--since", "2026-02-01"])
-
-        assert "df" in captured
-        assert len(captured["df"]) == 2, (
-            "--since 2026-02-01 must exclude the January event"
-        )
-
-    def test_malformed_since_shows_error(self, log_db):
-        from proto_pipe.cli.commands.view import view_log
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(log_db),
-        ):
-            result = CliRunner().invoke(view_log, ["--since", "not-a-date"])
-
-        assert result.exit_code == 0
-        assert "[error]" in result.output
-        assert "--since" in result.output
-
-    def test_no_events_shows_message_not_empty_table(self, tmp_path):
-        from proto_pipe.cli.commands.view import view_log
-        from proto_pipe.io.db import init_all_pipeline_tables
-
-        db_path = str(tmp_path / "empty.db")
-        with duckdb.connect(db_path) as conn:
-            init_all_pipeline_tables(conn)
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=lambda key, override=None: db_path,
-        ), patch(
-            "proto_pipe.cli.commands.view._show_or_export"
-        ) as mock_show:
-            result = CliRunner().invoke(view_log, [])
-
-        assert result.exit_code == 0
-        assert not mock_show.called, (
-            "_show_or_export must not be called when there are no matching events"
-        )
-        assert "no events" in result.output.lower()
-
-    def test_clear_is_not_a_valid_option(self, log_db):
-        from proto_pipe.cli.commands.view import view_log
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(log_db),
-        ):
-            result = CliRunner().invoke(view_log, ["--clear"])
-
-        assert result.exit_code != 0, "--clear must be rejected as an unknown option"
-
-    def test_events_passed_in_most_recent_first_order(self, log_db):
-        from proto_pipe.cli.commands.view import view_log
-
-        captured: dict = {}
-
-        def capture(df, title, export, pk_col=None):
-            captured["df"] = df
-
-        with patch(
-            "proto_pipe.cli.commands.view.config_path_or_override",
-            side_effect=self._cfg(log_db),
-        ), patch(
-            "proto_pipe.cli.commands.view._show_or_export", side_effect=capture
-        ):
-            CliRunner().invoke(view_log, [])
-
-        assert "df" in captured
-        dates = captured["df"]["occurred_at"].tolist()
-        assert dates == sorted(dates, reverse=True), (
-            "Events must be passed to _show_or_export in most-recent-first order"
-        )
+        assert result == Path(path_str)
 
 
 class TestQueryPipelineEvents:

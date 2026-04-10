@@ -1704,3 +1704,108 @@ class ValidateReportCallback(ReportCallback):
 
     def on_deliverable_written(self, path: str, row_count: int) -> None:
         click.echo(f"  [ok] {path} ({row_count} rows)")
+
+
+# ---------------------------------------------------------------------------
+# Prescriptive error output formatter (CLAUDE.md design principle)
+# ---------------------------------------------------------------------------
+# Append this to the end of prompts.py.
+# Used by vp errors and vp status to produce "N records failed because X.
+# To fix: run Y." output.
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ErrorGroup:
+    """A group of errors sharing the same cause."""
+    cause: str
+    count: int
+    explanation: str
+    fix_commands: list[str] = field(default_factory=list)
+
+
+# Fix commands keyed by (stage, check_name).
+# stage is "source" or "report". check_name is from source_block.check_name
+# or validation_block.check_name.
+_SOURCE_FIXES: dict[str, tuple[str, list[str]]] = {
+    "type_conflict": (
+        "values don't match the declared column type",
+        [
+            "vp errors source export {name} --open  →  fix values  →  vp errors source retry {name}",
+            "vp edit column-type  →  vp ingest",
+        ],
+    ),
+    "duplicate_conflict": (
+        "incoming row conflicts with an existing record",
+        [
+            "vp errors source export {name} --open  →  fix values  →  vp errors source retry {name}",
+            "vp errors source clear {name}",
+        ],
+    ),
+}
+
+_REPORT_FIXES: dict[str, tuple[str, list[str]]] = {
+    "__check_failure__": (
+        "check returned failing rows",
+        [
+            "vp errors report export {name} --open  →  fix values  →  vp errors report retry {name}",
+            "edit check function  →  vp validate",
+            "vp errors report clear {name}",
+        ],
+    ),
+    "__transform_type_mismatch__": (
+        "transform output type doesn't match the column type",
+        [
+            "vp edit column-type  →  vp validate",
+            "edit transform function  →  vp validate",
+        ],
+    ),
+}
+
+
+def build_error_groups(
+    rows: list[tuple[str, int]],
+    stage: str,
+    name: str | None = None,
+) -> list[ErrorGroup]:
+    """Build ErrorGroup list from (check_name, count) pairs.
+
+    Args:
+        rows: list of (check_name, count) tuples from a GROUP BY query.
+        stage: "source" or "report".
+        name: optional table/report name to interpolate into fix commands.
+    """
+    fixes = _SOURCE_FIXES if stage == "source" else _REPORT_FIXES
+    label = name or "<name>"
+    groups = []
+    for check_name, count in rows:
+        if check_name in fixes:
+            explanation, cmds = fixes[check_name]
+        elif stage == "report":
+            explanation, cmds = fixes["__check_failure__"]
+        else:
+            explanation = "unknown error type"
+            cmds = []
+
+        groups.append(ErrorGroup(
+            cause=check_name,
+            count=count,
+            explanation=explanation,
+            fix_commands=[c.format(name=label) for c in cmds],
+        ))
+    return groups
+
+
+def format_error_groups(groups: list[ErrorGroup], indent: int = 4) -> None:
+    """Print prescriptive error output to terminal.
+
+    Pattern: cause: N row(s) — explanation
+             Fix: exact commands
+    """
+    pad = " " * indent
+    for g in groups:
+        click.echo(f"{pad}{g.cause}: {g.count} row(s) — {g.explanation}")
+        for i, cmd in enumerate(g.fix_commands):
+            prefix = "Fix:" if i == 0 else "  or:"
+            click.echo(f"{pad}  {prefix} {cmd}")
