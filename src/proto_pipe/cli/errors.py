@@ -217,69 +217,6 @@ def _run_resolve_wizard(
             click.echo(f"  [skip] Left for later.")
 
 
-def _print_prescriptive_summary(
-    conn: duckdb.DuckDBPyConnection,
-    stage: str,
-    name: str | None = None,
-) -> None:
-    """Query flag table and print prescriptive error output.
-
-    stage: "source" or "report".
-    name: optional table_name (source) or report_name (report) filter.
-    """
-    from proto_pipe.cli.prompts import build_error_groups, format_error_groups
-
-    if stage == "source":
-        flag_table = "source_block"
-        group_col = "table_name"
-        label = "Source"
-    else:
-        flag_table = "validation_block"
-        group_col = "report_name"
-        label = "Report"
-
-    where = ""
-    params: list = []
-    if name:
-        where = f"WHERE {group_col} = ?"
-        params = [name]
-
-    # Grouped by scope + check_name
-    rows = conn.execute(f"""
-        SELECT {group_col}, check_name, count(*) AS cnt
-        FROM {flag_table}
-        {where}
-        GROUP BY {group_col}, check_name
-        ORDER BY {group_col}, check_name
-    """, params).fetchall()
-
-    if not rows:
-        scope = f"'{name}'" if name else f"any {stage}"
-        click.echo(f"\n  No {stage} errors for {scope} — all clear.")
-        return
-
-    # Group by scope name
-    from collections import defaultdict
-    by_scope: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    total = 0
-    for scope_name, check_name, cnt in rows:
-        by_scope[scope_name].append((check_name, cnt))
-        total += cnt
-
-    scope_count = len(by_scope)
-    if name:
-        click.echo(f"\n{label} Errors — {name} — {total} blocked row(s)")
-    else:
-        click.echo(
-            f"\n{label} Errors — {total} blocked row(s) across "
-            f"{scope_count} {stage}(s)"
-        )
-
-    for scope_name, check_rows in by_scope.items():
-        scope_total = sum(c for _, c in check_rows)
-        click.echo(f"\n  {scope_name} ({scope_total} rows)")
-        groups = build_error_groups(check_rows, stage, name=scope_name)
-        format_error_groups(groups, indent=4)
 
 
 # ---------------------------------------------------------------------------
@@ -310,47 +247,14 @@ def errors_cmd(ctx):
     if ctx.invoked_subcommand is not None:
         return
 
+    from proto_pipe.pipelines.query import query_error_overview
+    from proto_pipe.cli.prompts import print_error_overview
+
     p_db = config_path_or_override("pipeline_db")
     conn = duckdb.connect(p_db)
     try:
-        src_count = conn.execute(
-            "SELECT count(*) FROM source_block"
-        ).fetchone()[0]
-        src_tables = conn.execute(
-            "SELECT count(DISTINCT table_name) FROM source_block"
-        ).fetchone()[0]
-
-        val_count = conn.execute(
-            "SELECT count(*) FROM validation_block"
-        ).fetchone()[0]
-        val_reports = conn.execute(
-            "SELECT count(DISTINCT report_name) FROM validation_block"
-        ).fetchone()[0]
-
-        if src_count == 0 and val_count == 0:
-            click.echo("\n  No pipeline errors — all clear.")
-            return
-
-        click.echo("\nPipeline Errors\n")
-
-        if src_count > 0:
-            click.echo(
-                f"  Source: {src_count} blocked row(s) across "
-                f"{src_tables} table(s)"
-            )
-            click.echo("    Run: vp errors source\n")
-        else:
-            click.echo("  Source: no errors\n")
-
-        if val_count > 0:
-            click.echo(
-                f"  Report: {val_count} validation failure(s) across "
-                f"{val_reports} report(s)"
-            )
-            click.echo("    Run: vp errors report")
-        else:
-            click.echo("  Report: no errors")
-
+        overview = query_error_overview(conn)
+        print_error_overview(overview)
     finally:
         conn.close()
 
@@ -378,11 +282,15 @@ def source_cmd(ctx, pipeline_db):
     if ctx.invoked_subcommand is not None:
         return
 
+    from proto_pipe.pipelines.query import query_error_groups
+    from proto_pipe.cli.prompts import print_prescriptive_errors
+
     name = (ctx.obj or {}).get("stage_name")
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
-        _print_prescriptive_summary(conn, "source", name=name)
+        by_scope = query_error_groups(conn, "source", name=name)
+        print_prescriptive_errors("source", name, by_scope)
     finally:
         conn.close()
 
@@ -731,11 +639,15 @@ def report_cmd(ctx, pipeline_db):
     if ctx.invoked_subcommand is not None:
         return
 
+    from proto_pipe.pipelines.query import query_error_groups
+    from proto_pipe.cli.prompts import print_prescriptive_errors
+
     name = (ctx.obj or {}).get("stage_name")
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
-        _print_prescriptive_summary(conn, "report", name=name)
+        by_scope = query_error_groups(conn, "report", name=name)
+        print_prescriptive_errors("report", name, by_scope)
     finally:
         conn.close()
 

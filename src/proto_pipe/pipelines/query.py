@@ -481,3 +481,306 @@ def query_delete_table_impact(
             "rows",
         ),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Append to pipelines/query.py
+# Query functions for vp status and vp errors commands.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+
+
+# ---------------------------------------------------------------------------
+# Structured return types (Rule 19)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ErrorOverview:
+    """Counts for bare `vp errors` summary."""
+    source_count: int
+    source_table_count: int
+    report_count: int
+    report_name_count: int
+
+
+@dataclass
+class PipelineHealth:
+    """DB-derived health data for bare `vp status`."""
+    source_tables: list = field(default_factory=list)
+    source_error_count: int = 0
+    report_names: list = field(default_factory=list)
+    validation_failure_count: int = 0
+
+
+@dataclass
+class SourceStatus:
+    """One-line summary for a source table."""
+    table_name: str
+    file_count: int
+    total_rows: int
+    last_ingest: str | None
+    error_count: int
+
+
+@dataclass
+class SourceDetail:
+    """Detail view for one source table."""
+    name: str
+    row_count: int | None
+    error_count: int
+    history: list = field(default_factory=list)   # [{filename, status, rows, ingested_at}]
+
+
+@dataclass
+class ReportStatus:
+    """One-line summary for a report."""
+    report_name: str
+    record_count: int
+    last_validated: str | None
+    failure_count: int
+
+
+@dataclass
+class ReportDetail:
+    """Detail view for one report."""
+    name: str
+    row_count: int | None
+    failure_count: int
+    last_validated: str | None
+    checks: list = field(default_factory=list)   # [(check_name, status, count)]
+
+
+# ---------------------------------------------------------------------------
+# vp errors queries
+# ---------------------------------------------------------------------------
+
+def query_error_overview(conn) -> ErrorOverview:
+    """Counts for the bare `vp errors` summary display."""
+    return ErrorOverview(
+        source_count=_safe_count(conn, "SELECT count(*) FROM source_block"),
+        source_table_count=_safe_count(
+            conn, "SELECT count(DISTINCT table_name) FROM source_block"
+        ),
+        report_count=_safe_count(conn, "SELECT count(*) FROM validation_block"),
+        report_name_count=_safe_count(
+            conn, "SELECT count(DISTINCT report_name) FROM validation_block"
+        ),
+    )
+
+
+def query_error_groups(
+    conn, stage: str, name: str | None = None
+) -> dict[str, list[tuple[str, int]]]:
+    """Error rows grouped by scope and cause for prescriptive display.
+
+    Args:
+        stage: "source" or "report".
+        name: optional table_name (source) or report_name (report) filter.
+
+    Returns:
+        dict mapping scope_name → [(check_name, count), ...].
+    """
+    if stage == "source":
+        flag_table = "source_block"
+        group_col = "table_name"
+    else:
+        flag_table = "validation_block"
+        group_col = "report_name"
+
+    where = ""
+    params: list = []
+    if name:
+        where = f"WHERE {group_col} = ?"
+        params = [name]
+
+    rows = conn.execute(f"""
+        SELECT {group_col}, check_name, count(*) AS cnt
+        FROM {flag_table}
+        {where}
+        GROUP BY {group_col}, check_name
+        ORDER BY {group_col}, check_name
+    """, params).fetchall()
+
+    from collections import defaultdict
+    by_scope: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for scope_name, check_name, cnt in rows:
+        by_scope[scope_name].append((check_name, cnt))
+    return dict(by_scope)
+
+
+# ---------------------------------------------------------------------------
+# vp status queries
+# ---------------------------------------------------------------------------
+
+def query_pipeline_health(conn) -> PipelineHealth:
+    """DB-derived health data for the bare `vp status` display."""
+    health = PipelineHealth()
+
+    try:
+        health.source_tables = conn.execute(
+            "SELECT DISTINCT table_name FROM ingest_state WHERE status = 'ok'"
+        ).df()["table_name"].tolist()
+    except Exception:
+        pass
+
+    health.source_error_count = _safe_count(
+        conn, "SELECT count(*) FROM source_block"
+    )
+
+    try:
+        health.report_names = conn.execute(
+            "SELECT DISTINCT report_name FROM validation_pass"
+        ).df()["report_name"].tolist()
+    except Exception:
+        pass
+
+    health.validation_failure_count = _safe_count(
+        conn, "SELECT count(*) FROM validation_block"
+    )
+
+    return health
+
+
+def query_source_statuses(conn) -> list[SourceStatus]:
+    """One-line summary per source table for `vp status source`."""
+    try:
+        df = conn.execute("""
+            SELECT
+                table_name,
+                count(*) AS file_count,
+                sum(rows) AS total_rows,
+                max(ingested_at) AS last_ingest
+            FROM ingest_state
+            WHERE status = 'ok'
+            GROUP BY table_name
+            ORDER BY table_name
+        """).df()
+    except Exception:
+        return []
+
+    # Error counts per table
+    try:
+        errors = dict(conn.execute("""
+            SELECT table_name, count(*) FROM source_block
+            GROUP BY table_name
+        """).fetchall())
+    except Exception:
+        errors = {}
+
+    return [
+        SourceStatus(
+            table_name=row["table_name"],
+            file_count=int(row["file_count"]),
+            total_rows=int(row["total_rows"]) if row["total_rows"] else 0,
+            last_ingest=str(row["last_ingest"])[:10] if row["last_ingest"] else None,
+            error_count=errors.get(row["table_name"], 0),
+        )
+        for _, row in df.iterrows()
+    ]
+
+
+def query_source_detail(conn, name: str) -> SourceDetail:
+    """Detailed data for one source table."""
+    row_count = _safe_count(conn, f'SELECT count(*) FROM "{name}"')
+    error_count = _safe_count(
+        conn, "SELECT count(*) FROM source_block WHERE table_name = ?", [name]
+    )
+
+    history = []
+    try:
+        hdf = conn.execute("""
+            SELECT filename, status, rows, ingested_at
+            FROM ingest_state
+            WHERE table_name = ?
+            ORDER BY ingested_at DESC
+            LIMIT 10
+        """, [name]).df()
+        for _, row in hdf.iterrows():
+            history.append({
+                "filename": row["filename"],
+                "status": row["status"],
+                "rows": row["rows"],
+                "ingested_at": str(row["ingested_at"])[:10] if row["ingested_at"] else None,
+            })
+    except Exception:
+        pass
+
+    return SourceDetail(
+        name=name,
+        row_count=row_count if row_count else None,
+        error_count=error_count,
+        history=history,
+    )
+
+
+def query_report_statuses(conn) -> list[ReportStatus]:
+    """One-line summary per report for `vp status report`."""
+    try:
+        df = conn.execute("""
+            SELECT
+                report_name,
+                count(*) AS record_count,
+                max(validated_at) AS last_validated
+            FROM validation_pass
+            GROUP BY report_name
+            ORDER BY report_name
+        """).df()
+    except Exception:
+        return []
+
+    try:
+        failures = dict(conn.execute("""
+            SELECT report_name, count(*) FROM validation_block
+            GROUP BY report_name
+        """).fetchall())
+    except Exception:
+        failures = {}
+
+    return [
+        ReportStatus(
+            report_name=row["report_name"],
+            record_count=int(row["record_count"]),
+            last_validated=str(row["last_validated"])[:10] if row["last_validated"] else None,
+            failure_count=failures.get(row["report_name"], 0),
+        )
+        for _, row in df.iterrows()
+    ]
+
+
+def query_report_detail(conn, name: str) -> ReportDetail:
+    """Detailed data for one report."""
+    row_count = _safe_count(conn, f'SELECT count(*) FROM "{name}"')
+    failure_count = _safe_count(
+        conn, "SELECT count(*) FROM validation_block WHERE report_name = ?", [name]
+    )
+
+    last_validated = None
+    try:
+        val = conn.execute(
+            "SELECT max(validated_at) FROM validation_pass WHERE report_name = ?",
+            [name],
+        ).fetchone()[0]
+        last_validated = str(val)[:10] if val else None
+    except Exception:
+        pass
+
+    checks = []
+    try:
+        checks = conn.execute("""
+            SELECT check_name, status, count(*) AS cnt
+            FROM validation_pass
+            WHERE report_name = ?
+            GROUP BY check_name, status
+            ORDER BY check_name, status
+        """, [name]).fetchall()
+    except Exception:
+        pass
+
+    return ReportDetail(
+        name=name,
+        row_count=row_count if row_count else None,
+        failure_count=failure_count,
+        last_validated=last_validated,
+        checks=list(checks),
+    )

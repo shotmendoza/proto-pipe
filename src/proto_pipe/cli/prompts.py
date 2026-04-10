@@ -1809,3 +1809,215 @@ def format_error_groups(groups: list[ErrorGroup], indent: int = 4) -> None:
         for i, cmd in enumerate(g.fix_commands):
             prefix = "Fix:" if i == 0 else "  or:"
             click.echo(f"{pad}  {prefix} {cmd}")
+
+
+# ---------------------------------------------------------------------------
+# Append to prompts.py — after the previous ErrorGroup / format_error_groups block.
+# Display functions for vp status and vp errors commands.
+# ---------------------------------------------------------------------------
+
+
+def print_error_overview(overview) -> None:
+    """Display bare `vp errors` summary — counts from both stages.
+
+    Args:
+        overview: ErrorOverview from query_error_overview.
+    """
+    if overview.source_count == 0 and overview.report_count == 0:
+        click.echo("\n  No pipeline errors — all clear.")
+        return
+
+    click.echo("\nPipeline Errors\n")
+
+    if overview.source_count > 0:
+        click.echo(
+            f"  Source: {overview.source_count} blocked row(s) across "
+            f"{overview.source_table_count} table(s)"
+        )
+        click.echo("    Run: vp errors source\n")
+    else:
+        click.echo("  Source: no errors\n")
+
+    if overview.report_count > 0:
+        click.echo(
+            f"  Report: {overview.report_count} validation failure(s) across "
+            f"{overview.report_name_count} report(s)"
+        )
+        click.echo("    Run: vp errors report")
+    else:
+        click.echo("  Report: no errors")
+
+
+def print_prescriptive_errors(
+    stage: str,
+    name: str | None,
+    by_scope: dict[str, list[tuple[str, int]]],
+) -> None:
+    """Display error rows grouped by scope and cause with prescriptive fixes.
+
+    Args:
+        stage: "source" or "report".
+        name: optional filter name (for the title).
+        by_scope: dict from query_error_groups — scope_name → [(check_name, count)].
+    """
+    label = "Source" if stage == "source" else "Report"
+
+    if not by_scope:
+        scope = f"'{name}'" if name else f"any {stage}"
+        click.echo(f"\n  No {stage} errors for {scope} — all clear.")
+        return
+
+    total = sum(c for checks in by_scope.values() for _, c in checks)
+    scope_count = len(by_scope)
+
+    if name:
+        click.echo(f"\n{label} Errors — {name} — {total} blocked row(s)")
+    else:
+        click.echo(
+            f"\n{label} Errors — {total} blocked row(s) across "
+            f"{scope_count} {stage}(s)"
+        )
+
+    for scope_name, check_rows in by_scope.items():
+        scope_total = sum(c for _, c in check_rows)
+        click.echo(f"\n  {scope_name} ({scope_total} rows)")
+        groups = build_error_groups(check_rows, stage, name=scope_name)
+        format_error_groups(groups, indent=4)
+
+
+def print_health_summary(health, deliverable_names: list[str]) -> None:
+    """Display bare `vp status` health overview with prescriptive next steps.
+
+    Args:
+        health: PipelineHealth from query_pipeline_health.
+        deliverable_names: from DeliverableConfig (not DB-derived).
+    """
+    click.echo("\nPipeline Status\n")
+
+    # Sources
+    if health.source_tables:
+        err = f"    {health.source_error_count} error(s)" if health.source_error_count else ""
+        click.echo(f"  Sources:       {len(health.source_tables)} ingested{err}")
+    else:
+        click.echo("  Sources:       none ingested yet")
+
+    # Reports
+    if health.report_names:
+        fail = f"    {health.validation_failure_count} failure(s)" if health.validation_failure_count else ""
+        click.echo(f"  Reports:       {len(health.report_names)} validated{fail}")
+    else:
+        click.echo("  Reports:       none validated yet")
+
+    # Deliverables
+    if deliverable_names:
+        click.echo(f"  Deliverables:  {len(deliverable_names)} configured")
+    else:
+        click.echo("  Deliverables:  none configured")
+
+    # Prescriptive next steps
+    steps = []
+    if not health.source_tables:
+        steps.append("vp new source  →  vp ingest")
+    if health.source_error_count:
+        steps.append(f"vp errors source — {health.source_error_count} error(s) need resolution")
+    if health.source_tables and not health.report_names:
+        steps.append("vp new report  →  vp validate")
+    if health.validation_failure_count:
+        steps.append(f"vp errors report — {health.validation_failure_count} failure(s) to review")
+    if health.report_names and not deliverable_names:
+        steps.append("vp new deliverable  →  vp deliver <n>")
+
+    if steps:
+        click.echo("\n  Next steps:")
+        for s in steps:
+            click.echo(f"    {s}")
+    else:
+        click.echo("\n  All clear — ready to deliver.")
+
+
+def print_source_list(statuses) -> None:
+    """Display one-line summary per source table.
+
+    Args:
+        statuses: list of SourceStatus from query_source_statuses.
+    """
+    if not statuses:
+        click.echo("  No sources ingested yet. Run: vp ingest")
+        return
+
+    click.echo("\nSources\n")
+    for s in statuses:
+        err = f"  {s.error_count} error(s)" if s.error_count else ""
+        last = s.last_ingest or "—"
+        click.echo(f"  {s.table_name:<25} {s.total_rows:>8} rows    last: {last}{err}")
+
+
+def print_source_detail(detail) -> None:
+    """Display detailed status for one source table.
+
+    Args:
+        detail: SourceDetail from query_source_detail.
+    """
+    click.echo(f"\nSource: {detail.name}\n")
+
+    if detail.row_count is not None:
+        click.echo(f"  Rows:         {detail.row_count}")
+    else:
+        click.echo("  Rows:         table not found")
+
+    if detail.error_count:
+        click.echo(f"  Errors:       {detail.error_count}")
+        click.echo(f"    Fix: vp errors source {detail.name}")
+    else:
+        click.echo("  Errors:       none")
+
+    if detail.history:
+        click.echo("\n  Ingest history:")
+        for h in detail.history:
+            ts = h["ingested_at"] or "—"
+            rows = h["rows"] if h["rows"] else "—"
+            click.echo(f"    {ts}  {h['filename']:<35} {h['status']:<10} {rows} rows")
+
+
+def print_report_list(statuses) -> None:
+    """Display one-line summary per report.
+
+    Args:
+        statuses: list of ReportStatus from query_report_statuses.
+    """
+    if not statuses:
+        click.echo("  No reports validated yet. Run: vp validate")
+        return
+
+    click.echo("\nReports\n")
+    for s in statuses:
+        fail = f"  {s.failure_count} failure(s)" if s.failure_count else ""
+        last = s.last_validated or "—"
+        click.echo(f"  {s.report_name:<25} {s.record_count:>8} records    last: {last}{fail}")
+
+
+def print_report_detail(detail) -> None:
+    """Display detailed status for one report.
+
+    Args:
+        detail: ReportDetail from query_report_detail.
+    """
+    click.echo(f"\nReport: {detail.name}\n")
+
+    if detail.row_count is not None:
+        click.echo(f"  Rows:         {detail.row_count}")
+    else:
+        click.echo("  Rows:         table not found (run vp validate)")
+
+    click.echo(f"  Last validated: {detail.last_validated or '—'}")
+
+    if detail.failure_count:
+        click.echo(f"  Failures:     {detail.failure_count}")
+        click.echo(f"    Fix: vp errors report {detail.name}")
+    else:
+        click.echo("  Failures:     none")
+
+    if detail.checks:
+        click.echo("\n  Check results:")
+        for check_name, status, cnt in detail.checks:
+            click.echo(f"    {check_name:<30} {status:<10} {cnt} records")
