@@ -216,9 +216,9 @@ def run_all(
 
     # Step 3a — Ingest conflicts (source_block) — hard block deliverables
     conn = duckdb.connect(p_db)
-    ingest_conflict_count = conn.execute(
-        "SELECT count(*) FROM source_block"
-    ).fetchone()[0]
+    from proto_pipe.pipelines.query import query_block_count
+
+    ingest_conflict_count = query_block_count(conn, "source")
 
     if ingest_conflict_count > 0 and not ignore_flagged:
         conn.close()
@@ -234,9 +234,7 @@ def run_all(
         return
 
     # Step 3b — Validation failures (validation_block) — warn only
-    val_flag_count = conn.execute(
-        "SELECT count(*) FROM validation_block"
-    ).fetchone()[0]
+    val_flag_count = query_block_count(conn, "report")
     if val_flag_count > 0:
         click.echo(
             f"\n⚠  {val_flag_count} validation failure(s) found. Deliverable will still be produced."

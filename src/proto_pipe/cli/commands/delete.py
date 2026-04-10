@@ -97,36 +97,24 @@ def delete_source(table, yes, pipeline_db, sources_config):
             target_table = source["target_table"]
             click.echo(f"\n── {name} ──────────────────────────────────────")
             try:
-                if table_exists(conn, target_table):
-                    conn.execute(f'DROP TABLE "{target_table}"')
+                from proto_pipe.io.db import delete_source_cascade
+
+                result = delete_source_cascade(conn, target_table)
+                if result.table_dropped:
                     click.echo(f"  [ok] Dropped table '{target_table}'")
                 else:
                     click.echo(f"  [skip] Table '{target_table}' not found in DB")
-
-                deleted_log = conn.execute(
-                    "DELETE FROM ingest_state WHERE table_name = ? RETURNING id",
-                    [target_table],
-                ).fetchall()
-                if deleted_log:
+                if result.ingest_state_cleared:
                     click.echo(
-                        f"  [ok] Cleared {len(deleted_log)} ingest_state entry/entries"
+                        f"  [ok] Cleared {result.ingest_state_cleared} ingest_state entry/entries"
                     )
-
-                deleted_flags = conn.execute(
-                    "DELETE FROM source_block WHERE table_name = ? RETURNING id",
-                    [target_table],
-                ).fetchall()
-                if deleted_flags:
+                if result.source_block_cleared:
                     click.echo(
-                        f"  [ok] Cleared {len(deleted_flags)} source_block entry/entries"
+                        f"  [ok] Cleared {result.source_block_cleared} source_block entry/entries"
                     )
-
-                from proto_pipe.io.db import clear_source_pass_for_table
-
-                cleared_pass = clear_source_pass_for_table(conn, target_table)
-                if cleared_pass:
+                if result.source_pass_cleared:
                     click.echo(
-                        f"  [ok] Cleared {cleared_pass} source_pass entry/entries"
+                        f"  [ok] Cleared {result.source_pass_cleared} source_pass entry/entries"
                     )
 
                 config.remove(name)
@@ -158,7 +146,7 @@ def delete_report(report, yes, pipeline_db, reports_config):
       vp delete report --report daily_sales_validation
     """
     from proto_pipe.io.config import ReportConfig
-    from proto_pipe.io.db import table_exists, clear_validation_pass_for_report
+    from proto_pipe.io.db import delete_report_cascade
     from proto_pipe.pipelines.query import query_delete_report_impact
     from proto_pipe.cli.prompts import prompt_delete_impact
 
@@ -194,32 +182,19 @@ def delete_report(report, yes, pipeline_db, reports_config):
         if not prompt_delete_impact(impact, yes=yes):
             return
 
-        if table_exists(conn, target_table):
-            conn.execute(f'DROP TABLE "{target_table}"')
+        result = delete_report_cascade(conn, report, target_table)
+        if result.table_dropped:
             click.echo(f"  [ok] Dropped report table '{target_table}'")
         else:
             click.echo(f"  [skip] Report table '{target_table}' not found in DB")
-
-        try:
-            cleared_block = conn.execute(
-                "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
-                [report],
-            ).fetchall()
-            if cleared_block:
-                click.echo(
-                    f"  [ok] Cleared {len(cleared_block)} validation_block entry/entries"
-                )
-        except Exception:
-            pass
-
-        try:
-            cleared_pass = clear_validation_pass_for_report(conn, report)
-            if cleared_pass:
-                click.echo(
-                    f"  [ok] Cleared {cleared_pass} validation_pass entry/entries"
-                )
-        except Exception:
-            pass
+        if result.validation_block_cleared:
+            click.echo(
+                f"  [ok] Cleared {result.validation_block_cleared} validation_block entry/entries"
+            )
+        if result.validation_pass_cleared:
+            click.echo(
+                f"  [ok] Cleared {result.validation_pass_cleared} validation_pass entry/entries"
+            )
 
     finally:
         conn.close()

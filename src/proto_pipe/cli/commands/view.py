@@ -4,13 +4,13 @@ from pathlib import Path
 
 import click
 import duckdb
-import pandas as pd
 import questionary
 
 from proto_pipe.cli.commands.table import get_reviewer
 from proto_pipe.io.config import config_path_or_override
 from proto_pipe.constants import PIPELINE_TABLES
 from proto_pipe.io.db import get_all_tables
+from proto_pipe.pipelines.query import query_table_with_status
 
 
 # ---------------------------------------------------------------------------
@@ -49,40 +49,6 @@ def _show_or_export(
     else:
         reviewer = get_reviewer(edit=False)
         reviewer.show(df, title=title, pk_col=pk_col)
-
-
-def _with_status_column(
-    conn: duckdb.DuckDBPyConnection,
-    table: str,
-    pk_col: str | None,
-    limit: int,
-) -> pd.DataFrame:
-    """Fetch table rows with a _status column (flagged / ingested).
-
-    Joins to source_block via md5 identity when a primary key is available.
-    Falls back to plain SELECT when no primary key is defined.
-    """
-    try:
-        if pk_col:
-            df = conn.execute(f"""
-                SELECT
-                    CASE WHEN f.id IS NOT NULL THEN 'flagged'
-                         ELSE 'ingested'
-                    END AS _status,
-                    s.*
-                FROM "{table}" s
-                LEFT JOIN source_block f
-                    ON md5(CAST(s."{pk_col}" AS VARCHAR)) = f.id
-                    AND f.table_name = '{table}'
-                LIMIT {limit}
-            """).df()
-        else:
-            df = conn.execute(
-                f'SELECT * FROM "{table}" LIMIT {limit}'
-            ).df()
-    except Exception:
-        df = conn.execute(f'SELECT * FROM "{table}" LIMIT {limit}').df()
-    return df
 
 
 def _resolve_name(
@@ -181,7 +147,7 @@ def view_report(
 
     conn = duckdb.connect(p_db)
     try:
-        df = _with_status_column(conn, table, pk_col, limit)
+        df = query_table_with_status(conn, table, pk_col, limit)
         if df.empty:
             click.echo(f"Table '{table}' is empty. Run: vp ingest")
             return
@@ -327,7 +293,7 @@ def view_source(table_name, table, export, limit, pipeline_db, sources_config):
 
     conn = duckdb.connect(p_db)
     try:
-        df = _with_status_column(conn, name, pk_col, limit)
+        df = query_table_with_status(conn, name, pk_col, limit)
         if df.empty:
             click.echo(f"'{name}' is empty. Run: vp ingest")
             return
@@ -373,6 +339,9 @@ def view_lineage(
     """
     from proto_pipe.io.config import SourceConfig, ReportConfig, DeliverableConfig
     from proto_pipe.reports.runner import get_target_table
+    from proto_pipe.pipelines.query import (
+        build_lineage_graph, resolve_report_root_table, query_lineage_timestamps,
+    )
 
     p_db = config_path_or_override("pipeline_db",         pipeline_db)
     src_cfg = config_path_or_override("sources_config",      sources_config)
@@ -389,87 +358,21 @@ def view_lineage(
     all_deliverables = del_config.all()
 
     # ── Load timestamps from pipeline DB ────────────────────────────────────
-    last_ingested:  dict[str, str] = {}   # table_name  → formatted timestamp
-    last_validated: dict[str, str] = {}   # report_name → formatted timestamp
-    last_produced:  dict[str, str] = {}   # deliverable_name → formatted timestamp
-
-    def _fmt(ts) -> str:
-        if ts is None:
-            return "never"
-        try:
-            return str(ts)[:10]  # YYYY-MM-DD
-        except Exception:
-            return str(ts)
+    last_ingested: dict[str, str] = {}
+    last_validated: dict[str, str] = {}
+    last_produced: dict[str, str] = {}
 
     try:
         conn = duckdb.connect(p_db)
         try:
-            rows = conn.execute(
-                "SELECT table_name, max(ingested_at) FROM ingest_state GROUP BY table_name"
-            ).fetchall()
-            last_ingested = {r[0]: _fmt(r[1]) for r in rows}
-        except Exception:
-            pass
-
-        try:
-            rows = conn.execute(
-                "SELECT report_name, max(validated_at) FROM validation_pass GROUP BY report_name"
-            ).fetchall()
-            last_validated = {r[0]: _fmt(r[1]) for r in rows}
-        except Exception:
-            pass
-
-        try:
-            rows = conn.execute(
-                "SELECT deliverable_name, max(created_at) FROM report_runs GROUP BY deliverable_name"
-            ).fetchall()
-            last_produced = {r[0]: _fmt(r[1]) for r in rows}
-        except Exception:
-            pass
-        conn.close()
+            last_ingested, last_validated, last_produced = query_lineage_timestamps(conn)
+        finally:
+            conn.close()
     except Exception:
         pass  # DB may not exist yet — timestamps will all show "never"
 
     # ── Build graph ──────────────────────────────────────────────────────────
-    # Map each report's output table → report name (for dependency inference)
-    target_to_report: dict[str, str] = {
-        get_target_table(r): r["name"] for r in all_reports
-    }
-    # Map source table name → source config entry
-    table_to_source: dict[str, dict] = {
-        s["target_table"]: s for s in all_sources
-    }
-    # Map report name → report config entry
-    report_by_name: dict[str, dict] = {r["name"]: r for r in all_reports}
-
-    # For each report, resolve its direct upstream (another report or a raw source)
-    # and build a map: report_name → list of report_names that directly depend on it
-    report_dependents: dict[str, list[str]] = {r["name"]: [] for r in all_reports}
-    report_upstream:   dict[str, str | None] = {}   # report_name → upstream report_name or None
-
-    for r in all_reports:
-        src_table = r.get("source", {}).get("table", "")
-        upstream_report = target_to_report.get(src_table)
-        if upstream_report and upstream_report != r["name"]:
-            report_upstream[r["name"]] = upstream_report
-            report_dependents[upstream_report].append(r["name"])
-        else:
-            report_upstream[r["name"]] = None
-
-    # Reports with no upstream report are rooted directly in a source table
-    def _report_root_table(rname: str) -> str:
-        """Walk upstream until we find the source table (not another report's output)."""
-        visited = set()
-        current = rname
-        while True:
-            if current in visited:
-                break
-            visited.add(current)
-            up = report_upstream.get(current)
-            if up is None:
-                return report_by_name[current].get("source", {}).get("table", "")
-            current = up
-        return ""
+    graph = build_lineage_graph(all_sources, all_reports, get_target_table)
 
     # ── Apply filters ────────────────────────────────────────────────────────
     filter_count = sum([bool(source), bool(report), bool(deliverable)])
@@ -479,17 +382,17 @@ def view_lineage(
 
     # Determine which source tables to display
     if source:
-        if source not in table_to_source:
+        if source not in graph.table_to_source:
             click.echo(f"[error] No source table named '{source}' found in sources_config.yaml")
             return
-        display_sources = [table_to_source[source]]
+        display_sources = [graph.table_to_source[source]]
     elif report:
-        if report not in report_by_name:
+        if report not in graph.report_by_name:
             click.echo(f"[error] No report named '{report}' found in reports_config.yaml")
             return
         # Find the root source table of this report
-        root_table = _report_root_table(report)
-        display_sources = [table_to_source[root_table]] if root_table in table_to_source else []
+        root_table = resolve_report_root_table(graph, report)
+        display_sources = [graph.table_to_source[root_table]] if root_table in graph.table_to_source else []
     elif deliverable:
         del_entry = del_config.get(deliverable)
         if not del_entry:
@@ -499,11 +402,11 @@ def view_lineage(
         root_tables: set[str] = set()
         for rep_cfg_entry in del_entry.get("reports", []):
             rname = rep_cfg_entry.get("name", "")
-            if rname in report_by_name:
-                rt = _report_root_table(rname)
+            if rname in graph.report_by_name:
+                rt = resolve_report_root_table(graph, rname)
                 if rt:
                     root_tables.add(rt)
-        display_sources = [table_to_source[t] for t in root_tables if t in table_to_source]
+        display_sources = [graph.table_to_source[t] for t in root_tables if t in graph.table_to_source]
     else:
         display_sources = all_sources
 
@@ -530,7 +433,7 @@ def view_lineage(
         # Apply report filter — only show this report and its chain
         if filter_report and rname != filter_report:
             # Still recurse in case the filter target is downstream
-            for child in report_dependents.get(rname, []):
+            for child in graph.report_dependents.get(rname, []):
                 _render_report(child, indent, filter_report, filter_deliverable)
             return
 
@@ -539,7 +442,7 @@ def view_lineage(
         click.echo(f"{prefix}{rname}  (last validated: {ts})")
 
         # Render downstream reports first
-        for child in sorted(report_dependents.get(rname, [])):
+        for child in sorted(graph.report_dependents.get(rname, [])):
             _render_report(child, indent + 1, None, filter_deliverable)
 
         # Render deliverables that include this report
@@ -560,7 +463,7 @@ def view_lineage(
         rooted_reports = [
             r["name"] for r in all_reports
             if r.get("source", {}).get("table") == tbl
-            and report_upstream.get(r["name"]) is None
+            and graph.report_upstream.get(r["name"]) is None
         ]
         for rname in sorted(rooted_reports):
             _render_report(rname, indent=1, filter_report=report, filter_deliverable=deliverable)

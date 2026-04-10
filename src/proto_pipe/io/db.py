@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import duckdb
@@ -989,3 +990,148 @@ def upsert_via_staging(
     """)
     conn.execute(f"DROP TABLE IF EXISTS {staging}")
     return len(corrections_df)
+
+
+# ---------------------------------------------------------------------------
+# Cascade delete operations  (extracted from cli/commands/delete.py, Rule 16)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SourceCascadeResult:
+    """Result of delete_source_cascade — counts of affected rows per table."""
+    table_dropped: bool
+    ingest_state_cleared: int
+    source_block_cleared: int
+    source_pass_cleared: int
+
+
+@dataclass
+class ReportCascadeResult:
+    """Result of delete_report_cascade — counts of affected rows per table."""
+    table_dropped: bool
+    validation_block_cleared: int
+    validation_pass_cleared: int
+
+
+def delete_source_cascade(
+    conn: duckdb.DuckDBPyConnection,
+    target_table: str,
+) -> SourceCascadeResult:
+    """Drop a source table and clear all associated pipeline state.
+
+    Removes: the data table, ingest_state entries, source_block entries,
+    and source_pass entries for the given table_name.
+
+    Does NOT remove config entries — caller handles SourceConfig.remove().
+    Does NOT remove column_type_registry entries since other sources may
+    share those columns.
+    """
+    dropped = False
+    if table_exists(conn, target_table):
+        conn.execute(f'DROP TABLE "{target_table}"')
+        dropped = True
+
+    ingest_cleared = len(conn.execute(
+        "DELETE FROM ingest_state WHERE table_name = ? RETURNING id",
+        [target_table],
+    ).fetchall())
+
+    block_cleared = len(conn.execute(
+        "DELETE FROM source_block WHERE table_name = ? RETURNING id",
+        [target_table],
+    ).fetchall())
+
+    pass_cleared = clear_source_pass_for_table(conn, target_table)
+
+    return SourceCascadeResult(
+        table_dropped=dropped,
+        ingest_state_cleared=ingest_cleared,
+        source_block_cleared=block_cleared,
+        source_pass_cleared=pass_cleared,
+    )
+
+
+def delete_report_cascade(
+    conn: duckdb.DuckDBPyConnection,
+    report_name: str,
+    target_table: str,
+) -> ReportCascadeResult:
+    """Drop a report table and clear all associated pipeline state.
+
+    Removes: the report table, validation_block entries (by report_name),
+    and validation_pass entries (by report_name).
+
+    Does NOT remove config entries — caller handles ReportConfig.remove().
+    """
+    dropped = False
+    if table_exists(conn, target_table):
+        conn.execute(f'DROP TABLE "{target_table}"')
+        dropped = True
+
+    block_cleared = 0
+    try:
+        block_cleared = len(conn.execute(
+            "DELETE FROM validation_block WHERE report_name = ? RETURNING id",
+            [report_name],
+        ).fetchall())
+    except Exception:
+        pass
+
+    pass_cleared = 0
+    try:
+        pass_cleared = clear_validation_pass_for_report(conn, report_name)
+    except Exception:
+        pass
+
+    return ReportCascadeResult(
+        table_dropped=dropped,
+        validation_block_cleared=block_cleared,
+        validation_pass_cleared=pass_cleared,
+    )
+
+
+# ---------------------------------------------------------------------------
+# column_type_registry bulk operations  (extracted from cli/commands/edit.py)
+# ---------------------------------------------------------------------------
+
+def get_column_type_registry_df(
+    conn: duckdb.DuckDBPyConnection,
+) -> "pd.DataFrame":
+    """Return the full column_type_registry as a DataFrame.
+
+    Sorted by column_name, source_name for display.
+    """
+    return conn.execute("""
+        SELECT column_name, source_name, declared_type, recorded_at
+        FROM column_type_registry
+        ORDER BY column_name, source_name
+    """).df()
+
+
+def get_conflicting_columns(
+    conn: duckdb.DuckDBPyConnection,
+) -> list[str]:
+    """Return column names where sources disagree on the declared type."""
+    return conn.execute("""
+        SELECT column_name
+        FROM column_type_registry
+        GROUP BY column_name
+        HAVING count(DISTINCT declared_type) > 1
+    """).df()["column_name"].tolist()
+
+
+def update_column_type(
+    conn: duckdb.DuckDBPyConnection,
+    column_name: str,
+    source_name: str,
+    declared_type: str,
+) -> None:
+    """Update a single column_type_registry entry."""
+    conn.execute(
+        """
+        UPDATE column_type_registry
+        SET declared_type = ?, recorded_at = ?
+        WHERE column_name = ? AND source_name = ?
+        """,
+        [declared_type, datetime.now(timezone.utc), column_name, source_name],
+    )

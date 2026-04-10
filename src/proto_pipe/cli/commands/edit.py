@@ -1,5 +1,4 @@
 """vp edit — edit existing pipeline resources."""
-from datetime import timezone, datetime
 
 import click
 import duckdb
@@ -532,19 +531,12 @@ def edit_column_type(pipeline_db, diff):
 
     with duckdb.connect(p_db) as conn:
         try:
-            df = conn.execute("""
-                SELECT column_name, source_name, declared_type, recorded_at
-                FROM column_type_registry
-                ORDER BY column_name, source_name
-            """).df()
+            from proto_pipe.io.db import get_column_type_registry_df, get_conflicting_columns
+
+            df = get_column_type_registry_df(conn)
 
             if diff:
-                conflicting = conn.execute("""
-                    SELECT column_name
-                    FROM column_type_registry
-                    GROUP BY column_name
-                    HAVING count(DISTINCT declared_type) > 1
-                """).df()["column_name"].tolist()
+                conflicting = get_conflicting_columns(conn)
 
         except Exception as e:
             click.echo(f"[error] Could not read column_type_registry: {e}")
@@ -595,16 +587,15 @@ def edit_column_type(pipeline_db, diff):
         click.echo("  No changes detected.")
         return
 
-    now = datetime.now(timezone.utc)
     with duckdb.connect(p_db) as conn:
+        from proto_pipe.io.db import update_column_type
+
         for _, row in changed.iterrows():
-            conn.execute(
-                """
-                UPDATE column_type_registry
-                SET declared_type = ?, recorded_at = ?
-                WHERE column_name = ? AND source_name = ?
-                """,
-                [row["declared_type_new"], now, row["column_name"], row["source_name"]],
+            update_column_type(
+                conn,
+                row["column_name"],
+                row["source_name"],
+                row["declared_type_new"],
             )
 
     click.echo(f"\n[ok] {len(changed)} column type(s) updated.")

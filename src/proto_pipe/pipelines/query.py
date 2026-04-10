@@ -784,3 +784,233 @@ def query_report_detail(conn, name: str) -> ReportDetail:
         last_validated=last_validated,
         checks=list(checks),
     )
+
+
+# ---------------------------------------------------------------------------
+# Table-with-status query  (moved from cli/commands/view.py, Rule 16/18)
+# ---------------------------------------------------------------------------
+
+def query_table_with_status(
+    conn: duckdb.DuckDBPyConnection,
+    table: str,
+    pk_col: str | None,
+    limit: int,
+) -> pd.DataFrame:
+    """Fetch table rows with a _status column (flagged / ingested).
+
+    Joins to source_block via md5 identity when a primary key is available.
+    Falls back to plain SELECT when no primary key is defined.
+    """
+    try:
+        if pk_col:
+            df = conn.execute(f"""
+                SELECT
+                    CASE WHEN f.id IS NOT NULL THEN 'flagged'
+                         ELSE 'ingested'
+                    END AS _status,
+                    s.*
+                FROM "{table}" s
+                LEFT JOIN source_block f
+                    ON md5(CAST(s."{pk_col}" AS VARCHAR)) = f.id
+                    AND f.table_name = '{table}'
+                LIMIT {limit}
+            """).df()
+        else:
+            df = conn.execute(
+                f'SELECT * FROM "{table}" LIMIT {limit}'
+            ).df()
+    except Exception:
+        df = conn.execute(f'SELECT * FROM "{table}" LIMIT {limit}').df()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Block count query  (for run_all flag gating, Rule 16)
+# ---------------------------------------------------------------------------
+
+def query_block_count(conn, stage: str) -> int:
+    """Return count of rows in source_block or validation_block.
+
+    stage: "source" or "report".
+    Returns 0 if the table does not exist.
+    """
+    table = "source_block" if stage == "source" else "validation_block"
+    return _safe_count(conn, f"SELECT count(*) FROM {table}")
+
+
+# ---------------------------------------------------------------------------
+# Validation export queries  (moved from cli/commands/export.py, Rule 16)
+# ---------------------------------------------------------------------------
+
+def query_validation_report_names(conn) -> list[str]:
+    """Return distinct report names with validation failures, sorted."""
+    return conn.execute(
+        "SELECT DISTINCT report_name FROM validation_block ORDER BY report_name"
+    ).df()["report_name"].tolist()
+
+
+def query_validation_detail_fallback(
+    conn,
+    report_name: str,
+) -> pd.DataFrame:
+    """Return validation_block rows for a report, formatted for export.
+
+    Used as a fallback when pk_col is not available and
+    build_validation_flag_export cannot be called.
+    """
+    return conn.execute("""
+        SELECT
+            id          AS _flag_id,
+            report_name,
+            check_name  AS _flag_check,
+            pk_value,
+            bad_columns AS _flag_columns,
+            reason      AS _flag_reason,
+            flagged_at
+        FROM validation_block
+        WHERE report_name = ?
+        ORDER BY flagged_at DESC
+    """, [report_name]).df()
+
+
+def query_validation_summary(
+    conn,
+    report_name: str | None = None,
+) -> pd.DataFrame:
+    """Return failure counts grouped by report + check for export summary sheet."""
+    if report_name:
+        return conn.execute("""
+            SELECT
+                report_name,
+                check_name,
+                count(*) AS failure_count,
+                min(flagged_at) AS first_flagged,
+                max(flagged_at) AS last_flagged
+            FROM validation_block
+            WHERE report_name = ?
+            GROUP BY report_name, check_name
+            ORDER BY report_name, check_name
+        """, [report_name]).df()
+    else:
+        return conn.execute("""
+            SELECT
+                report_name,
+                check_name,
+                count(*) AS failure_count,
+                min(flagged_at) AS first_flagged,
+                max(flagged_at) AS last_flagged
+            FROM validation_block
+            GROUP BY report_name, check_name
+            ORDER BY report_name, check_name
+        """).df()
+
+
+# ---------------------------------------------------------------------------
+# Lineage graph  (moved from cli/commands/view.py, Rule 16)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LineageGraph:
+    """Dependency graph structures for vp view lineage rendering."""
+    target_to_report: dict      # report target_table → report name
+    table_to_source: dict       # source target_table → source config dict
+    report_by_name: dict        # report name → report config dict
+    report_dependents: dict     # report name → [downstream report names]
+    report_upstream: dict       # report name → upstream report name or None
+
+
+def build_lineage_graph(
+    sources: list[dict],
+    reports: list[dict],
+    get_target_table,
+) -> LineageGraph:
+    """Build dependency graph from config data.
+
+    get_target_table: callable that takes a report dict and returns
+    its target table name (imported from reports.runner).
+    """
+    target_to_report = {get_target_table(r): r["name"] for r in reports}
+    table_to_source = {s["target_table"]: s for s in sources}
+    report_by_name = {r["name"]: r for r in reports}
+
+    report_dependents: dict[str, list[str]] = {r["name"]: [] for r in reports}
+    report_upstream: dict[str, str | None] = {}
+
+    for r in reports:
+        src_table = r.get("source", {}).get("table", "")
+        upstream_report = target_to_report.get(src_table)
+        if upstream_report and upstream_report != r["name"]:
+            report_upstream[r["name"]] = upstream_report
+            report_dependents[upstream_report].append(r["name"])
+        else:
+            report_upstream[r["name"]] = None
+
+    return LineageGraph(
+        target_to_report=target_to_report,
+        table_to_source=table_to_source,
+        report_by_name=report_by_name,
+        report_dependents=report_dependents,
+        report_upstream=report_upstream,
+    )
+
+
+def resolve_report_root_table(graph: LineageGraph, report_name: str) -> str:
+    """Walk upstream through the lineage graph to find the root source table."""
+    visited: set[str] = set()
+    current = report_name
+    while True:
+        if current in visited:
+            break
+        visited.add(current)
+        up = graph.report_upstream.get(current)
+        if up is None:
+            return graph.report_by_name[current].get("source", {}).get("table", "")
+        current = up
+    return ""
+
+
+def query_lineage_timestamps(
+    conn,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Query last-run timestamps for lineage display.
+
+    Returns (last_ingested, last_validated, last_produced) dicts
+    mapping name → YYYY-MM-DD string. Missing entries not included.
+    """
+    def _fmt(ts) -> str:
+        if ts is None:
+            return "never"
+        try:
+            return str(ts)[:10]
+        except Exception:
+            return str(ts)
+
+    last_ingested: dict[str, str] = {}
+    last_validated: dict[str, str] = {}
+    last_produced: dict[str, str] = {}
+
+    try:
+        rows = conn.execute(
+            "SELECT table_name, max(ingested_at) FROM ingest_state GROUP BY table_name"
+        ).fetchall()
+        last_ingested = {r[0]: _fmt(r[1]) for r in rows}
+    except Exception:
+        pass
+
+    try:
+        rows = conn.execute(
+            "SELECT report_name, max(validated_at) FROM validation_pass GROUP BY report_name"
+        ).fetchall()
+        last_validated = {r[0]: _fmt(r[1]) for r in rows}
+    except Exception:
+        pass
+
+    try:
+        rows = conn.execute(
+            "SELECT deliverable_name, max(created_at) FROM report_runs GROUP BY deliverable_name"
+        ).fetchall()
+        last_produced = {r[0]: _fmt(r[1]) for r in rows}
+    except Exception:
+        pass
+
+    return last_ingested, last_validated, last_produced

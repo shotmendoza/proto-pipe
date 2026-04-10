@@ -67,13 +67,17 @@ def export_validation(report, output, pipeline_db, sources_config):
 
     conn = duckdb.connect(p_db)
     try:
+        from proto_pipe.pipelines.query import (
+            query_validation_report_names,
+            query_validation_detail_fallback,
+            query_validation_summary,
+        )
+
         # Build Detail sheet — one entry per flagged report
         if report:
             report_names = [report]
         else:
-            report_names = conn.execute(
-                "SELECT DISTINCT report_name FROM validation_block ORDER BY report_name"
-            ).df()["report_name"].tolist()
+            report_names = query_validation_report_names(conn)
 
         if not report_names:
             click.echo("[error] No validation failures found.")
@@ -106,30 +110,18 @@ def export_validation(report, output, pipeline_db, sources_config):
                     pass
 
             if not pk_col:
-                # Fall back to querying pk_value column directly from validation_block
-                df = coerce_for_display(conn.execute(f"""
-                    SELECT
-                        id          AS _flag_id,
-                        report_name,
-                        check_name  AS _flag_check,
-                        pk_value,
-                        bad_columns AS _flag_columns,
-                        reason      AS _flag_reason,
-                        flagged_at
-                    FROM validation_block
-                    WHERE report_name = ?
-                    ORDER BY flagged_at DESC
-                """, [rname]).df())
+                df = coerce_for_display(
+                    query_validation_detail_fallback(conn, rname)
+                )
             else:
                 try:
                     df = coerce_for_display(
                         build_validation_flag_export(conn, table, rname, pk_col)
                     )
                 except Exception:
-                    df = coerce_for_display(conn.execute("""
-                        SELECT * FROM validation_block WHERE report_name = ?
-                        ORDER BY flagged_at DESC
-                    """, [rname]).df())
+                    df = coerce_for_display(
+                        query_validation_detail_fallback(conn, rname)
+                    )
 
             if not df.empty:
                 detail_frames.append(df)
@@ -137,21 +129,7 @@ def export_validation(report, output, pipeline_db, sources_config):
         detail_df = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
 
         # Build Summary sheet — count failures per report + check
-        summary_df = coerce_for_display(conn.execute("""
-            SELECT
-                report_name,
-                check_name,
-                count(*) AS failure_count,
-                min(flagged_at) AS first_flagged,
-                max(flagged_at) AS last_flagged
-            FROM validation_block
-            WHERE 1=1
-            {}
-            GROUP BY report_name, check_name
-            ORDER BY report_name, check_name
-        """.format("AND report_name = ?" if report else ""),
-            [report] if report else []
-        ).df())
+        summary_df = coerce_for_display(query_validation_summary(conn, report))
 
         if detail_df.empty:
             scope = f" for report '{report}'" if report else ""
