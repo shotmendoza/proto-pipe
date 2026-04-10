@@ -98,7 +98,7 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
             )
         elif status == "completed":
             has_failures = any(
-                v.get("status") in ("failed", "error")
+                v.status in ("failed", "error")
                 for v in r.get("results", {}).values()
             )
             events.append(

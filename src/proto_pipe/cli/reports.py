@@ -203,7 +203,7 @@ def run_all(
             })
         elif status == "completed":
             has_failures = any(
-                v.get("status") in ("failed", "error")
+                v.status in ("failed", "error")
                 for v in r.get("results", {}).values()
             )
             validation_events.append({

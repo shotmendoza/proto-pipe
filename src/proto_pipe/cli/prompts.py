@@ -1603,15 +1603,19 @@ class ValidateProgressReporter(PipelineProgressReporter):
             self._completed += 1
             results = result.get("results", {})
             has_failures = any(
-                v.get("status") in ("failed", "error") for v in results.values()
+                v.status in ("failed", "error") for v in results.values()
             )
             header_style = "bold red" if has_failures else "bold green"
             self._print(f"\n  [{header_style}]{report_name}[/{header_style}] [completed]")
 
             for check_name, outcome in results.items():
                 name = display_name(check_name, self._check_registry)
-                check_status = outcome.get("status", "")
-                failed_count = outcome.get("failed_count", 0)
+                check_status = outcome.status
+                failed_count = (
+                    int(outcome.result.mask.sum())
+                    if outcome.result and outcome.result.mask is not None
+                    else 0
+                )
 
                 if check_status == "passed":
                     self._print(f"    [green]✓[/green] {name}")
@@ -1621,7 +1625,7 @@ class ValidateProgressReporter(PipelineProgressReporter):
                         f"      [dim]{failed_count} row(s) failed → validation_block[/dim]"
                     )
                 elif check_status == "error":
-                    self._print(f"    [bold red]✗ {name}: {outcome.get('error', '')}[/bold red]")
+                    self._print(f"    [bold red]✗ {name}: {outcome.error or ''}[/bold red]")
 
         elif status == "skipped":
             self._skipped += 1
