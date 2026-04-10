@@ -95,7 +95,7 @@ def create_views(
             if skip_missing_tables and (
                     "table" in err_str and ("does not exist" in err_str or "not found" in err_str)):
                 print(f"[skip] View '{name}' — underlying table not yet ingested. ")
-                print(f"Run vp refresh-views after first ingest.")
+                print(f"Run vp refresh views after first ingest.")
                 continue
 
             # Re-raise with context so the user knows which view failed
@@ -116,7 +116,7 @@ def refresh_views(
     conn: duckdb.DuckDBPyConnection,
     views: list[dict],
 ) -> list[str]:
-    """Drop and recreate all views. Called by vp refresh-views and vp run-all.
+    """Drop and recreate all views. Called by vp refresh views and vp run-all.
     Preserves creation order so views that depend on other views work correctly.
     """
     return create_views(conn, views, replace=True, skip_missing_tables=False)

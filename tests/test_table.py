@@ -242,7 +242,7 @@ class TestTableCmd:
     Behavioral guarantees:
     - Exits with a non-zero code
     - Error message names all three replacements: vp view table,
-      vp edit table, vp flagged edit
+      vp edit table, vp errors source edit
     - Does not execute any DB query or display logic
     """
 
@@ -264,7 +264,7 @@ class TestTableCmd:
     def test_error_mentions_vp_flagged_edit(self):
         runner = CliRunner()
         result = runner.invoke(table_cmd, ["sales"])
-        assert "vp flagged edit" in result.output
+        assert "vp errors source edit" in result.output
 
     def test_does_not_query_db(self, tmp_path):
         """Exits before any DB connection — nonexistent DB path causes no

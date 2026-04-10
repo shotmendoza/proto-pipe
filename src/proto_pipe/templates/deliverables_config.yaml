@@ -1,15 +1,15 @@
 # deliverables:
 #  - name: "my_export" # Unique name — used on the CLI:
-#                                              #   vp pull-report my_export
-#    format: xlsx                              # "xlsx", "csv"
+#                                              #   vp deliver my_export
+#    format: xlsx # "xlsx", "csv"
 #
-#    filename_template: "export_{date}.xlsx"   # {date} = YYYY-MM-DD of run, {report_name} = report name (csv only)
+#    filename_template: "export_{date}.xlsx" # {date} = YYYY-MM-DD of run, {report_name} = report name (csv only)
 #
 #    output_dir: "output/custom/" # Optional. Overrides pipeline.yaml output_dir.
 #
 #    reports:
 #      - name: "my_report" # Must match a name in reports_config.yaml
-#        sheet: "My Sheet"                     # xlsx only. Defaults to report name if omitted.
+#        sheet: "My Sheet" # xlsx only. Defaults to report name if omitted.
 #
 #        # --- Query path A: SQL file ---
 #        sql_file: "config/sql/my_report.sql" # Path to a .sql file.
@@ -28,13 +28,13 @@
 
 #deliverables:
 #  - name: "monthly_sales_pack"
-#    format: xlsx                              # xlsx = one file, multiple sheets
-#    filename_template: "sales_{date}.xlsx"    # {date} = YYYY-MM-DD of run
-#    output_dir: "output/reports/"             # overrides pipeline.yaml if set
+#    format: xlsx # xlsx = one file, multiple sheets
+#    filename_template: "sales_{date}.xlsx" # {date} = YYYY-MM-DD of run
+#    output_dir: "output/reports/" # overrides pipeline.yaml if set
 #    reports:
 #      - name: "daily_sales_validation"
 #        sheet: "Sales"
-#        filters:                              # default filters, CLI can override
+#        filters: # default filters, CLI can override
 #          date_filters:
 #            - col: "order_date"
 #              from: "2026-01-01"
@@ -51,7 +51,7 @@
 #              from: "2026-01-01"
 #
 #  - name: "ops_daily_drop"
-#    format: csv                               # csv = one file per report
+#    format: csv # csv = one file per report
 #    filename_template: "{report_name}_{date}.csv"
 #    reports:
 #      - name: "daily_sales_validation"

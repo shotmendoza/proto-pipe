@@ -177,7 +177,7 @@ def ingest_log(status, table, limit, pipeline_db):
 
     except Exception as e:
         click.echo(f"[error] Could not read ingest_state: {e}")
-        click.echo("Has `vp db-init` been run yet?")
+        click.echo("Has `vp init db` been run yet?")
     finally:
         conn.close()
 
@@ -247,7 +247,7 @@ def update_table(table, filepath, pipeline_db, sources_config, mode):
         if result.get("new_cols"):
             click.echo(f"  New columns added: {', '.join(result['new_cols'])}")
         if result["flagged"]:
-            click.echo(f"  Run: vp flagged --table {table}")
+            click.echo(f"  Run: vp errors source {table}")
     else:
         click.echo(f"[error] {result.get('message', 'Ingest failed')}")
 

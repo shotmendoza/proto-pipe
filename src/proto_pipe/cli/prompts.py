@@ -23,14 +23,14 @@ def prompt_custom_export_path() -> "Path | None":
     """Prompt for a custom CSV export path with a pipeline warning.
 
     Shows a warning that custom paths are not picked up by vp ingest or
-    vp flagged retry, then asks for a full output path from the user.
+    vp errors source retry, then asks for a full output path from the user.
 
     Returns a resolved Path, or None if the user cancels.
     """
     from pathlib import Path
 
     click.echo(
-        "\n  [warn] Custom paths won't be picked up by vp ingest or vp flagged retry. "
+        "\n[warn] Custom paths won't be picked up by vp ingest or vp errors source retry. "
         "Use csv to export to output_dir so the pipeline can find the file automatically."
     )
     raw = questionary.text(

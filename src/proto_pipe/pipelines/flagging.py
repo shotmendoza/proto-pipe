@@ -6,7 +6,7 @@ Both the source layer (io/ingest.py) and the report layer
   - Computing row hashes for change detection
   - Writing blocked rows to source_block or validation_block
   - Comparing incoming hashes against source_pass or validation_pass
-  - Building the enriched flag export view for vp flagged / vp validated
+  - Building the enriched flag export view for vp errors source / vp errors report
 
 All direct DuckDB flag operations live here. Neither ingest.py nor
 runner.py should contain raw SQL against these tables.
@@ -294,7 +294,7 @@ def compare_validation_hashes(
 
 
 # ---------------------------------------------------------------------------
-# Flag export — shared by vp flagged and vp validated
+# Flag export — shared by vp errors source / vp errors report
 # ---------------------------------------------------------------------------
 
 def build_source_flag_export(
@@ -302,7 +302,7 @@ def build_source_flag_export(
     table_name: str,
     pk_col: str,
 ) -> pd.DataFrame:
-    """Build the enriched flag export for vp flagged edit / vp flagged open.
+    """Build the enriched flag export for vp errors source edit / vp errors source export
 
     Groups source_block entries by source_file, globs each file via DuckDB,
     concatenates with union_by_name=True, then INNER JOINs to source_block
@@ -381,7 +381,7 @@ def build_validation_flag_export(
     report_name: str,
     pk_col: str,
 ) -> pd.DataFrame:
-    """Build the enriched flag export for vp validated edit / vp validated open.
+    """Build the enriched flag export for vp errors report edit / vp errors report export
 
     INNER JOINs validation_block to the report table on pk_value.
     Adds _flag_* guide columns. No source file globbing needed —

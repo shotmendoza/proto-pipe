@@ -14,7 +14,7 @@
 # Using absolute paths (e.g. /Volumes/SharedDrive/...) avoids ambiguity.
 #
 # Keys marked [required] have defaults that will likely be wrong
-# for your project. Update them before running `vp db-init`.
+# for your project. Update them before running `vp init db`.
 # Keys marked [optional] work fine with the defaults for most setups.
 
 paths:
@@ -27,7 +27,7 @@ paths:
   incoming_dir: "data/incoming/"
 
   # [optional] Directory where deliverable output files are written.
-  # `vp pull-report` writes CSV and Excel files here.
+  # `vp deliver` writes CSV and Excel files here.
   # Can be overridden per deliverable in deliverables_config.yaml.
   output_dir: "output/reports/"
 
@@ -49,12 +49,12 @@ paths:
 
   # [optional] Path to the main DuckDB database file.
   # This is where ingested tables, flagged rows, and report run history live.
-  # Created automatically by `vp db-init`. Safe to leave as-is.
+  # Created automatically by `vp init db`. Safe to leave as-is.
   pipeline_db: "data/pipeline.db"
 
   # [optional] Path to the watermark DuckDB database file.
   # Tracks the last successful validation run per report so only new rows
-  # are checked on subsequent runs. Created automatically by `vp db-init`.
+  # are checked on subsequent runs. Created automatically by `vp init db`.
   watermark_db: "data/watermarks.db"
 
 # [optional] When true, vp new source will show a multi-select checkbox for

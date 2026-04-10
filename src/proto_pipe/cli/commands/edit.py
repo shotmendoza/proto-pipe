@@ -84,7 +84,7 @@ def edit_source(table, force, pipeline_db, sources_config):
 
     with duckdb.connect(p_db) as conn:
         # Always fetch registry hints for this source — needed even when
-        # the table doesn't exist yet (e.g. after vp table-reset)
+        # the table doesn't exist yet (e.g. after vp delete report)
         try:
             rows = conn.execute(
                 """
@@ -451,7 +451,7 @@ def edit_table(table_name, table, pipeline_db):
         if name in PIPELINE_TABLES:
             click.echo(
                 f"[error] '{name}' is a pipeline table and cannot be edited here.\n"
-                f"Use 'vp flagged edit' to edit flagged rows."
+                f"Use 'vp errors source edit' to edit flagged rows."
             )
             return
 
@@ -631,7 +631,7 @@ def edit_column_type(pipeline_db, diff):
 
     if not drop:
         click.echo(
-            "  Skipped. Run: vp table-reset --report <name>  to drop tables manually."
+            "  Skipped. Run: vp delete report --report <name>  to drop tables manually."
         )
         return
 

@@ -9,7 +9,7 @@ Handles the flagged-row correction workflow:
                           resolved entries from source_block.
 
 Note: export_flagged / import_corrections are the low-level implementation.
-The CLI layer (vp flagged open / vp flagged retry) calls build_source_flag_export
+The CLI layer (vp errors source open / vp errors source retry) calls build_source_flag_export
 from flagging.py for the enriched view. This module handles direct file I/O
 and the correction write-back, shared by both CLI paths.
 

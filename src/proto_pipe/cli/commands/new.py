@@ -148,8 +148,8 @@ def new_source(sources_config, incoming_dir):
         except Exception as e:
             click.echo(
                 f"[warn] Column types were not saved to column_type_registry: {e}\n"
-                f"  Has 'vp db-init' been run? Types confirmed this session are lost.\n"
-                f"  Run 'vp db-init' then 'vp new source' again to re-confirm them."
+                f"  Has 'vp init db' been run? Types confirmed this session are lost.\n"
+                f"  Run 'vp init db' then 'vp new source' again to re-confirm them."
             )
     config.add_or_update(prompter.source)
     click.echo(f"\n[ok] Source '{prompter.source['name']}' added to {src_cfg}")
@@ -299,11 +299,11 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
     if sql_file:
         click.echo(f"1. Edit {sql_file} with your transformation query")
         click.echo(
-            f"2. Run: vp pull-report --deliverable {prompter.deliverable['name']}"
+            f"2. Run: vp deliver {prompter.deliverable['name']}"
         )
     else:
         click.echo(
-            f"1. Run: vp pull-report --deliverable {prompter.deliverable['name']}"
+            f"1. Run: vp deliver {prompter.deliverable['name']}"
         )
 
 
@@ -354,7 +354,7 @@ ORDER BY <date_col> DESC;
     click.echo(f"\nNext steps:")
     click.echo(f"1. Edit {dest} with your query")
     click.echo(f"2. Add an entry in deliverables_config.yaml referencing {name}.sql")
-    click.echo(f"3. Run: vp pull-report --deliverable {name}")
+    click.echo(f"3. Run: vp deliver {name}")
 
 
 @click.command("new-macro")
@@ -390,7 +390,7 @@ def new_macro(name: str, macros_dir: str | None):
 -- Macros are registered at pipeline startup and available in all
 -- view and deliverable SQL queries.
 --
--- Use CREATE OR REPLACE so re-running vp db-init is idempotent.
+-- Use CREATE OR REPLACE so re-running vp init db is idempotent.
 
 CREATE OR REPLACE MACRO {name}(val) AS
     CASE
@@ -412,7 +412,7 @@ CREATE OR REPLACE MACRO {name}(val) AS
 
     click.echo(f"\nNext steps:")
     click.echo(f"1. Edit {dest} with your macro logic")
-    click.echo(f"2. Run: vp db-init   (re-registers all macros)")
+    click.echo(f"2. Run: vp init db   (re-registers all macros)")
 
 
 @click.command("new-sql")

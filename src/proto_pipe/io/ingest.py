@@ -15,7 +15,7 @@ Data layer invariants (see Spec):
 
 Table lifecycle:
 - vp new source  — confirms column types, writes column_type_registry
-- vp db-init     — creates pipeline tables including source_pass and source_block
+- vp init db     — creates pipeline tables including source_pass and source_block
 - First ingest   — CREATE TABLE AS SELECT, writes source_pass for all rows
 - Subsequent     — auto_migrate new columns, _handle_duplicates via source_pass
 
@@ -774,11 +774,11 @@ def ingest_single_file(
     :param source:                Source definition from sources_config.yaml.
     :param mode:                  'append' or 'replace'.
     :param on_duplicate_override: Overrides source.on_duplicate when set.
-                                  Pass 'upsert' from vp flagged retry.
+                                  Pass 'upsert' from vp errors source retry.
     :param log_status_override:   Overrides the ingest_state status when set.
-                                  Pass 'correction' from vp flagged retry.
+                                  Pass 'correction' from vp errors source retry.
     :param strip_pipeline_cols:   When True, drops all _-prefixed columns after
-                                  load. Pass True from vp flagged retry to strip
+                                  load. Pass True from vp errors source retry to strip
                                   _flag_id, _flag_reason, _flag_columns etc.
     :return: {status, table, rows, new_cols, flagged, skipped} or
              {status: 'failed', message} on failure.
