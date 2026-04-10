@@ -503,6 +503,20 @@ def migrate_pipeline_schema(conn: duckdb.DuckDBPyConnection) -> list[str]:
         init_validation_block(conn)
         applied.append("Created validation_block table")
 
+    # ── 6. check_registry_metadata.func_name — add if missing ─────────────
+    if _table_exists(conn, "check_registry_metadata"):
+        existing_cols = set(
+            conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'check_registry_metadata'"
+            ).df()["column_name"].tolist()
+        )
+        if "func_name" not in existing_cols:
+            conn.execute(
+                'ALTER TABLE check_registry_metadata ADD COLUMN func_name VARCHAR'
+            )
+            applied.append("Added column check_registry_metadata.func_name")
+
     return applied
 
 

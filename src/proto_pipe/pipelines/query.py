@@ -574,12 +574,15 @@ def query_error_groups(
 ) -> dict[str, list[tuple[str, int]]]:
     """Error rows grouped by scope and cause for prescriptive display.
 
+    LEFT JOINs check_registry_metadata to resolve UUIDs to human-readable
+    function names. Falls back to the raw check_name when no metadata exists.
+
     Args:
         stage: "source" or "report".
         name: optional table_name (source) or report_name (report) filter.
 
     Returns:
-        dict mapping scope_name → [(check_name, count), ...].
+        dict mapping scope_name → [(display_name, count), ...].
     """
     if stage == "source":
         flag_table = "source_block"
@@ -591,21 +594,26 @@ def query_error_groups(
     where = ""
     params: list = []
     if name:
-        where = f"WHERE {group_col} = ?"
+        where = f"WHERE f.{group_col} = ?"
         params = [name]
 
     rows = conn.execute(f"""
-        SELECT {group_col}, check_name, count(*) AS cnt
-        FROM {flag_table}
+        SELECT
+            f.{group_col},
+            COALESCE(m.func_name, f.check_name) AS display_name,
+            count(*) AS cnt
+        FROM {flag_table} f
+        LEFT JOIN check_registry_metadata m
+            ON m.check_name = f.check_name
         {where}
-        GROUP BY {group_col}, check_name
-        ORDER BY {group_col}, check_name
+        GROUP BY f.{group_col}, display_name
+        ORDER BY f.{group_col}, display_name
     """, params).fetchall()
 
     from collections import defaultdict
     by_scope: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    for scope_name, check_name, cnt in rows:
-        by_scope[scope_name].append((check_name, cnt))
+    for scope_name, check_display, cnt in rows:
+        by_scope[scope_name].append((check_display, cnt))
     return dict(by_scope)
 
 
@@ -768,11 +776,16 @@ def query_report_detail(conn, name: str) -> ReportDetail:
     checks = []
     try:
         checks = conn.execute("""
-            SELECT check_name, status, count(*) AS cnt
-            FROM validation_pass
-            WHERE report_name = ?
-            GROUP BY check_name, status
-            ORDER BY check_name, status
+            SELECT
+                COALESCE(m.func_name, vp.check_name) AS display_name,
+                vp.status,
+                count(*) AS cnt
+            FROM validation_pass vp
+            LEFT JOIN check_registry_metadata m
+                ON m.check_name = vp.check_name
+            WHERE vp.report_name = ?
+            GROUP BY display_name, vp.status
+            ORDER BY display_name, vp.status
         """, [name]).fetchall()
     except Exception:
         pass
@@ -877,32 +890,30 @@ def query_validation_summary(
     conn,
     report_name: str | None = None,
 ) -> pd.DataFrame:
-    """Return failure counts grouped by report + check for export summary sheet."""
+    """Return failure counts grouped by report + check for export summary sheet.
+
+    Resolves check UUIDs to function names via check_registry_metadata.
+    """
+    where = ""
+    params: list = []
     if report_name:
-        return conn.execute("""
-            SELECT
-                report_name,
-                check_name,
-                count(*) AS failure_count,
-                min(flagged_at) AS first_flagged,
-                max(flagged_at) AS last_flagged
-            FROM validation_block
-            WHERE report_name = ?
-            GROUP BY report_name, check_name
-            ORDER BY report_name, check_name
-        """, [report_name]).df()
-    else:
-        return conn.execute("""
-            SELECT
-                report_name,
-                check_name,
-                count(*) AS failure_count,
-                min(flagged_at) AS first_flagged,
-                max(flagged_at) AS last_flagged
-            FROM validation_block
-            GROUP BY report_name, check_name
-            ORDER BY report_name, check_name
-        """).df()
+        where = "WHERE vb.report_name = ?"
+        params = [report_name]
+
+    return conn.execute(f"""
+        SELECT
+            vb.report_name,
+            COALESCE(m.func_name, vb.check_name) AS check_name,
+            count(*) AS failure_count,
+            min(vb.flagged_at) AS first_flagged,
+            max(vb.flagged_at) AS last_flagged
+        FROM validation_block vb
+        LEFT JOIN check_registry_metadata m
+            ON m.check_name = vb.check_name
+        {where}
+        GROUP BY vb.report_name, COALESCE(m.func_name, vb.check_name)
+        ORDER BY vb.report_name, check_name
+    """, params).df()
 
 
 # ---------------------------------------------------------------------------

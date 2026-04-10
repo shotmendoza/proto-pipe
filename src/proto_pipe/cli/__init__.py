@@ -66,13 +66,17 @@ class SectionGroup(click.Group):
             else:
                 unsectioned.append((name, help_text))
 
-        # Render each section in order
-        limit = formatter.width - 6 - max(len(n) for n, _ in commands)
+        # Render each section in defined order
         for section_name in _COMMAND_SECTIONS:
             if section_name not in sections:
                 continue
+            order = _COMMAND_SECTIONS[section_name]
+            sorted_cmds = sorted(
+                sections[section_name],
+                key=lambda item: order.index(item[0]) if item[0] in order else len(order),
+            )
             with formatter.section(section_name):
-                formatter.write_dl(sections[section_name])
+                formatter.write_dl(sorted_cmds)
 
         if unsectioned:
             with formatter.section("Other"):

@@ -1080,10 +1080,16 @@ class CheckParamInspector:
 
         Safe to call multiple times — updates the record if the key changed
         (function was modified), no-op if key is unchanged.
+
+        Persists func_name (original __name__) so query-layer functions can
+        resolve UUIDs to human-readable names via LEFT JOIN — without loading
+        the full check registry.
         """
         key = self.make_key()
+        func_name = getattr(self.func, "__name__", "")
+
         existing = conn.execute(
-            "SELECT check_key FROM check_registry_metadata WHERE check_name = ?",
+            "SELECT check_key, func_name FROM check_registry_metadata WHERE check_name = ?",
             [check_name],
         ).fetchone()
 
@@ -1092,23 +1098,26 @@ class CheckParamInspector:
         if existing is None:
             conn.execute("""
                 INSERT INTO check_registry_metadata
-                    (id, check_name, check_key, is_multiselect_eligible,
+                    (id, check_name, check_key, func_name,
+                     is_multiselect_eligible,
                      column_params, scalar_params, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 str(uuid.uuid4()),
                 check_name,
                 key,
+                func_name,
                 self.is_multiselect_eligible(),
                 ", ".join(self.column_params()),
                 ", ".join(self.scalar_params()),
                 now,
             ])
-        elif existing[0] != key:
-            # Function changed — update metadata
+        elif existing[0] != key or (existing[1] or "") != func_name:
+            # Function changed or func_name was missing — update metadata
             conn.execute("""
                 UPDATE check_registry_metadata
                 SET check_key = ?,
+                    func_name = ?,
                     is_multiselect_eligible = ?,
                     column_params = ?,
                     scalar_params = ?,
@@ -1116,10 +1125,11 @@ class CheckParamInspector:
                 WHERE check_name = ?
             """, [
                 key,
+                func_name,
                 self.is_multiselect_eligible(),
                 ", ".join(self.column_params()),
                 ", ".join(self.scalar_params()),
                 now,
                 check_name,
             ])
-        # If key matches, no update needed
+        # If key and func_name both match, no update needed

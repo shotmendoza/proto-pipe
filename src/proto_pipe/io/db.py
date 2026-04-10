@@ -254,6 +254,7 @@ def init_check_registry_metadata(conn: duckdb.DuckDBPyConnection) -> None:
             id                      VARCHAR PRIMARY KEY,
             check_name              VARCHAR NOT NULL UNIQUE,
             check_key               VARCHAR NOT NULL,
+            func_name               VARCHAR,
             is_multiselect_eligible BOOLEAN NOT NULL,
             column_params           VARCHAR,
             scalar_params           VARCHAR,

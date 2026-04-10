@@ -1750,15 +1750,15 @@ _REPORT_FIXES: dict[str, tuple[str, list[str]]] = {
         "check returned failing rows",
         [
             "vp errors report export {name} --open  →  fix values  →  vp errors report retry {name}",
-            "edit check function  →  vp validate",
+            "if the check logic is wrong (not the data): edit the function in your checks file  →  vp validate --full",
             "vp errors report clear {name}",
         ],
     ),
     "__transform_type_mismatch__": (
         "transform output type doesn't match the column type",
         [
-            "vp edit column-type  →  vp validate",
-            "edit transform function  →  vp validate",
+            "vp edit column-type  →  vp validate --full",
+            "if the transform logic is wrong: edit the function in your checks file  →  vp validate --full",
         ],
     ),
 }
