@@ -1078,58 +1078,18 @@ class CheckParamInspector:
     ) -> None:
         """Store or update check metadata in check_registry_metadata.
 
-        Safe to call multiple times — updates the record if the key changed
-        (function was modified), no-op if key is unchanged.
-
-        Persists func_name (original __name__) so query-layer functions can
-        resolve UUIDs to human-readable names via LEFT JOIN — without loading
-        the full check registry.
+        Computes inspection values and delegates all SQL to
+        upsert_check_metadata in io/db.py — checks/ never executes
+        raw SQL against pipeline tables (module responsibility rule).
         """
-        key = self.make_key()
-        func_name = getattr(self.func, "__name__", "")
+        from proto_pipe.io.db import upsert_check_metadata
 
-        existing = conn.execute(
-            "SELECT check_key, func_name FROM check_registry_metadata WHERE check_name = ?",
-            [check_name],
-        ).fetchone()
-
-        now = datetime.now(timezone.utc)
-
-        if existing is None:
-            conn.execute("""
-                INSERT INTO check_registry_metadata
-                    (id, check_name, check_key, func_name,
-                     is_multiselect_eligible,
-                     column_params, scalar_params, recorded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                str(uuid.uuid4()),
-                check_name,
-                key,
-                func_name,
-                self.is_multiselect_eligible(),
-                ", ".join(self.column_params()),
-                ", ".join(self.scalar_params()),
-                now,
-            ])
-        elif existing[0] != key or (existing[1] or "") != func_name:
-            # Function changed or func_name was missing — update metadata
-            conn.execute("""
-                UPDATE check_registry_metadata
-                SET check_key = ?,
-                    func_name = ?,
-                    is_multiselect_eligible = ?,
-                    column_params = ?,
-                    scalar_params = ?,
-                    recorded_at = ?
-                WHERE check_name = ?
-            """, [
-                key,
-                func_name,
-                self.is_multiselect_eligible(),
-                ", ".join(self.column_params()),
-                ", ".join(self.scalar_params()),
-                now,
-                check_name,
-            ])
-        # If key and func_name both match, no update needed
+        upsert_check_metadata(
+            conn,
+            check_name=check_name,
+            check_key=self.make_key(),
+            func_name=getattr(self.func, "__name__", ""),
+            is_multiselect_eligible=self.is_multiselect_eligible(),
+            column_params=", ".join(self.column_params()),
+            scalar_params=", ".join(self.scalar_params()),
+        )

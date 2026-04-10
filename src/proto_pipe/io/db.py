@@ -105,6 +105,23 @@ def table_exists(conn: duckdb.DuckDBPyConnection, table: str) -> bool:
     return result is not None and result[0] > 0
 
 
+def column_exists(conn: duckdb.DuckDBPyConnection, table: str, column: str) -> bool:
+    """Return True if a column exists on a table.
+
+    Used by upsert_check_metadata and query functions to handle pre-migration
+    databases where func_name column may not exist yet.
+    """
+    try:
+        result = conn.execute(
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_name = ? AND column_name = ?",
+            [table, column],
+        ).fetchone()
+        return result is not None and result[0] > 0
+    except Exception:
+        return False
+
+
 def get_column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
     """Return {column_name: data_type} for all columns in a table.
 
@@ -261,6 +278,122 @@ def init_check_registry_metadata(conn: duckdb.DuckDBPyConnection) -> None:
             recorded_at             TIMESTAMPTZ NOT NULL
         )
     """)
+
+
+def upsert_check_metadata(
+    conn: duckdb.DuckDBPyConnection,
+    check_name: str,
+    check_key: str,
+    func_name: str,
+    is_multiselect_eligible: bool,
+    column_params: str,
+    scalar_params: str,
+) -> None:
+    """Insert or update a row in check_registry_metadata.
+
+    Safe to call multiple times — updates the record if the key changed
+    (function was modified), no-op if key is unchanged.
+
+    Persists func_name so query-layer functions can resolve UUIDs to
+    human-readable names via LEFT JOIN — without loading the full check
+    registry at display time.
+
+    Resilient to pre-migration databases where func_name column does not
+    yet exist — falls back to writing without it.
+    """
+    import uuid as _uuid
+
+    has_func_name = column_exists(conn, "check_registry_metadata", "func_name")
+
+    existing = conn.execute(
+        "SELECT check_key FROM check_registry_metadata WHERE check_name = ?",
+        [check_name],
+    ).fetchone()
+
+    now = datetime.now(timezone.utc)
+
+    if existing is None:
+        if has_func_name:
+            conn.execute("""
+                INSERT INTO check_registry_metadata
+                    (id, check_name, check_key, func_name,
+                     is_multiselect_eligible,
+                     column_params, scalar_params, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                str(_uuid.uuid4()),
+                check_name,
+                check_key,
+                func_name,
+                is_multiselect_eligible,
+                column_params,
+                scalar_params,
+                now,
+            ])
+        else:
+            conn.execute("""
+                INSERT INTO check_registry_metadata
+                    (id, check_name, check_key, is_multiselect_eligible,
+                     column_params, scalar_params, recorded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, [
+                str(_uuid.uuid4()),
+                check_name,
+                check_key,
+                is_multiselect_eligible,
+                column_params,
+                scalar_params,
+                now,
+            ])
+    elif existing[0] != check_key:
+        if has_func_name:
+            conn.execute("""
+                UPDATE check_registry_metadata
+                SET check_key = ?,
+                    func_name = ?,
+                    is_multiselect_eligible = ?,
+                    column_params = ?,
+                    scalar_params = ?,
+                    recorded_at = ?
+                WHERE check_name = ?
+            """, [
+                check_key,
+                func_name,
+                is_multiselect_eligible,
+                column_params,
+                scalar_params,
+                now,
+                check_name,
+            ])
+        else:
+            conn.execute("""
+                UPDATE check_registry_metadata
+                SET check_key = ?,
+                    is_multiselect_eligible = ?,
+                    column_params = ?,
+                    scalar_params = ?,
+                    recorded_at = ?
+                WHERE check_name = ?
+            """, [
+                check_key,
+                is_multiselect_eligible,
+                column_params,
+                scalar_params,
+                now,
+                check_name,
+            ])
+    elif has_func_name:
+        # Key unchanged but func_name may need backfill after migration
+        existing_name = conn.execute(
+            "SELECT func_name FROM check_registry_metadata WHERE check_name = ?",
+            [check_name],
+        ).fetchone()
+        if (existing_name[0] or "") != func_name:
+            conn.execute(
+                "UPDATE check_registry_metadata SET func_name = ?, recorded_at = ? WHERE check_name = ?",
+                [func_name, now, check_name],
+            )
+    # Otherwise no update needed
 
 
 def init_column_type_registry(conn: duckdb.DuckDBPyConnection) -> None:

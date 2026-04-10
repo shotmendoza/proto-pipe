@@ -574,8 +574,9 @@ def query_error_groups(
 ) -> dict[str, list[tuple[str, int]]]:
     """Error rows grouped by scope and cause for prescriptive display.
 
-    LEFT JOINs check_registry_metadata to resolve UUIDs to human-readable
-    function names. Falls back to the raw check_name when no metadata exists.
+    When check_registry_metadata has a func_name column (post-migration),
+    LEFT JOINs to resolve UUIDs to human-readable function names.
+    Falls back to raw check_name on pre-migration databases.
 
     Args:
         stage: "source" or "report".
@@ -584,6 +585,8 @@ def query_error_groups(
     Returns:
         dict mapping scope_name → [(display_name, count), ...].
     """
+    from proto_pipe.io.db import column_exists
+
     if stage == "source":
         flag_table = "source_block"
         group_col = "table_name"
@@ -591,24 +594,36 @@ def query_error_groups(
         flag_table = "validation_block"
         group_col = "report_name"
 
+    has_func_name = column_exists(conn, "check_registry_metadata", "func_name")
+
     where = ""
     params: list = []
     if name:
-        where = f"WHERE f.{group_col} = ?"
+        where_col = f"f.{group_col}" if has_func_name else group_col
+        where = f"WHERE {where_col} = ?"
         params = [name]
 
-    rows = conn.execute(f"""
-        SELECT
-            f.{group_col},
-            COALESCE(m.func_name, f.check_name) AS display_name,
-            count(*) AS cnt
-        FROM {flag_table} f
-        LEFT JOIN check_registry_metadata m
-            ON m.check_name = f.check_name
-        {where}
-        GROUP BY f.{group_col}, display_name
-        ORDER BY f.{group_col}, display_name
-    """, params).fetchall()
+    if has_func_name:
+        rows = conn.execute(f"""
+            SELECT
+                f.{group_col},
+                COALESCE(m.func_name, f.check_name) AS display_name,
+                count(*) AS cnt
+            FROM {flag_table} f
+            LEFT JOIN check_registry_metadata m
+                ON m.check_name = f.check_name
+            {where}
+            GROUP BY f.{group_col}, display_name
+            ORDER BY f.{group_col}, display_name
+        """, params).fetchall()
+    else:
+        rows = conn.execute(f"""
+            SELECT {group_col}, check_name, count(*) AS cnt
+            FROM {flag_table}
+            {where}
+            GROUP BY {group_col}, check_name
+            ORDER BY {group_col}, check_name
+        """, params).fetchall()
 
     from collections import defaultdict
     by_scope: dict[str, list[tuple[str, int]]] = defaultdict(list)
@@ -758,6 +773,8 @@ def query_report_statuses(conn) -> list[ReportStatus]:
 
 def query_report_detail(conn, name: str) -> ReportDetail:
     """Detailed data for one report."""
+    from proto_pipe.io.db import column_exists
+
     row_count = _safe_count(conn, f'SELECT count(*) FROM "{name}"')
     failure_count = _safe_count(
         conn, "SELECT count(*) FROM validation_block WHERE report_name = ?", [name]
@@ -773,20 +790,31 @@ def query_report_detail(conn, name: str) -> ReportDetail:
     except Exception:
         pass
 
+    has_func_name = column_exists(conn, "check_registry_metadata", "func_name")
+
     checks = []
     try:
-        checks = conn.execute("""
-            SELECT
-                COALESCE(m.func_name, vp.check_name) AS display_name,
-                vp.status,
-                count(*) AS cnt
-            FROM validation_pass vp
-            LEFT JOIN check_registry_metadata m
-                ON m.check_name = vp.check_name
-            WHERE vp.report_name = ?
-            GROUP BY display_name, vp.status
-            ORDER BY display_name, vp.status
-        """, [name]).fetchall()
+        if has_func_name:
+            checks = conn.execute("""
+                SELECT
+                    COALESCE(m.func_name, vp.check_name) AS display_name,
+                    vp.status,
+                    count(*) AS cnt
+                FROM validation_pass vp
+                LEFT JOIN check_registry_metadata m
+                    ON m.check_name = vp.check_name
+                WHERE vp.report_name = ?
+                GROUP BY display_name, vp.status
+                ORDER BY display_name, vp.status
+            """, [name]).fetchall()
+        else:
+            checks = conn.execute("""
+                SELECT check_name, status, count(*) AS cnt
+                FROM validation_pass
+                WHERE report_name = ?
+                GROUP BY check_name, status
+                ORDER BY check_name, status
+            """, [name]).fetchall()
     except Exception:
         pass
 
@@ -892,28 +920,49 @@ def query_validation_summary(
 ) -> pd.DataFrame:
     """Return failure counts grouped by report + check for export summary sheet.
 
-    Resolves check UUIDs to function names via check_registry_metadata.
+    Resolves check UUIDs to function names via check_registry_metadata
+    when the func_name column exists (post-migration). Falls back to raw
+    check_name on pre-migration databases.
     """
+    from proto_pipe.io.db import column_exists
+
+    has_func_name = column_exists(conn, "check_registry_metadata", "func_name")
+
     where = ""
     params: list = []
     if report_name:
-        where = "WHERE vb.report_name = ?"
+        where_col = "vb.report_name" if has_func_name else "report_name"
+        where = f"WHERE {where_col} = ?"
         params = [report_name]
 
-    return conn.execute(f"""
-        SELECT
-            vb.report_name,
-            COALESCE(m.func_name, vb.check_name) AS check_name,
-            count(*) AS failure_count,
-            min(vb.flagged_at) AS first_flagged,
-            max(vb.flagged_at) AS last_flagged
-        FROM validation_block vb
-        LEFT JOIN check_registry_metadata m
-            ON m.check_name = vb.check_name
-        {where}
-        GROUP BY vb.report_name, COALESCE(m.func_name, vb.check_name)
-        ORDER BY vb.report_name, check_name
-    """, params).df()
+    if has_func_name:
+        return conn.execute(f"""
+            SELECT
+                vb.report_name,
+                COALESCE(m.func_name, vb.check_name) AS check_name,
+                count(*) AS failure_count,
+                min(vb.flagged_at) AS first_flagged,
+                max(vb.flagged_at) AS last_flagged
+            FROM validation_block vb
+            LEFT JOIN check_registry_metadata m
+                ON m.check_name = vb.check_name
+            {where}
+            GROUP BY vb.report_name, COALESCE(m.func_name, vb.check_name)
+            ORDER BY vb.report_name, check_name
+        """, params).df()
+    else:
+        return conn.execute(f"""
+            SELECT
+                report_name,
+                check_name,
+                count(*) AS failure_count,
+                min(flagged_at) AS first_flagged,
+                max(flagged_at) AS last_flagged
+            FROM validation_block
+            {where}
+            GROUP BY report_name, check_name
+            ORDER BY report_name, check_name
+        """, params).df()
 
 
 # ---------------------------------------------------------------------------
