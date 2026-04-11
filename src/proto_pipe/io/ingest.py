@@ -280,11 +280,7 @@ def ingest_directory(
             )
 
     if unmatched:
-        print(f"[warn] No source match for: {', '.join(unmatched)}")
-        for filename in unmatched:
-            log_ingest_state(
-                conn, filename, None, "skipped", message="No matching source pattern"
-            )
+        pass
 
     conn.close()
     return summary
