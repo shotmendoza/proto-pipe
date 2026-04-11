@@ -1731,6 +1731,220 @@ class DeliverableConfigPrompter:
 
         return report_entries
 
+# ---------------------------------------------------------------------------
+
+
+class ViewConfigPrompter:
+    """Collects user input for creating a new view configuration.
+
+    Single-use: create a fresh instance per command invocation.
+    After run() returns True, read results from self.view_config,
+    self.sql_spec, and self.insert_after.
+    """
+
+    def __init__(self) -> None:
+        # Output properties — only valid after run() returns True
+        self.view_config: dict = {}  # {"name": ..., "sql_file": ...}
+        self.sql_spec = None  # ViewSQLSpec
+        self.insert_after: str | None = None  # view name for dependency ordering
+
+    # ---------------------------------------------------------------------------
+    # run() — full view config flow
+    # ---------------------------------------------------------------------------
+
+    def run(
+        self,
+        existing_view_names: list[str],
+        available_tables: list,
+        pipeline_db: str,
+    ) -> bool:
+        """Run the full view configuration flow.
+
+        Stores results in self.view_config, self.sql_spec, self.insert_after.
+        Returns True on completion, False if cancelled.
+
+        :param existing_view_names: Names of already-configured views.
+        :param available_tables:    list[str] or list[tuple[str, int]] from
+                                    get_all_source_tables.
+        :param pipeline_db:         Path to pipeline DB for column discovery.
+        """
+        from proto_pipe.cli.scaffold import ViewSQLSpec
+        from proto_pipe.io.db import get_table_columns
+
+        self.view_config = {}
+        self.sql_spec = None
+        self.insert_after = None
+
+        name = self.prompt_name(existing_view_names)
+        if not name:
+            return False
+
+        table = self.prompt_base_table(available_tables)
+        if not table:
+            return False
+
+        view_type = self.prompt_view_type()
+        if not view_type:
+            return False
+
+        group_by_columns: list[str] = []
+        aggregate_functions: dict[str, str] = {}
+        where_clause: str = ""
+
+        if view_type == "aggregate":
+            table_columns = get_table_columns(pipeline_db, table)
+            if not table_columns:
+                click.echo(f"\n  [error] No columns found in table '{table}'.")
+                return False
+
+            group_by_columns = self.prompt_group_by_columns(table_columns)
+            if not group_by_columns:
+                return False
+
+            non_grouped = [c for c in table_columns if c not in group_by_columns]
+            if non_grouped:
+                aggregate_functions = self.prompt_aggregate_functions(non_grouped)
+                if aggregate_functions is None:
+                    return False
+
+        elif view_type == "filter":
+            where_clause = self.prompt_where_clause()
+            if where_clause is None:
+                return False
+
+        # Dependency ordering
+        if existing_view_names:
+            self.insert_after = self.prompt_view_dependency(existing_view_names)
+
+        self.sql_spec = ViewSQLSpec(
+            view_name=name,
+            base_table=table,
+            view_type=view_type,
+            group_by_columns=group_by_columns,
+            aggregate_functions=aggregate_functions,
+            where_clause=where_clause or "",
+        )
+        self.view_config = {"name": name, "sql_file": ""}  # caller sets sql_file path
+        return True
+
+    def prompt_name(self, existing_view_names: list[str]) -> str | None:
+        """Prompt for view name. Returns None if cancelled."""
+        name = questionary.text("View name (e.g. carrier_summary):").ask()
+        if not name:
+            return None
+
+        if name in existing_view_names:
+            overwrite = questionary.confirm(
+                f"View '{name}' already exists. Overwrite?"
+            ).ask()
+            if not overwrite:
+                return None
+
+        return name
+
+    def prompt_base_table(self, available_tables) -> str | None:
+        """Prompt for base table selection. Returns None if cancelled.
+
+        Accepts list[str] or list[tuple[str, int]] from get_all_source_tables.
+        When tuples are provided, annotated questionary.Choice objects are
+        built here — keeping all questionary formatting inside prompts.py.
+        """
+        if available_tables and isinstance(available_tables[0], tuple):
+            choices = [
+                questionary.Choice(
+                    title=(
+                        f"{name}  ({count} report{'s' if count != 1 else ''})"
+                        if count > 0
+                        else name
+                    ),
+                    value=name,
+                )
+                for name, count in available_tables
+            ]
+        else:
+            choices = list(available_tables)
+        return questionary.select(
+            "Which table should this view query?",
+            choices=choices,
+        ).ask()
+
+    def prompt_view_type(self) -> str | None:
+        """Prompt for view type selection. Returns None if cancelled."""
+        return questionary.select(
+            "View type:",
+            choices=[
+                questionary.Choice(
+                    "Aggregate — GROUP BY with SUM, COUNT, etc.",
+                    value="aggregate",
+                ),
+                questionary.Choice(
+                    "Filter    — SELECT * WHERE <condition>",
+                    value="filter",
+                ),
+                questionary.Choice(
+                    "Custom    — blank template to edit manually",
+                    value="custom",
+                ),
+            ],
+        ).ask()
+
+    def prompt_group_by_columns(self, table_columns: list[str]) -> list[str] | None:
+        """Prompt for GROUP BY column selection. Returns None if cancelled."""
+        selected = questionary.checkbox(
+            "Select columns to GROUP BY:",
+            choices=[questionary.Choice(col, value=col) for col in table_columns],
+        ).ask()
+        if not selected:
+            click.echo("  Please select at least one GROUP BY column.")
+            return None
+        return selected
+
+    def prompt_aggregate_functions(
+        self,
+        non_grouped_columns: list[str],
+    ) -> dict[str, str] | None:
+        """Prompt for aggregate function per non-grouped column.
+
+        Returns dict mapping column name → aggregate function name.
+        Columns assigned 'exclude' are omitted from the result.
+        Returns None if cancelled.
+        """
+        agg_choices = ["SUM", "COUNT", "AVG", "MIN", "MAX", "exclude"]
+        result: dict[str, str] = {}
+
+        for col in non_grouped_columns:
+            agg = questionary.select(
+                f"Aggregate for '{col}':",
+                choices=agg_choices,
+            ).ask()
+            if agg is None:
+                return None
+            if agg != "exclude":
+                result[col] = agg
+
+        return result
+
+    def prompt_where_clause(self) -> str | None:
+        """Prompt for WHERE clause text. Returns None if cancelled."""
+        clause = questionary.text(
+            "WHERE clause (e.g. status = 'active'):",
+        ).ask()
+        return clause
+
+    def prompt_view_dependency(self, existing_view_names: list[str]) -> str | None:
+        """Ask if this view depends on another view. Returns view name or None."""
+        depends = questionary.confirm(
+            "Does this view reference another view?",
+            default=False,
+        ).ask()
+        if not depends:
+            return None
+
+        return questionary.select(
+            "Insert after which view?",
+            choices=existing_view_names,
+        ).ask()
+
 
 # ---------------------------------------------------------------------------
 def display_name(check_name: str, check_registry) -> str:

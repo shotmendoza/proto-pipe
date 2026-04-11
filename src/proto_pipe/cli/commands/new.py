@@ -19,7 +19,7 @@ from proto_pipe.cli.scaffold import (
 )
 from proto_pipe.io.db import get_all_source_tables
 from proto_pipe.io.config import load_config, write_config, load_settings, config_path_or_override
-from proto_pipe.cli.prompts import SourceConfigPrompter
+from proto_pipe.cli.prompts import SourceConfigPrompter, ViewConfigPrompter
 from proto_pipe.constants import DEFAULT_SETTINGS_PATH
 
 
@@ -306,53 +306,81 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
 
 
 @click.command("new-view")
-@click.option("--name", required=True, help="Name for the new deliverable (e.g. carrier_a_report).")
-@click.option("--output-dir", default=None, help="Override SQL output directory.")
-def new_view(name: str, output_dir: str):
-    """Scaffold a starter SQL file for a new deliverable view and sql transformations.
-
-    \b
-    Example:
-      vp new-deliverable --name carrier_a_report
-    """
-    from proto_pipe.io.config import load_settings
+@click.option("--views-config", default=None, help="Override views config path.")
+@click.option("--reports-config", default=None, help="Override reports config path.")
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+@click.option("--sql-dir", default=None, help="Override SQL output directory.")
+def new_view(views_config, reports_config, pipeline_db, sql_dir):
+    """Interactively define a new view and add it to views_config.yaml."""
+    from proto_pipe.cli.scaffold import build_view_sql
+    from proto_pipe.reports.views import load_views_config
 
     settings = load_settings()
-    sql_dir = Path(output_dir or settings["paths"].get("sql_dir", "sql"))
-    sql_dir.mkdir(parents=True, exist_ok=True)
+    p_db = config_path_or_override("pipeline_db", pipeline_db)
+    rep_cfg = config_path_or_override("reports_config", reports_config)
+    views_cfg = views_config or settings["paths"].get("views_config")
+    sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
 
-    dest = sql_dir / f"{name}.sql"
-    if dest.exists():
-        click.echo(f"  [skip] {dest} already exists (delete it first to regenerate)")
+    rep_config = load_config(rep_cfg)
+
+    all_tables = get_all_source_tables(p_db, rep_config)
+    if not all_tables:
+        click.echo("\n  No tables found. Run: vp ingest to load files first.")
         return
 
-    template = f"""\
--- {name}.sql
--- Deliverable query for: {name}
---
--- This query defines what gets written to the output file.
--- Use DuckDB SQL syntax. Reference ingested tables directly by name.
--- Date filtering should be written inline here — no placeholders needed.
---
--- Example:
---   SELECT order_id, customer_id, price, region
---   FROM sales
---   WHERE updated_at >= '2024-01-01'
---     AND region = 'West'
---   ORDER BY updated_at DESC;
+    existing_views = load_views_config(views_cfg) if views_cfg else []
+    existing_view_names = [v["name"] for v in existing_views]
 
-SELECT *
-FROM <table>
-WHERE <date_col> >= '<from_date>'
-ORDER BY <date_col> DESC;
-"""
+    click.echo("\n── New View ────────────────────────────────")
 
-    dest.write_text(template)
-    click.echo(f"[ok] {dest}")
-    click.echo(f"\nNext steps:")
-    click.echo(f"1. Edit {dest} with your query")
-    click.echo(f"2. Add an entry in deliverables_config.yaml referencing {name}.sql")
-    click.echo(f"3. Run: vp deliver {name}")
+    prompter = ViewConfigPrompter()
+    if not prompter.run(existing_view_names, all_tables, p_db):
+        click.echo("Cancelled.")
+        return
+
+    # Write SQL file
+    sql_path = Path(sql_directory)
+    sql_path.mkdir(parents=True, exist_ok=True)
+    dest = sql_path / f"{prompter.sql_spec.view_name}.sql"
+    sql_content = build_view_sql(prompter.sql_spec)
+    dest.write_text(sql_content)
+
+    # Update views_config.yaml
+    view_entry = {"name": prompter.sql_spec.view_name, "sql_file": str(dest)}
+
+    if views_cfg and Path(views_cfg).exists():
+        config = load_config(views_cfg)
+    else:
+        config = {"views": []}
+        if not views_cfg:
+            views_cfg = str(Path(sql_directory).parent / "views_config.yaml")
+
+    views_list = config.get("views", [])
+    if views_list is None:
+        views_list = []
+
+    # Insert after dependency or append
+    if prompter.insert_after:
+        insert_idx = None
+        for i, v in enumerate(views_list):
+            if v["name"] == prompter.insert_after:
+                insert_idx = i + 1
+                break
+        if insert_idx is not None:
+            views_list.insert(insert_idx, view_entry)
+        else:
+            views_list.append(view_entry)
+    else:
+        views_list.append(view_entry)
+
+    config["views"] = views_list
+    write_config(config, views_cfg)
+
+    click.echo(f"\n[ok] View '{prompter.sql_spec.view_name}' added to {views_cfg}")
+    click.echo(f"  SQL: {dest}")
+    click.echo("\nNext steps:")
+    click.echo(f"1. Review {dest}")
+    click.echo("2. Run: vp refresh views")
 
 
 @click.command("new-macro")
