@@ -39,7 +39,7 @@ cd my-pipeline
 ## 3. Scaffold the config files
 
 ```bash
-vp init
+vp init config
 ```
 
 This creates:
@@ -77,7 +77,7 @@ vp config show
 ## 5. Initialize the database
 
 ```bash
-vp db-init
+vp init db
 ```
 
 Creates `data/pipeline.db` and `data/watermarks.db` and bootstraps the
@@ -121,6 +121,12 @@ To see ingest history:
 vp view table ingest_state
 ```
 
+Check pipeline health at any time with:
+
+```bash
+vp status
+```
+
 ---
 
 ## 8. Define validation checks
@@ -143,8 +149,8 @@ vp validate
 To view check failures:
 
 ```bash
-vp validated
-vp export validation
+vp errors report
+vp errors report export <report-name>
 ```
 
 ---
@@ -164,7 +170,7 @@ file for you to customise with joins and column selection.
 ## 10. Produce the deliverable
 
 ```bash
-vp pull-report <deliverable-name>
+vp deliver <deliverable-name>
 ```
 
 Output is written to `output/reports/`.
@@ -179,8 +185,8 @@ Once your config is set up, the daily run is:
 vp run-all --deliverable <deliverable-name>
 ```
 
-Runs ingest → validate → pull-report in sequence. Stops before producing
-the deliverable if ingest conflicts exist (rows flagged in `source_block`).
+Runs ingest → validate → deliver in sequence. Stops before producing
+the deliverable if ingest conflicts exist (rows blocked in `source_block`).
 Pass `--ignore-flagged` to produce the deliverable anyway.
 
 ---
@@ -192,15 +198,15 @@ primary key. Review and correct them:
 
 ```bash
 # Browse flagged rows in the terminal
-vp flagged --table sales
+vp errors source sales
 
 # Open an enriched editable view
-vp flagged edit --table sales
+vp errors source edit sales
 
 # Export flagged rows to incoming_dir, edit, then apply corrections
-vp flagged open sales
+vp errors source export sales --open
 # ... edit the file in incoming_dir ...
-vp flagged retry sales
+vp errors source retry sales
 ```
 
 See `docs/reviewing_flagged_rows.md` for more detail.
@@ -209,17 +215,18 @@ See `docs/reviewing_flagged_rows.md` for more detail.
 
 ## Quick reference
 
-| Task                    | Command                        |
-|-------------------------|--------------------------------|
-| First-time setup        | `vp init` then `vp db-init`    |
-| Define a source         | `vp new source`                |
-| Load new files          | `vp ingest`                    |
-| Run checks              | `vp validate`                  |
-| Produce a deliverable   | `vp pull-report <n>`           |
-| Run everything          | `vp run-all --deliverable <n>` |
-| Workflow guide          | `vp help`                      |
-| Check current paths     | `vp config show`               |
-| Inspect check functions | `vp funcs`                     |
-| Browse any table        | `vp table <n>`                 |
-| Review ingest conflicts | `vp flagged --table <n>`       |
-| Review check failures   | `vp validated`                 |
+| Task                    | Command                            |
+|-------------------------|------------------------------------|
+| First-time setup        | `vp init config` then `vp init db` |
+| Define a source         | `vp new source`                    |
+| Load new files          | `vp ingest`                        |
+| Run checks              | `vp validate`                      |
+| Produce a deliverable   | `vp deliver <n>`                   |
+| Run everything          | `vp run-all --deliverable <n>`     |
+| Pipeline health         | `vp status`                        |
+| Workflow guide          | `vp help`                          |
+| Check current paths     | `vp config show`                   |
+| Inspect check functions | `vp funcs`                         |
+| Browse any table        | `vp view table <n>`                |
+| Review ingest conflicts | `vp errors source <n>`             |
+| Review check failures   | `vp errors report`                 |

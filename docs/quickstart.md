@@ -8,9 +8,9 @@ For first-time installation and config, see `docs/first_time_setup.md`.
 ## The three flows
 
 ```
-1. Run everything        vp run-all --deliverable <name>
-2. Fix ingest conflicts  vp flagged open <table> → edit → vp flagged retry <table>
-3. Fix validation flags  vp export validation → fix at source → re-ingest → re-validate
+1. Run everything        vp run-all --deliverable <n>
+2. Fix ingest conflicts  vp errors source export <n> --open → edit → vp errors source retry <n>
+3. Fix validation flags  vp errors report export <n> → fix at source → re-ingest → re-validate
 ```
 
 ---
@@ -28,10 +28,10 @@ Rows arrived whose values differ from what's already in the table.
 These block the deliverable until resolved.
 
 ```bash
-vp flagged --table sales           # browse conflicts
-vp flagged open sales              # export + open in default app for editing
+vp errors source sales              # browse conflicts
+vp errors source export sales --open # export + open in default app for editing
 # edit the file — fix the bad values, save
-vp flagged retry sales             # apply corrections through ingest cycle
+vp errors source retry sales         # apply corrections through ingest cycle
 vp run-all --deliverable monthly_pack
 ```
 
@@ -46,8 +46,8 @@ Rows failed a business logic check. The deliverable was still produced.
 Validation flags are warnings — fix at source, re-ingest, re-validate.
 
 ```bash
-vp validated                       # browse check failures
-vp export validation               # export Detail + Summary sheets to Excel
+vp errors report                     # browse check failures
+vp errors report export sales_validation  # export Detail + Summary sheets to Excel
 # fix the values in the source file, then:
 vp ingest
 vp validate
@@ -144,19 +144,15 @@ from proto_pipe.checks.helpers import custom_check
 
 
 @custom_check("no_negatives", kind="check")
-def check_no_negatives(col: str) -> pd.Series:
+def check_no_negatives(col: pd.Series) -> pd.Series[bool]:
     """Check that values in a column are not negative."""
-    def _run(context: dict) -> pd.Series:
-        return context["df"][col] >= 0
-    return _run
+    return col >= 0
 
 
 @custom_check("margin_check", kind="check")
-def check_margin(col: str, threshold: float = 0.2) -> pd.Series:
+def check_margin(col: pd.Series, threshold: float = 0.2) -> pd.Series[bool]:
     """Check that margin is above the declared threshold."""
-    def _run(context: dict) -> pd.Series:
-        return context["df"][col] >= threshold
-    return _run
+    return col >= threshold
 ```
 
 Register the module in `pipeline.yaml`:
@@ -175,13 +171,9 @@ run after all checks and write back to the table.
 
 ```python
 @custom_check("normalize_region", kind="transform")
-def normalize_region(col: str) -> pd.Series:
+def normalize_region(col: pd.Series) -> pd.Series:
     """Uppercase and strip the region column."""
-    def _run(context: dict) -> pd.Series:
-        result = context["df"][col].str.upper().str.strip()
-        result.name = col
-        return result
-    return _run
+    return col.str.upper().str.strip()
 ```
 
 See `docs/adding_checks.md` for the full reference.
@@ -219,11 +211,11 @@ deliverables:
 ```
 
 **Shared views** — define reusable transformations in `views_config.yaml`
-and reference them by name in any SQL file. Run `vp refresh-views` after
+and reference them by name in any SQL file. Run `vp refresh views` after
 editing a view SQL file.
 
 **Macros** — define reusable column-level expressions with `vp new macro`
-and call them in any SQL file. Run `vp db-init` after adding a macro to
+and call them in any SQL file. Run `vp init db` after adding a macro to
 re-register it.
 
 See `docs/adding_deliverables.md` for the full reference.
@@ -246,30 +238,30 @@ See `docs/adding_deliverables.md` for the full reference.
 
 **Ingest**
 
-| Task | Command |
-|---|---|
-| Load source files | `vp ingest` |
-| View ingest history | `vp view table ingest_state` |
-| Browse ingest conflicts | `vp flagged --table <n>` |
-| Open conflicts for editing | `vp flagged open <table>` |
-| Apply corrections | `vp flagged retry <table>` |
-| Clear conflicts | `vp flagged clear --table <n>` |
+| Task                         | Command                              |
+|------------------------------|--------------------------------------|
+| Load source files            | `vp ingest`                          |
+| View ingest history          | `vp view table ingest_state`         |
+| Browse ingest conflicts      | `vp errors source <n>`               |
+| Export conflicts for editing | `vp errors source export <n> --open` |
+| Apply corrections            | `vp errors source retry <n>`         |
+| Clear conflicts              | `vp errors source clear <n>`         |
 
 **Validation**
 
-| Task | Command |
-|---|---|
-| Run checks | `vp validate` |
-| Browse check failures | `vp validated` |
-| Export check failures | `vp export validation` |
-| Export for one report | `vp export validation --report <n>` |
+| Task                  | Command                       |
+|-----------------------|-------------------------------|
+| Run checks            | `vp validate`                 |
+| Browse check failures | `vp errors report`            |
+| Export check failures | `vp errors report export <n>` |
 
 **Deliverables**
 
-| Task | Command |
-|---|---|
-| Produce a deliverable | `vp pull-report <n>` |
-| Preview deliverable output | `vp view deliverable <n>` |
-| Refresh views | `vp refresh-views` |
-| Run everything | `vp run-all --deliverable <n>` |
-| Skip conflict block | `vp run-all --deliverable <n> --ignore-flagged` |
+| Task                       | Command                                         |
+|----------------------------|-------------------------------------------------|
+| Produce a deliverable      | `vp deliver <n>`                                |
+| Preview deliverable output | `vp view deliverable <n>`                       |
+| Refresh views              | `vp refresh views`                              |
+| Run everything             | `vp run-all --deliverable <n>`                  |
+| Skip conflict block        | `vp run-all --deliverable <n> --ignore-flagged` |
+| Check pipeline health      | `vp status`                                     |

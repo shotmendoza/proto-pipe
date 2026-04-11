@@ -9,18 +9,26 @@ The easiest way is the interactive wizard:
 vp new deliverable
 ```
 
-The wizard walks you through selecting reports, naming the deliverable,
-choosing format, and scaffolding a SQL file — then writes to
+The wizard walks you through naming the deliverable, choosing format,
+selecting reports, picking columns, configuring joins, adding views and
+macros, and scaffolding a SQL file — then writes to
 `config/deliverables_config.yaml` automatically.
+
+The `vp new deliverable` wizard supports column selection, join
+configuration across multiple tables, view selection, and macro param
+binding — generating runnable SQL with all of these wired together.
+
+To modify an existing deliverable, use `vp edit deliverable`, which
+runs the same wizard against the current config.
 
 ---
 
 ## Two query paths per report
 
-| Path | When to use |
-|---|---|
+| Path       | When to use                                                           |
+|------------|-----------------------------------------------------------------------|
 | `sql_file` | Joins across tables, carrier-specific column names, custom date logic |
-| `filters` | Simple single-table queries with date and field filters |
+| `filters`  | Simple single-table queries with date and field filters               |
 
 Only one should be set per report. If `sql_file` is present it takes
 precedence and `filters` is ignored.
@@ -64,7 +72,7 @@ deliverables:
 ```yaml
 deliverables:
   - name: "my_export"                         # Unique name — used on CLI:
-                                              #   vp pull-report my_export
+                                              #   vp deliver my_export
     format: xlsx                              # "xlsx" = one file, one sheet per report
                                               # "csv"  = one file per report
     filename_template: "export_{date}.xlsx"   # {date} = YYYY-MM-DD of run
@@ -112,15 +120,46 @@ WHERE s.order_date <= (date_trunc('month', current_date) - INTERVAL '1 day')
 
 **Useful DuckDB date expressions:**
 
-| Goal | Expression |
-|---|---|
-| End of last month | `date_trunc('month', current_date) - INTERVAL '1 day'` |
-| Start of this month | `date_trunc('month', current_date)` |
-| Start of last month | `date_trunc('month', current_date) - INTERVAL '1 month'` |
-| Today | `current_date` |
-| 30 days ago | `current_date - INTERVAL '30 days'` |
-| Start of this quarter | `date_trunc('quarter', current_date)` |
-| End of last quarter | `date_trunc('quarter', current_date) - INTERVAL '1 day'` |
+| Goal                  | Expression                                               |
+|-----------------------|----------------------------------------------------------|
+| End of last month     | `date_trunc('month', current_date) - INTERVAL '1 day'`   |
+| Start of this month   | `date_trunc('month', current_date)`                      |
+| Start of last month   | `date_trunc('month', current_date) - INTERVAL '1 month'` |
+| Today                 | `current_date`                                           |
+| 30 days ago           | `current_date - INTERVAL '30 days'`                      |
+| Start of this quarter | `date_trunc('quarter', current_date)`                    |
+| End of last quarter   | `date_trunc('quarter', current_date) - INTERVAL '1 day'` |
+
+---
+
+## Macros
+
+Macros are reusable scalar computations callable from any `sql_file`.
+
+**SQL macros** — define in `.sql` files under your macros directory and
+scaffold with `vp new macro`:
+
+```sql
+-- config/macros/quota_share.sql
+CREATE OR REPLACE MACRO quota_share(premium, share_pct) AS
+    premium * share_pct;
+```
+
+**Python macros** — use the `@macro` decorator for computations that are
+easier to express in Python:
+
+```python
+from proto_pipe.macros import macro
+
+@macro("adjusted_premium")
+def adjusted_premium(premium, factor, offset=0):
+    """Apply adjustment factor and optional offset to premium."""
+    return premium * factor + offset
+```
+
+Macros are loaded automatically on the connection by `vp deliver` and
+`vp run-all`. Run `vp init db` after adding a new macro to perform a
+parse-only smoke test.
 
 ---
 
@@ -177,6 +216,15 @@ If multiple deliverables need the same transformation — standardising region
 codes, zeroing out negatives, joining a lookup table — define it once as a
 view and reference it in any SQL file.
 
+Use the interactive wizard to create views:
+
+```bash
+vp new view
+```
+
+The wizard supports aggregate, filter, and custom view types, generating
+the SQL and registering the view in `views_config.yaml`.
+
 ```yaml
 # config/views_config.yaml
 views:
@@ -204,26 +252,26 @@ WHERE region = 'EMEA'
 **Creation order matters** — if a view references another view, list the
 dependency first in `views_config.yaml`.
 
-Views are refreshed by `vp refresh-views` and automatically before
+Views are refreshed by `vp refresh views` and automatically before
 deliverables in `vp run-all`.
 
 ---
 
 ## Dynamic date tokens (filter path only)
 
-| Token | Resolves to |
-|---|---|
-| `today` | Current date |
-| `start_of_month` | First day of current month |
-| `end_of_month` | Last day of current month |
-| `start_of_last_month` | First day of previous month |
-| `end_of_last_month` | Last day of previous month |
-| `start_of_quarter` | First day of current quarter |
-| `end_of_quarter` | Last day of current quarter |
-| `start_of_last_quarter` | First day of previous quarter |
-| `end_of_last_quarter` | Last day of previous quarter |
-| `today-Nd` | N days ago (e.g. `today-30d`) |
-| `today+Nd` | N days from now (e.g. `today+7d`) |
+| Token                   | Resolves to                       |
+|-------------------------|-----------------------------------|
+| `today`                 | Current date                      |
+| `start_of_month`        | First day of current month        |
+| `end_of_month`          | Last day of current month         |
+| `start_of_last_month`   | First day of previous month       |
+| `end_of_last_month`     | Last day of previous month        |
+| `start_of_quarter`      | First day of current quarter      |
+| `end_of_quarter`        | Last day of current quarter       |
+| `start_of_last_quarter` | First day of previous quarter     |
+| `end_of_last_quarter`   | Last day of previous quarter      |
+| `today-Nd`              | N days ago (e.g. `today-30d`)     |
+| `today+Nd`              | N days from now (e.g. `today+7d`) |
 
 Omitting `from:` or `to:` means no bound on that end.
 
@@ -265,7 +313,7 @@ reports:
 Date flags only apply to filter-based reports. SQL file reports ignore them.
 
 ```bash
-vp pull-report my_export \
+vp deliver my_export \
   --date-col order_date \
   --date-from 2026-01-01 \
   --date-to   2026-03-31
@@ -276,16 +324,19 @@ vp pull-report my_export \
 ## Running a deliverable
 
 ```bash
-vp pull-report my_export
+vp deliver my_export
 vp run-all --deliverable my_export
 ```
+
+The `vp deliver` command loads all macros on the connection before executing
+SQL, so macro functions are available in any `sql_file`.
 
 ---
 
 ## Tracking what was produced
 
 ```sql
-SELECT * FROM report_runs ORDER BY created_at DESC;
+SELECT * FROM pipeline_events ORDER BY created_at DESC;
 ```
 
 Columns: `deliverable_name`, `report_name`, `filename`, `output_dir`,

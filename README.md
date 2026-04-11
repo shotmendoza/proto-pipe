@@ -17,27 +17,28 @@ pip install proto-pipe
 ## Quickstart
 
 ```bash
-# 1. Scaffold config files into your project
+# 1. Scaffold config files and initialize the database
 vp init
 
-# 2. Edit pipeline.yaml to confirm your paths, then initialize DuckDB
-vp db-init
+# Or run each step separately (recommended)
+vp init config
+vp init db
 
-# 3. Define your data sources interactively
+# 2. Create a new data source
 vp new source
 
-# 4. Drop files into data/incoming/ and ingest them
+# 3. Drop files into your incoming folder (set in config) and ingest them
 vp ingest
 
-# 5. Define validation checks for a table
+# 4. Create a report
 vp new report
 
-# 6. Run checks
+# 5. Run checks, validations, and transformations on the report
 vp validate
 
-# 7. Define and produce a deliverable
+# 6. Create and produce a deliverable
 vp new deliverable
-vp pull-report <deliverable-name>
+vp deliver <deliverable-name>
 
 # Or chain everything in one command
 vp run-all --deliverable <deliverable-name>
@@ -49,17 +50,25 @@ Run `vp help` at any time to see the full workflow guide.
 
 ## CLI Reference
 
-### Workflow
+### Pipeline
 
 | Command              | Description                                    |
 |----------------------|------------------------------------------------|
-| `vp help`            | Show the end-to-end workflow guide             |
-| `vp init`            | Scaffold config files into your project        |
-| `vp db-init`         | Create DuckDB files and bootstrap tables       |
 | `vp ingest`          | Load files from incoming directory into DuckDB |
 | `vp validate`        | Run registered checks against ingested tables  |
-| `vp pull-report <n>` | Query tables and write deliverable output      |
-| `vp run-all`         | Chain ingest → validate → pull-report          |
+| `vp deliver <n>`     | Query tables and write deliverable output      |
+| `vp run-all`         | Chain ingest → validate → deliver              |
+
+### Inspect and Validate
+
+| Command                              | Description                               |
+|--------------------------------------|-------------------------------------------|
+| `vp status [source / report] <name>` | Pipeline health, drill down to detail     |
+| `vp errors [source / report] <name>` | View blocked records, drill down          |
+| `vp errors <stage> export`           | Export to CSV; `--open` launches          |
+| `vp errors <stage> edit`             | TUI inline edit                           |
+| `vp errors <stage> clear`            | Drop without fixing; `--yes` skips prompt |
+| `vp errors <stage> retry`            | Re-process corrected export               |
 
 ### Scaffold new resources
 
@@ -91,17 +100,6 @@ Run `vp help` at any time to see the full workflow guide.
 | `vp delete deliverable` | Remove deliverable config               |
 | `vp delete table`       | Drop a non-pipeline table               |
 
-### Review & fix
-
-| Command                   | Description                                   |
-|---------------------------|-----------------------------------------------|
-| `vp flagged`              | Browse ingest-time conflicts                  |
-| `vp flagged edit`         | View conflicts with source data context       |
-| `vp flagged clear`        | Clear flags without applying corrections      |
-| `vp flagged retry <file>` | Apply corrected file and clear resolved flags |
-| `vp validated`            | Browse check failures                         |
-| `vp export-validation`    | Export check failures to Excel                |
-
 ### Explore
 
 | Command               | Description                                |
@@ -109,18 +107,20 @@ Run `vp help` at any time to see the full workflow guide.
 | `vp view source`      | Ingested rows with flag status column      |
 | `vp view report`      | Source table for a report                  |
 | `vp view deliverable` | Full deliverable output preview (no limit) |
-| `vp view table`       | Any pipeline table                         |
-| `vp table <name>`     | Quick table browse, edit, or export        |
+| `vp view table <n>`   | Any pipeline table                         |
 | `vp funcs`            | Inspect registered check functions         |
 
 ### Config & setup
 
 | Command                       | Description                                 |
 |-------------------------------|---------------------------------------------|
+| `vp help`                     | Show the end-to-end workflow guide          |
 | `vp config show`              | Print current path settings                 |
 | `vp config set <key> <value>` | Update a path setting                       |
-| `vp db-init --migrate`        | Apply pending schema migrations             |
-| `vp refresh-views`            | Refresh DuckDB views from views_config.yaml |
+| `vp init config`              | Scaffold config files into your project     |
+| `vp init db`                  | Create DuckDB files and bootstrap tables    |
+| `vp init db --migrate`        | Apply pending schema migrations             |
+| `vp refresh views`            | Refresh DuckDB views from views_config.yaml |
 
 ---
 
@@ -154,11 +154,13 @@ src/proto_pipe/
   checks/         — CheckRegistry, built-ins, @custom_check decorator
   cli/
     commands/     — vp new, vp edit, vp delete, vp view, vp funcs, vp help
-    flagged.py    — vp flagged group + vp validated
+    errors.py     — vp errors group (source + report)
+    status.py     — vp status
     prompts.py    — interactive wizards for source/report/deliverable setup
-    quickstart.py — vp init, vp db-init, vp config
-    reports.py    — vp pull-report, vp run-all, vp refresh-views
+    quickstart.py — vp init config, vp init db, vp config
+    reports.py    — vp deliver, vp run-all, vp refresh views
   io/             — DuckDB ops, file ingestion, config classes, migration
+  macros/         — SQL and Python macro loading
   pipelines/      — integrity pre-scan, watermark tracking
   reports/        — check runner, deliverable writer, validation flags
   constants.py
@@ -169,15 +171,15 @@ src/proto_pipe/
 
 ## DuckDB Pipeline Tables
 
-| Table                     | Description                                          |
-|---------------------------|------------------------------------------------------|
-| `<source_table>`          | One table per source in sources_config.yaml          |
-| `ingest_log`              | Every file ingested, including failures and skips    |
-| `flagged_rows`            | Ingest-time conflicts — duplicate keys, changed rows |
-| `validation_flags`        | Check failures from `vp validate`                    |
-| `check_registry_metadata` | Registered check metadata                            |
-| `watermark`               | Last-processed timestamp per report                  |
-| `report_runs`             | Record of every deliverable produced                 |
+| Table                     | Description                                       |
+|---------------------------|---------------------------------------------------|
+| `<source_table>`          | One table per source in sources_config.yaml       |
+| `ingest_state`            | Every file ingested, including failures and skips |
+| `source_block`            | Ingest-time conflicts that blocks deliverables.   |
+| `validation_block`        | Check failures from `vp validate`                 |
+| `check_registry_metadata` | Registered check metadata                         |
+| `watermark`               | Last-processed timestamp per report               |
+| `pipeline_events`         | Record of every deliverable produced              |
 
 ---
 
@@ -189,12 +191,9 @@ import pandas as pd
 from proto_pipe.checks.helpers import custom_check
 
 @custom_check("margin_check", kind="check")
-def margin_check(col: str, threshold: float = 0.2) -> pd.Series:
+def margin_check(col: pd.Series, threshold: float = 0.2) -> pd.Series[bool]:
     """Check that margin values are above the declared threshold."""
-    def _run(context: dict) -> pd.Series:
-        df = context["df"]
-        return df[col] >= threshold
-    return _run
+    return col >= threshold
 ```
 
 Point `custom_checks_module` in `pipeline.yaml` at your file. Run `vp funcs`
@@ -206,15 +205,15 @@ to confirm the check registered correctly.
 
 ```bash
 # View conflicts for a table
-vp flagged --table sales
+vp errors source sales
 
 # Open enriched editable view (requires textual)
-vp flagged edit --table sales
+vp errors source edit sales
 
 # Export to CSV, fix values, re-import
-vp flagged --table sales --export csv
+vp errors source export sales --open
 # ... after editing the CSV
-vp flagged retry flagged_sales_2026-04-01.csv --table sales
+vp errors source retry sales
 ```
 
 ---

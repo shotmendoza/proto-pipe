@@ -12,8 +12,8 @@ different correction paths. Understanding which one you're looking at matters.
 | `source_block`     | `vp ingest`   | Ingest-time conflicts — duplicate key with changed content, or type mismatch | Yes                  |
 | `validation_block` | `vp validate` | Business logic check failures                                                | No — warns only      |
 
-`vp flagged` and its subcommands operate on `source_block`.
-`vp validated` operates on `validation_block`.
+`vp errors source` and its subcommands operate on `source_block`.
+`vp errors report` operates on `validation_block`.
 
 ---
 
@@ -31,16 +31,15 @@ the conflict.
 ### View ingest flags
 
 ```bash
-vp flagged                          # all tables
-vp flagged --table sales            # one table
-vp flagged --table sales --limit 100
+vp errors source                    # all tables
+vp errors source sales              # one table
 ```
 
 For an enriched view that joins flag metadata to the actual source row so you
 can see the bad data in context:
 
 ```bash
-vp flagged edit --table sales
+vp errors source edit sales
 ```
 
 ---
@@ -50,7 +49,7 @@ vp flagged edit --table sales
 ### Step 1 — Open the flagged rows for editing
 
 ```bash
-vp flagged open sales
+vp errors source export sales --open
 ```
 
 This exports the enriched flagged rows (source data + flag context) to
@@ -65,7 +64,7 @@ automatically before ingest.
 ### Step 2 — Apply corrections
 
 ```bash
-vp flagged retry sales
+vp errors source retry sales
 ```
 
 This picks up the most recently modified flagged export from `incoming_dir`,
@@ -97,9 +96,9 @@ Confirms the corrected rows now pass checks before producing the deliverable.
 acceptable as-is:
 
 ```bash
-vp flagged clear --table sales
-vp flagged clear --table sales --check duplicate_conflict   # one check only
-vp flagged clear --table sales --yes                        # skip confirmation
+vp errors source clear sales
+vp errors source clear sales --check duplicate_conflict   # one check only
+vp errors source clear sales --yes                        # skip confirmation
 ```
 
 **Produce deliverable anyway** — flags remain but don't block output:
@@ -117,11 +116,10 @@ do not block deliverables. The correction path is different — fix at source,
 re-ingest, re-validate.
 
 ```bash
-vp validated                        # all reports
-vp validated --report sales_validation
-vp validated --table sales
-vp validated open                   # export failures and open for editing
-vp export validation                # export detail + summary to Excel
+vp errors report                          # all reports
+vp errors report sales_validation         # one report
+vp errors report export sales_validation  # export detail + summary to Excel
+vp errors report export sales_validation --open  # export and open for editing
 ```
 
 ---
@@ -142,7 +140,7 @@ version.
 **"I want to clear everything and start fresh."**
 
 ```bash
-vp flagged clear --table sales --yes
+vp errors source clear sales --yes
 ```
 
 **"I don't have a primary key column."**

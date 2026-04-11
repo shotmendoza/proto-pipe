@@ -122,8 +122,8 @@ vp validate --table my_table
 To view check failures:
 
 ```bash
-vp validated --report my_report
-vp export validation --report my_report
+vp errors report my_report
+vp errors report export my_report
 ```
 
 ---

@@ -14,22 +14,29 @@ import pandas as pd
 from proto_pipe.checks.helpers import custom_check
 
 @custom_check("null_premium_check", kind="check")
-def null_premium_check(col: str) -> pd.Series:
+def null_premium_check(col: pd.Series) -> pd.Series[bool]:
     """Check that premium values are not null.
 
     Returns True for rows that pass, False for rows that fail.
     """
-    def _run(context: dict) -> pd.Series:
-        df = context["df"]
-        return df[col].notna()
-    return _run
+    return col.notna()
 ```
 
-- `col: str` — annotated as `str` tells the wizard this is a **column selector**.
+- `col: pd.Series` — annotated as `pd.Series` tells the wizard this is a **column selector**.
   The user picks the column from a list when running `vp new report`.
-- Return type `-> pd.Series` is required for `kind='check'`.
-  `pd.Series[bool]` is also accepted and more explicit.
-- `context["df"]` is the watermark-filtered DataFrame for this report run.
+- Return type `-> pd.Series[bool]` is required for `kind='check'`.
+- The column data is injected directly as a Series — no manual DataFrame lookup needed.
+
+For checks that need access to the full table:
+
+```python
+@custom_check("ratio_check", kind="check")
+def ratio_check(df: pd.DataFrame, numerator: str, denominator: str) -> pd.Series[bool]:
+    """Check that the ratio of two columns is at least 0.5."""
+    return df[numerator] / df[denominator] >= 0.5
+```
+
+- `df: pd.DataFrame` — auto-filled with the full table, never prompted.
 
 ---
 
@@ -50,7 +57,8 @@ the user sees:
 
 | Annotation                     | Behaviour                                                                                                 |
 |--------------------------------|-----------------------------------------------------------------------------------------------------------|
-| `col: str` or `col: pd.Series` | Column selector — user picks from available table columns. Supports multi-select for alias_map expansion. |
+| `col: pd.Series`               | Column selector — user picks from available table columns. Supports multi-select for alias_map expansion. |
+| `col: str`                     | Column selector — column name passed as a string. Supports multi-select for alias_map expansion.          |
 | Unannotated                    | Treated as a column selector by convention.                                                               |
 | `threshold: float`             | Scalar — free-text prompt. Broadcast across all column runs.                                              |
 | `df: pd.DataFrame`             | Auto-filled with the full table — never prompted.                                                         |
@@ -98,12 +106,9 @@ registered check instance per column at runtime.
 
 ```python
 @custom_check("value_not_negative", kind="check")
-def value_not_negative(col: str) -> pd.Series:
+def value_not_negative(col: pd.Series) -> pd.Series[bool]:
     """Check that values in a column are not negative."""
-    def _run(context: dict) -> pd.Series:
-        df = context["df"]
-        return df[col] >= 0
-    return _run
+    return col >= 0
 ```
 
 Selecting `premium` and `renewal` runs two instances:
@@ -117,17 +122,10 @@ Transforms return a Series or DataFrame that replaces column data in the table.
 
 ```python
 @custom_check("normalize_region", kind="transform")
-def normalize_region(col: str) -> pd.Series:
+def normalize_region(col: pd.Series) -> pd.Series:
     """Uppercase and strip the region column."""
-    def _run(context: dict) -> pd.Series:
-        df = context["df"]
-        result = df[col].str.upper().str.strip()
-        result.name = col
-        return result
-    return _run
+    return col.str.upper().str.strip()
 ```
-
-The series `.name` must match the column to overwrite.
 
 ---
 
