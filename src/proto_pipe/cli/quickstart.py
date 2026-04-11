@@ -139,6 +139,15 @@ def init_db(pipeline_db=None, watermark_db=None, migrate=False):
     WatermarkStore(w_db)
     click.echo("[ok] Watermark table ready")
 
+    # Smoke-test macros (parse-only — no CREATE MACRO or create_function)
+    from proto_pipe.io.config import load_settings
+    from proto_pipe.macros.loader import smoke_test_macros
+
+    settings = load_settings()
+    if settings.get("custom_macros_module") or settings.get("macros_dir"):
+        click.echo("\nValidating macros...")
+        smoke_test_macros(settings)
+
     click.echo("\nNext steps:")
     click.echo("1. Run: vp new source (define your data sources)")
     click.echo("2. Run: vp ingest (load files into the pipeline)")

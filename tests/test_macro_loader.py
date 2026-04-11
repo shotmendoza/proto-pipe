@@ -1,534 +1,285 @@
-"""vp new — create new pipeline resources.
+"""Tests for macro loading — loader.py, helpers.py, registry.py integration.
 
-Wraps the existing scaffold commands under a unified group.
-Command logic lives in scaffold.py until Session B moves it here.
+Tests:
+- register_python_macros makes a @macro-decorated function callable in DuckDB
+- load_sql_macros + register_python_macros together in same connection
+- Missing custom_macros_module path → no crash, no macros loaded
+- Python macro with unmappable type → skipped with warning
 """
 from pathlib import Path
 
-import click
 import duckdb
-import questionary
+import pytest
 
-from proto_pipe.cli.scaffold import (
-    get_original_func,
-    build_rich_sql_scaffold,
-    filter_unconfigured,
-    scan_incoming,
-    group_files_by_pattern,
+from proto_pipe.macros.registry import (
+    MacroContract,
+    MacroRegistry,
+    validate_macro,
+    parse_macro_signature,
 )
-from proto_pipe.io.db import get_all_source_tables
-from proto_pipe.io.config import load_config, write_config, load_settings, config_path_or_override
-from proto_pipe.cli.prompts import SourceConfigPrompter, ViewConfigPrompter
-from proto_pipe.constants import DEFAULT_SETTINGS_PATH
+from proto_pipe.macros.loader import (
+    load_sql_macros,
+    register_python_macros,
+    load_all_macros,
+    smoke_test_macros,
+)
+from proto_pipe.macros.helpers import macro, DECORATED_MACROS, load_macros_module
 
 
-@click.group("new", context_settings={"max_content_width": 120})
-def new_cmd():
-    """Create new pipeline resources.
-
-    \b
-    Examples:
-      vp new source
-      vp new report
-      vp new deliverable
-      vp new view
-      vp new macro
-      vp new sql
-    """
-    pass
+@pytest.fixture(autouse=True)
+def _clear_decorated_macros():
+    """Reset the global staging dict between tests."""
+    DECORATED_MACROS.clear()
+    yield
+    DECORATED_MACROS.clear()
 
 
-def new_commands(cli: click.Group) -> None:
-    cli.add_command(new_cmd)
+# ---------------------------------------------------------------------------
+# Test: Python macro callable in DuckDB query
+# ---------------------------------------------------------------------------
+class TestRegisterPythonMacros:
+    def test_python_macro_callable_in_duckdb(self):
+        """A @macro-decorated function is callable via SELECT after registration."""
 
+        def apply_quota_share(premium: float, share: float) -> float:
+            return premium * share
 
-@click.command("new-source")
-@click.option("--sources-config", default=None, help="Override sources config path.")
-@click.option("--incoming-dir", default=None, help="Override incoming directory path.")
-def new_source(sources_config, incoming_dir):
-    """Interactively define a new data source and add it to sources_config.yaml.
-
-    \b
-    Example:
-      vp new source
-    """
-    from proto_pipe.io.config import SourceConfig
-    from proto_pipe.io.db import get_registry_hints, write_registry_types
-
-    src_cfg = config_path_or_override("sources_config", sources_config)
-    inc_dir = config_path_or_override("incoming_dir", incoming_dir)
-    settings = load_settings()
-    pipeline_db = settings["paths"]["pipeline_db"]
-
-    config = SourceConfig(src_cfg)
-
-    click.echo("\n── New Source ──────────────────────────────")
-
-    all_files = scan_incoming(inc_dir)
-    files = filter_unconfigured(all_files, config.all())
-
-    if not files:
-        if not all_files:
-            click.echo(
-                f"\n[error] No files found in '{inc_dir}'."
-                f"\n  Add a matching file to '{inc_dir}' first, then run: vp new source"
-            )
-        else:
-            click.echo(
-                f"\n[error] All {len(all_files)} file(s) in '{inc_dir}' are already"
-                f" covered by an existing source.\n"
-                f"  Run 'vp edit source' to update an existing source,"
-                f" or add a new file first."
-            )
-        return
-
-    file_groups = group_files_by_pattern(files)
-    selected_file, suggested = SourceConfigPrompter.prompt_file_group(file_groups)
-
-    if suggested is None:
-        click.echo("Cancelled.")
-        return
-
-    # Load ALL files matching the suggested pattern via DuckDB with
-    # union_by_name=True so the combined schema covers every column
-    # that may appear across the file group — not just one file.
-    group_files = file_groups.get(suggested, [])
-    sample = None
-
-    if group_files:
-        if len(group_files) > 1:
-            click.echo(
-                f"\n  {len(group_files)} files match '{suggested}'"
-                f" — reading all to derive the combined schema.\n"
-            )
-        try:
-            file_paths = [str(Path(inc_dir) / f) for f in group_files]
-            with duckdb.connect(pipeline_db) as _conn:
-                path_list = ", ".join(f"'{p}'" for p in file_paths)
-                sample = _conn.execute(
-                    f"SELECT * FROM read_csv([{path_list}],"
-                    f" union_by_name=true) LIMIT 1000"
-                ).df()
-                from proto_pipe.io.db import coerce_for_display
-
-                sample = coerce_for_display(sample)
-        except Exception as e:
-            click.echo(f"  [warn] Could not read files for schema preview: {e}")
-
-    registry_hints: dict = {}
-    if sample is not None:
-        # Strip blank/whitespace-only column names — these are CSV artefacts
-        # (trailing commas, empty header cells) and must never be registered.
-        file_cols = [c for c in sample.columns if not c.startswith("_") and c.strip()]
-        try:
-            with duckdb.connect(pipeline_db) as conn:
-                registry_hints = get_registry_hints(conn, file_cols)
-        except Exception as e:
-            print(f"[warn] Could not load column type hints from registry: {e}")
-    # existing source name (e.g. to add a new pattern).
-    existing_lookup = {s["name"]: s for s in config.all()}
-
-    prompter = SourceConfigPrompter(
-        sample_df=sample,
-        registry_hints=registry_hints,
-        existing_sources_lookup=existing_lookup,
-    )
-
-    if not prompter.run(config.names(), suggested):
-        click.echo("Cancelled.")
-        return
-
-    if prompter.confirmed_types:
-        try:
-            with duckdb.connect(pipeline_db) as conn:
-                write_registry_types(
-                    conn, prompter.source["name"], prompter.confirmed_types
-                )
-        except Exception as e:
-            click.echo(
-                f"[warn] Column types were not saved to column_type_registry: {e}\n"
-                f"  Has 'vp init db' been run? Types confirmed this session are lost.\n"
-                f"  Run 'vp init db' then 'vp new source' again to re-confirm them."
-            )
-    config.add_or_update(prompter.source)
-    click.echo(f"\n[ok] Source '{prompter.source['name']}' added to {src_cfg}")
-    click.echo("\nNext steps:")
-    click.echo("1. Review the entry in sources_config.yaml if needed")
-    click.echo("2. Run: vp ingest")
-
-
-@click.command("new-report")
-@click.option("--reports-config", default=None, help="Override reports config path.")
-@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-def new_report(reports_config, pipeline_db):
-    """Interactively define a new report and add it to reports_config.yaml.
-
-    \b
-    Example:
-      vp new report
-    """
-    from proto_pipe.checks.registry import CheckRegistry, CheckParamInspector
-    from proto_pipe.checks.built_in import BUILT_IN_CHECKS
-    from proto_pipe.io.config import config_path_or_override, ReportConfig
-    from proto_pipe.checks.helpers import load_custom_checks_module
-    from proto_pipe.io.config import load_settings
-    from proto_pipe.io.db import init_check_registry_metadata
-    from proto_pipe.cli.prompts import ReportConfigPrompter
-
-    rep_cfg = config_path_or_override("reports_config", reports_config)
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    settings = load_settings()
-    multi_select = settings.get("multi_select_params", True)
-
-    config = ReportConfig(rep_cfg)
-
-    check_registry = CheckRegistry()
-    for name, func in BUILT_IN_CHECKS.items():
-        check_registry.register(name, func)
-
-    module_path = settings.get("custom_checks_module")
-    if module_path:
-        load_custom_checks_module(module_path, check_registry)
-
-    if not check_registry.available():
-        click.echo("\n[warn] No checks available. Add built-in or custom checks first.")
-        return
-
-    all_tables = get_all_source_tables(p_db, {"reports": config.all()})
-    if not all_tables:
-        click.echo(
-            "\n  No tables found. Run: vp ingest to load files first."
+        contract = validate_macro(apply_quota_share)
+        contract = MacroContract(
+            name="apply_quota_share",
+            params=contract.params,
+            param_types=contract.param_types,
+            return_type=contract.return_type,
+            source="python",
+            func=apply_quota_share,
+            func_name=contract.func_name,
         )
-        return
 
-    # all_tables is list[tuple[str, int]] — prompt_table in prompts.py
-    # builds the annotated questionary.Choice objects (CLAUDE.md: prompts.py
-    # owns all CLI formatting; command files never call questionary directly).
-    table_choices = all_tables
+        registry = MacroRegistry()
+        registry.register(contract)
 
-    click.echo("\n── New Report ──────────────────────────────")
-    click.echo("  Press ESC at any prompt to go back to the previous step.\n")
+        conn = duckdb.connect(":memory:")
+        register_python_macros(conn, registry)
 
-    prompter = ReportConfigPrompter(
-        check_registry=check_registry,
-        p_db=p_db,
-        multi_select=multi_select,
-    )
-
-    conn = duckdb.connect(p_db)
-    init_check_registry_metadata(conn)
-    for check_name in check_registry.available():
-        original = get_original_func(check_name, check_registry)
-        if original is not None:
-            CheckParamInspector(original).write_to_db(conn, check_name)
-
-    try:
-        if not prompter.run(table_choices, config.names(), conn):
-            click.echo("Cancelled.")
-            return
-    finally:
+        result = conn.execute("SELECT apply_quota_share(100.0, 0.25)").fetchone()[0]
+        assert result == pytest.approx(25.0)
         conn.close()
 
-    report = {
-        "name": prompter.name,
-        "source": {"type": "duckdb", "path": p_db, "table": prompter.table},
-        "options": {"parallel": False},
-    }
-    if prompter.alias_map:
-        report["alias_map"] = prompter.alias_map
-    report["checks"] = prompter.check_entries
+    def test_unannotated_params_default_to_str(self):
+        """Unannotated params default to str and work in DuckDB."""
 
-    config.add_or_update(report)
-    click.echo(f"\n[ok] Report '{prompter.name}' added to {rep_cfg}")
-    click.echo("\nNext steps:")
-    click.echo("1. Review the entry in reports_config.yaml if needed")
-    click.echo("2. Run: vp validate")
+        def upper_name(val) -> str:
+            return val.upper()
 
+        contract = validate_macro(upper_name)
+        contract = MacroContract(
+            name="upper_name",
+            params=contract.params,
+            param_types=contract.param_types,
+            return_type=contract.return_type,
+            source="python",
+            func=upper_name,
+            func_name=contract.func_name,
+        )
 
-@click.command("new-deliverable")
-@click.option("--deliverables-config", default=None)
-@click.option("--reports-config", default=None)
-@click.option("--sources-config", default=None)
-@click.option("--sql-dir", default=None)
-def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir):
-    """Interactively define a new deliverable and add it to deliverables_config.yaml."""
-    from proto_pipe.io.config import config_path_or_override, DeliverableConfig
-    from proto_pipe.io.config import load_config, load_settings
-    from proto_pipe.cli.prompts import DeliverableConfigPrompter
+        registry = MacroRegistry()
+        registry.register(contract)
 
-    del_cfg = config_path_or_override("deliverables_config", deliverables_config)
-    rep_cfg = config_path_or_override("reports_config", reports_config)
-    src_cfg = config_path_or_override("sources_config", sources_config)
-    settings = load_settings()
-    pipeline_db = settings["paths"].get("pipeline_db")
-    sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
-    views_config = settings["paths"].get("views_config")  # NEW
+        conn = duckdb.connect(":memory:")
+        register_python_macros(conn, registry)
 
-    config = DeliverableConfig(del_cfg)
-    rep_config = load_config(rep_cfg)
-    src_config = load_config(src_cfg)
-
-    available_reports = [r["name"] for r in rep_config.get("reports", [])]
-    if not available_reports:
-        click.echo("\n  No reports configured yet. Run: vp new report")
-        return
-
-    click.echo("\n── New Deliverable ─────────────────────────")
-
-    prompter = DeliverableConfigPrompter(
-        rep_config=rep_config,
-        src_config=src_config,
-        sql_dir=sql_directory,
-    )
-
-    if not prompter.run(
-        config.names(),
-        available_reports,
-        pipeline_db=pipeline_db,
-        views_config_path=views_config,  # NEW
-    ):
-        click.echo("Cancelled.")
-        return
-
-    config.add_or_update(prompter.deliverable)
-
-    click.echo(
-        f"\n[ok] Deliverable '{prompter.deliverable['name']}' added to {del_cfg}"
-    )
-    click.echo("\nNext steps:")
-    sql_file = prompter.deliverable.get("sql_file")
-    if sql_file:
-        click.echo(f"1. Edit {sql_file} with your transformation query")
-        click.echo(f"2. Run: vp deliver {prompter.deliverable['name']}")
-    else:
-        click.echo(f"1. Run: vp deliver {prompter.deliverable['name']}")
+        result = conn.execute("SELECT upper_name('hello')").fetchone()[0]
+        assert result == "HELLO"
+        conn.close()
 
 
-@click.command("new-view")
-@click.option("--views-config", default=None, help="Override views config path.")
-@click.option("--reports-config", default=None, help="Override reports config path.")
-@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
-@click.option("--sql-dir", default=None, help="Override SQL output directory.")
-def new_view(views_config, reports_config, pipeline_db, sql_dir):
-    """Interactively define a new view and add it to views_config.yaml."""
-    from proto_pipe.cli.scaffold import build_view_sql
-    from proto_pipe.reports.views import load_views_config
+# ---------------------------------------------------------------------------
+# Test: SQL + Python macros together
+# ---------------------------------------------------------------------------
+class TestSqlAndPythonMacrosTogether:
+    def test_both_macro_types_available_in_same_connection(self, tmp_path):
+        """SQL and Python macros coexist on the same connection."""
+        # SQL macro
+        macros_dir = tmp_path / "macros"
+        macros_dir.mkdir()
+        (macros_dir / "double_it.sql").write_text(
+            "CREATE OR REPLACE MACRO double_it(x) AS x * 2;"
+        )
 
-    settings = load_settings()
-    p_db = config_path_or_override("pipeline_db", pipeline_db)
-    rep_cfg = config_path_or_override("reports_config", reports_config)
-    views_cfg = views_config or settings["paths"].get("views_config")
-    sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
+        # Python macro
+        def triple_it(x: float) -> float:
+            return x * 3.0
 
-    rep_config = load_config(rep_cfg)
+        py_contract = validate_macro(triple_it)
+        py_contract = MacroContract(
+            name="triple_it",
+            params=py_contract.params,
+            param_types=py_contract.param_types,
+            return_type=py_contract.return_type,
+            source="python",
+            func=triple_it,
+            func_name=py_contract.func_name,
+        )
 
-    all_tables = get_all_source_tables(p_db, rep_config)
-    if not all_tables:
-        click.echo("\n  No tables found. Run: vp ingest to load files first.")
-        return
+        registry = MacroRegistry()
+        registry.register(py_contract)
 
-    existing_views = load_views_config(views_cfg) if views_cfg else []
-    existing_view_names = [v["name"] for v in existing_views]
+        conn = duckdb.connect(":memory:")
+        load_sql_macros(conn, str(macros_dir), registry)
+        register_python_macros(conn, registry)
 
-    click.echo("\n── New View ────────────────────────────────")
+        # Both should work
+        sql_result = conn.execute("SELECT double_it(5)").fetchone()[0]
+        py_result = conn.execute("SELECT triple_it(5.0)").fetchone()[0]
+        assert sql_result == 10
+        assert py_result == pytest.approx(15.0)
 
-    prompter = ViewConfigPrompter()
-    if not prompter.run(existing_view_names, all_tables, p_db):
-        click.echo("Cancelled.")
-        return
-
-    # Write SQL file
-    sql_path = Path(sql_directory)
-    sql_path.mkdir(parents=True, exist_ok=True)
-    dest = sql_path / f"{prompter.sql_spec.view_name}.sql"
-    sql_content = build_view_sql(prompter.sql_spec)
-    dest.write_text(sql_content)
-
-    # Update views_config.yaml
-    view_entry = {"name": prompter.sql_spec.view_name, "sql_file": str(dest)}
-
-    if views_cfg and Path(views_cfg).exists():
-        config = load_config(views_cfg)
-    else:
-        config = {"views": []}
-        if not views_cfg:
-            views_cfg = str(Path(sql_directory).parent / "views_config.yaml")
-
-    views_list = config.get("views", [])
-    if views_list is None:
-        views_list = []
-
-    # Insert after dependency or append
-    if prompter.insert_after:
-        insert_idx = None
-        for i, v in enumerate(views_list):
-            if v["name"] == prompter.insert_after:
-                insert_idx = i + 1
-                break
-        if insert_idx is not None:
-            views_list.insert(insert_idx, view_entry)
-        else:
-            views_list.append(view_entry)
-    else:
-        views_list.append(view_entry)
-
-    config["views"] = views_list
-    write_config(config, views_cfg)
-
-    click.echo(f"\n[ok] View '{prompter.sql_spec.view_name}' added to {views_cfg}")
-    click.echo(f"  SQL: {dest}")
-    click.echo("\nNext steps:")
-    click.echo(f"1. Review {dest}")
-    click.echo("2. Run: vp refresh views")
+        # Registry knows about both
+        assert "double_it" in registry.available()
+        assert "triple_it" in registry.available()
+        conn.close()
 
 
-@click.command("new-macro")
-@click.argument("name")
-@click.option("--macros-dir", default=None, help="Override macros directory.")
-def new_macro(name: str, macros_dir: str | None):
-    """Scaffold a new SQL macro file in the macros directory.
+# ---------------------------------------------------------------------------
+# Test: Missing custom_macros_module → no crash
+# ---------------------------------------------------------------------------
+class TestMissingMacrosModule:
+    def test_missing_module_path_no_crash(self):
+        """load_all_macros with no custom_macros_module and no macros_dir
+        returns an empty registry without errors."""
+        conn = duckdb.connect(":memory:")
+        settings = {}  # no custom_macros_module, no macros_dir
 
-    Creates a templated .sql file with a CREATE OR REPLACE MACRO stub.
-    Registers macros_dir in pipeline.yaml if not already set.
+        registry = load_all_macros(conn, settings)
 
-    \b
-    Example:
-      vp new-macro normalize_transaction_type
-    """
-    from proto_pipe.io.config import load_settings
+        assert registry.available() == []
+        conn.close()
 
-    settings = load_settings()
-    macro_dir_path = macros_dir or settings.get("macros_dir", "macros")
+    def test_missing_macros_dir_no_crash(self, capsys):
+        """Nonexistent macros_dir warns but doesn't crash."""
+        conn = duckdb.connect(":memory:")
+        settings = {"macros_dir": "/nonexistent/macros"}
 
-    dest_dir = Path(macro_dir_path)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+        registry = load_all_macros(conn, settings)
 
-    dest = dest_dir / f"{name}.sql"
-    if dest.exists():
-        click.echo(f"  [skip] {dest} already exists — delete it first to regenerate")
-        return
-
-    template = f"""\
--- {name}.sql
--- Macro: describe what this macro does
---
--- Macros are registered at pipeline startup and available in all
--- view and deliverable SQL queries.
---
--- Use CREATE OR REPLACE so re-running vp init db is idempotent.
-
-CREATE OR REPLACE MACRO {name}(val) AS
-    CASE
-        WHEN val = 'old_value' THEN 'new_value'
-        ELSE val
-    END;
-"""
-    dest.write_text(template)
-    click.echo(f"[ok] {dest}")
-
-    # Add macros_dir to pipeline.yaml if not already present
-    pipeline_yaml = DEFAULT_SETTINGS_PATH
-    if pipeline_yaml.exists():
-        doc = load_config(pipeline_yaml)
-        if "macros_dir" not in doc:
-            doc["macros_dir"] = macro_dir_path
-            write_config(doc, pipeline_yaml)
-            click.echo(f"[ok] Added macros_dir = '{macro_dir_path}' to pipeline.yaml")
-
-    click.echo(f"\nNext steps:")
-    click.echo(f"1. Edit {dest} with your macro logic")
-    click.echo(f"2. Run: vp init db   (re-registers all macros)")
+        assert registry.available() == []
+        captured = capsys.readouterr()
+        assert "not found" in captured.out
+        conn.close()
 
 
-@click.command("new-sql")
-@click.argument("name", required=False)
-@click.option("--reports-config", default=None, help="Override reports config path.")
-@click.option("--sources-config", default=None, help="Override sources config path.")
-@click.option("--sql-dir", default=None, help="Override SQL output directory.")
-def new_sql(name, reports_config, sources_config, sql_dir):
-    """Scaffold an annotated SQL file for a deliverable query.
+# ---------------------------------------------------------------------------
+# Test: Unmappable type → skipped with warning
+# ---------------------------------------------------------------------------
+class TestUnmappableType:
+    def test_unmappable_param_type_skipped_with_warning(self, capsys):
+        """A macro with a non-scalar param type is skipped, not registered."""
+        import datetime
 
-    Creates a .sql file with join stubs, macro references, and inline comments
-    so you can write your carrier queries faster. Does not modify any config
-    file — wire it up in deliverables_config.yaml when ready.
+        def bad_macro(val: datetime.datetime) -> str:
+            return str(val)
 
-    \\b
-    Example:
-      vp new-sql carrier_a_sales
-      vp new-sql # interactive — prompts for name and tables
-    """
-    from proto_pipe.io.config import config_path_or_override, load_settings
+        contract = validate_macro(bad_macro)
+        contract = MacroContract(
+            name="bad_macro",
+            params=contract.params,
+            param_types=contract.param_types,
+            return_type=contract.return_type,
+            source="python",
+            func=bad_macro,
+            func_name=contract.func_name,
+        )
 
-    rep_cfg = config_path_or_override("reports_config", reports_config)
-    src_cfg = config_path_or_override("sources_config", sources_config)
-    settings = load_settings()
+        registry = MacroRegistry()
+        registry.register(contract)
 
-    sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
+        conn = duckdb.connect(":memory:")
+        register_python_macros(conn, registry)
 
-    rep_config = load_config(rep_cfg)
-    src_config = load_config(src_cfg)
+        captured = capsys.readouterr()
+        assert "unmappable" in captured.out
+        assert "bad_macro" in captured.out
 
-    available_reports = [r["name"] for r in rep_config.get("reports", [])]
+        # Should NOT be callable in DuckDB
+        with pytest.raises(Exception):
+            conn.execute("SELECT bad_macro('test')")
+        conn.close()
 
-    if not available_reports:
-        click.echo("  No reports configured yet. Run: vp new report")
-        return
+    def test_unmappable_return_type_skipped(self, capsys):
+        """A macro with unmappable return type is skipped."""
+        import datetime
 
-    click.echo("\n── New SQL File ────────────────────────────")
+        def bad_return(val: str) -> datetime.date:
+            return datetime.date.today()
 
-    # Name
-    if not name:
-        name = questionary.text("SQL file name (e.g. carrier_a_sales):").ask()
-        if not name:
-            click.echo("Cancelled.")
-            return
+        contract = validate_macro(bad_return)
+        contract = MacroContract(
+            name="bad_return",
+            params=contract.params,
+            param_types=contract.param_types,
+            return_type=contract.return_type,
+            source="python",
+            func=bad_return,
+            func_name=contract.func_name,
+        )
 
-    dest = Path(sql_directory) / f"{name}.sql"
-    dest.parent.mkdir(parents=True, exist_ok=True)
+        registry = MacroRegistry()
+        registry.register(contract)
 
-    if dest.exists():
-        overwrite = questionary.confirm(f"{dest} already exists. Overwrite?").ask()
-        if not overwrite:
-            click.echo("Cancelled.")
-            return
+        conn = duckdb.connect(":memory:")
+        register_python_macros(conn, registry)
 
-    # Select reports / tables
-    selected = questionary.checkbox(
-        "Which reports should this query pull from?",
-        choices=available_reports,
-    ).ask()
-    if not selected:
-        click.echo("Cancelled.")
-        return
-
-    scaffold = build_rich_sql_scaffold(
-        deliverable_name=name,
-        selected_reports=selected,
-        reports_config=rep_config,
-        sources_config=src_config,
-    )
-
-    dest.write_text(scaffold)
-    click.echo(f"\n[ok] {dest}")
-
-    click.echo(f"\nNext steps:")
-    click.echo(f"1. Edit {dest} with your query logic")
-    click.echo(f"2. Reference it in deliverables_config.yaml:\n" f'sql_file: "{dest}"')
+        captured = capsys.readouterr()
+        assert "unmappable" in captured.out
+        conn.close()
 
 
-#####################
-# REGISTRATION
-####################
+# ---------------------------------------------------------------------------
+# Test: smoke_test_macros (parse-only, no connection)
+# ---------------------------------------------------------------------------
+class TestSmokeTestMacros:
+    def test_smoke_test_validates_sql_files(self, tmp_path, capsys):
+        """smoke_test_macros parses SQL files without executing."""
+        macros_dir = tmp_path / "macros"
+        macros_dir.mkdir()
+        (macros_dir / "my_macro.sql").write_text(
+            "CREATE OR REPLACE MACRO my_macro(a, b) AS a + b;"
+        )
 
-def _register(cli_group: click.Group) -> None:
-    """Register all vp new subcommands onto the group."""
+        smoke_test_macros({"macros_dir": str(macros_dir)})
 
-    cli_group.add_command(new_source, name="source")
-    cli_group.add_command(new_report, name="report")
-    cli_group.add_command(new_deliverable, name="deliverable")
-    cli_group.add_command(new_view, name="view")
-    cli_group.add_command(new_macro, name="macro")
-    cli_group.add_command(new_sql, name="sql")
+        captured = capsys.readouterr()
+        assert "my_macro" in captured.out
+        assert "macro-ok" in captured.out
+
+    def test_smoke_test_warns_on_unparseable(self, tmp_path, capsys):
+        """smoke_test_macros warns on files it can't parse."""
+        macros_dir = tmp_path / "macros"
+        macros_dir.mkdir()
+        (macros_dir / "bad.sql").write_text("SELECT 1;")
+
+        smoke_test_macros({"macros_dir": str(macros_dir)})
+
+        captured = capsys.readouterr()
+        assert "macro-warn" in captured.out
 
 
-_register(new_cmd)
+# ---------------------------------------------------------------------------
+# Test: load_all_macros orchestrator
+# ---------------------------------------------------------------------------
+class TestLoadAllMacros:
+    def test_sql_macros_loaded_via_orchestrator(self, tmp_path):
+        """load_all_macros loads SQL macros and makes them queryable."""
+        macros_dir = tmp_path / "macros"
+        macros_dir.mkdir()
+        (macros_dir / "add_ten.sql").write_text(
+            "CREATE OR REPLACE MACRO add_ten(x) AS x + 10;"
+        )
+
+        conn = duckdb.connect(":memory:")
+        registry = load_all_macros(conn, {"macros_dir": str(macros_dir)})
+
+        result = conn.execute("SELECT add_ten(5)").fetchone()[0]
+        assert result == 15
+        assert "add_ten" in registry.available()
+        conn.close()

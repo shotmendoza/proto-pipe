@@ -42,6 +42,8 @@ def deliver(
 
     from proto_pipe.reports.deliverable import run_deliverable
     from proto_pipe.pipelines.query import query_table
+    from proto_pipe.io.config import load_settings
+    from proto_pipe.macros.loader import load_all_macros
 
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     del_cfg = config_path_or_override("deliverables_config", deliverables_config)
@@ -57,6 +59,10 @@ def deliver(
 
     deliverable = deliverables[deliverable_name]
     conn = duckdb.connect(p_db)
+
+    # Load macros before any SQL queries — macros are connection-scoped
+    settings = load_settings()
+    load_all_macros(conn, settings)
 
     # Build CLI date override if provided
     cli_date_filter = None
@@ -145,13 +151,14 @@ def run_all(
     """
     from proto_pipe.pipelines.watermark import WatermarkStore
     from proto_pipe.checks.registry import check_registry, report_registry
-    from proto_pipe.io.config import load_config
+    from proto_pipe.io.config import load_config, load_settings
     from proto_pipe.reports.runner import run_all_reports
     from proto_pipe.reports.deliverable import run_deliverable
     from proto_pipe.pipelines.query import query_table
     from proto_pipe.io.ingest import ingest_directory
     from proto_pipe.reports.views import refresh_views, load_views_config
     from proto_pipe.io.db import write_pipeline_events
+    from proto_pipe.macros.loader import load_all_macros
 
     import duckdb
 
@@ -253,6 +260,10 @@ def run_all(
             return
     else:
         click.echo("[skip] No views defined")
+
+    # Step 4b — Load macros (connection-scoped, before deliverable queries)
+    settings = load_settings()
+    load_all_macros(conn, settings)
 
     # Step 5 — Deliver
     if deliverable:
