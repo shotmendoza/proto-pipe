@@ -22,6 +22,61 @@ from proto_pipe.cli.prompts import SourceConfigPrompter, ViewConfigPrompter
 from proto_pipe.constants import DEFAULT_SETTINGS_PATH
 
 
+def _build_inspect_macro_registry(settings: dict):
+    """Build a MacroRegistry for wizard inspection — no DuckDB registration.
+
+    Same as smoke_test_macros but returns the populated registry.
+    Loads Python macros via load_macros_module (import + validate_macro)
+    and parses SQL macro signatures — but skips conn.execute and
+    conn.create_function (connection-scoped, would be lost anyway).
+
+    Returns MacroRegistry (possibly empty if no macros configured).
+    """
+    from pathlib import Path
+    from proto_pipe.macros.registry import (
+        MacroRegistry,
+        MacroContract,
+        parse_macro_signature,
+    )
+
+    macro_registry = MacroRegistry()
+
+    # Python macros from user module
+    module_path = settings.get("custom_macros_module")
+    if module_path:
+        from proto_pipe.macros.helpers import load_macros_module
+
+        load_macros_module(module_path, macro_registry)
+
+    # SQL macros — parse signatures only, no conn.execute
+    macros_dir = settings.get("macros_dir")
+    if macros_dir:
+        p = Path(macros_dir)
+        if p.exists():
+            for sql_file in sorted(p.glob("*.sql")):
+                try:
+                    sql = sql_file.read_text().strip()
+                    if not sql:
+                        continue
+                    parsed = parse_macro_signature(sql)
+                    if parsed:
+                        name, params = parsed
+                        contract = MacroContract(
+                            name=name,
+                            params=params,
+                            param_types={},
+                            return_type=None,
+                            source="sql",
+                            func=None,
+                            func_name=name,
+                        )
+                        macro_registry.register(contract)
+                except Exception:
+                    pass  # Wizard shouldn't crash on bad macro files
+
+    return macro_registry
+
+
 @click.group("new", context_settings={"max_content_width": 120})
 def new_cmd():
     """Create new pipeline resources.
@@ -262,7 +317,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
     settings = load_settings()
     pipeline_db = settings["paths"].get("pipeline_db")
     sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
-    views_config = settings["paths"].get("views_config")  # NEW
+    views_config = settings["paths"].get("views_config")
 
     config = DeliverableConfig(del_cfg)
     rep_config = load_config(rep_cfg)
@@ -273,19 +328,23 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
         click.echo("\n  No reports configured yet. Run: vp new report")
         return
 
+    # Build inspect-only macro registry (no DuckDB registration)
+    macro_registry = _build_inspect_macro_registry(settings)
+
     click.echo("\n── New Deliverable ─────────────────────────")
 
     prompter = DeliverableConfigPrompter(
         rep_config=rep_config,
         src_config=src_config,
         sql_dir=sql_directory,
+        macro_registry=macro_registry,
     )
 
     if not prompter.run(
         config.names(),
         available_reports,
         pipeline_db=pipeline_db,
-        views_config_path=views_config,  # NEW
+        views_config_path=views_config,
     ):
         click.echo("Cancelled.")
         return

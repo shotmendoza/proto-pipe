@@ -15,8 +15,24 @@ from __future__ import annotations
 import click
 import questionary
 
+from dataclasses import dataclass
+
 from proto_pipe.constants import DUCKDB_TYPES, DATE_FORMATS
 from proto_pipe.reports.callbacks import ReportCallback, LogEntry
+
+
+@dataclass
+class MacroApplication:
+    """A macro bound to specific columns/literals for a deliverable query.
+
+    Built by DeliverableConfigPrompter.prompt_all_macros().
+    Consumed by build_deliverable_sql() in scaffold.py for SQL generation.
+    """
+
+    macro_name: str  # e.g. "apply_quota_share"
+    param_bindings: dict[str, str]  # param_name → column_name or literal value
+    output_column: str  # alias in SELECT clause
+    overwrites: str | None  # column name it replaces, or None if new
 
 
 def prompt_custom_export_path() -> "Path | None":
@@ -561,6 +577,37 @@ def _make_col_choices(
     ]
 
 
+def prompt_param_binding(
+    param_name: str,
+    param_type: type | None,
+    available_columns: list[str],
+) -> str | None:
+    """Prompt user to bind a parameter to a column or a literal value.
+
+    Used by both DeliverableConfigPrompter (macro param binding) and
+    ReportConfigPrompter._fill_params (column-or-literal escape hatch).
+
+    Returns the column name or literal string, or None if cancelled.
+    """
+    import questionary
+
+    choices = [questionary.Choice(col, value=col) for col in available_columns]
+    choices.append(questionary.Choice(title=_DIRECT_ENTRY, value=_DIRECT_ENTRY))
+
+    value = questionary.select(f"{param_name}:", choices=choices).ask()
+    if value is None:
+        return None
+
+    if value == _DIRECT_ENTRY:
+        type_hint = f" ({param_type.__name__})" if param_type else ""
+        raw = questionary.text(f"{param_name}{type_hint} (enter value directly):").ask()
+        if raw is None:
+            return None
+        return raw
+
+    return value
+
+
 # Sentinel for the free-text escape hatch in column-picker prompts.
 # When selected, the user types a value directly → filled_params (broadcast constant)
 # rather than alias_map (column-backed per-row). Never stored in alias_map.
@@ -1046,11 +1093,15 @@ class ReportConfigPrompter:
                         col_choices = _make_col_choices(ordered, registry_types)
                         if has_escape:
                             col_choices = col_choices + [
-                                questionary.Choice(title=_DIRECT_ENTRY, value=_DIRECT_ENTRY)
+                                questionary.Choice(
+                                    title=_DIRECT_ENTRY, value=_DIRECT_ENTRY
+                                )
                             ]
 
                         value = questionary.select(
-                            f"{param_name}:", choices=col_choices, default=default_col
+                            f"{param_name}:",
+                            choices=col_choices,
+                            default=default_col,
                         ).ask()
                         if value is None:
                             return [], [], True
@@ -1226,6 +1277,38 @@ class ReportConfigPrompter:
 # DeliverableConfigPrompter
 # ---------------------------------------------------------------------------
 
+
+def _flatten_columns_for_macros(
+    all_columns: dict[str, list[str]],
+) -> list[str]:
+    """Flatten table columns into a single list for macro param binding.
+
+    When a column name exists in multiple tables, includes qualified
+    names (table.column) so the user can disambiguate.
+    """
+    col_counts: dict[str, int] = {}
+    for cols in all_columns.values():
+        for col in cols:
+            col_counts[col] = col_counts.get(col, 0) + 1
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for table, cols in all_columns.items():
+        for col in cols:
+            if col_counts[col] > 1:
+                qualified = f"{table}.{col}"
+                if qualified not in seen:
+                    result.append(qualified)
+                    seen.add(qualified)
+            else:
+                if col not in seen:
+                    result.append(col)
+                    seen.add(col)
+
+    return result
+
+
 class DeliverableConfigPrompter:
     """Collects user input for creating or editing a deliverable configuration.
 
@@ -1244,11 +1327,13 @@ class DeliverableConfigPrompter:
             src_config: dict,
             sql_dir: str,
             existing_deliverable: dict | None = None,
+            macro_registry=None,
     ) -> None:
         self._rep_config = rep_config
         self._src_config = src_config
         self._sql_dir = sql_dir
         self._existing = existing_deliverable or {}
+        self._macro_registry = macro_registry  # MacroRegistry or None
         # Output property — only valid after run() returns True
         self.deliverable: dict = {}
 
@@ -1266,10 +1351,13 @@ class DeliverableConfigPrompter:
 
         Stores the completed deliverable dict in self.deliverable.
         Returns True on completion, False if cancelled.
-
-        :param pipeline_db: Path to pipeline DB. Required for column discovery.
-        :param views_config_path: Path to views_config.yaml. Optional.
         """
+        import click
+        from proto_pipe.cli.scaffold import (
+            DeliverableSQLSpec,
+            build_deliverable_sql,
+        )
+
         self.deliverable = {}
 
         name = self.prompt_name(existing_names)
@@ -1312,8 +1400,15 @@ class DeliverableConfigPrompter:
                     return False
                 view_columns = view_columns_result
 
-            # Join configuration — unified for reports + views
+            # Macro selection (optional — skips if no macros available)
             all_columns = {**report_columns, **view_columns}
+            all_col_names = _flatten_columns_for_macros(all_columns)
+            macro_applications = self.prompt_all_macros(
+                self._macro_registry,
+                all_col_names,
+            )
+
+            # Join configuration — unified for reports + views
             join_specs = []
             if len(all_columns) > 1:
                 join_specs = self.prompt_joins(all_columns)
@@ -1322,17 +1417,13 @@ class DeliverableConfigPrompter:
 
             order_by = self.prompt_order_by(report_columns)
 
-            from proto_pipe.cli.scaffold import (
-                DeliverableSQLSpec,
-                build_deliverable_sql,
-            )
-
             spec = DeliverableSQLSpec(
                 deliverable_name=name,
                 report_columns=report_columns,
                 join_specs=join_specs,
                 order_by=order_by,
                 view_columns=view_columns,
+                macro_applications=macro_applications,
             )
 
             sql_content = build_deliverable_sql(spec)
@@ -1605,6 +1696,128 @@ class DeliverableConfigPrompter:
             view_columns[view_name] = selected
 
         return view_columns
+
+
+    def prompt_macros(self, macro_registry) -> list[str]:
+        """Checkbox of available macros. Returns selected macro names.
+
+        Skips silently if macro_registry is None or empty.
+        Never returns None — macros are optional, not cancellable.
+        """
+        if macro_registry is None:
+            return []
+
+        available = macro_registry.available()
+        if not available:
+            return []
+
+        choices = []
+        for name in available:
+            contract = macro_registry.get_contract(name)
+            if contract:
+                sig = f"{contract.func_name}({', '.join(contract.params)})"
+                choices.append(questionary.Choice(sig, value=name))
+            else:
+                choices.append(questionary.Choice(name, value=name))
+
+        selected = questionary.checkbox(
+            "Apply macros to this deliverable?",
+            choices=choices,
+        ).ask()
+
+        return selected or []
+
+    def prompt_macro_params(
+        self,
+        contract,
+        available_columns: list[str],
+    ) -> dict[str, str] | None:
+        """For each param in the macro contract, prompt for a column or literal.
+
+        Returns {param_name: column_name_or_literal} or None if cancelled.
+        """
+        bindings: dict[str, str] = {}
+        for param_name in contract.params:
+            param_type = contract.param_types.get(param_name)
+            value = prompt_param_binding(param_name, param_type, available_columns)
+            if value is None:
+                return None
+            bindings[param_name] = value
+        return bindings
+
+    def prompt_macro_output(
+        self,
+        macro_name: str,
+        available_columns: list[str],
+    ) -> tuple[str, str | None] | None:
+        """Prompt for output column name and whether it overwrites an existing column.
+
+        Returns (output_column, overwrites) or None if cancelled.
+        overwrites is the column name being replaced, or None for a new column.
+        """
+        NEW_COL = "\u271a New column"
+        choices = [questionary.Choice(col, value=col) for col in available_columns]
+        choices.append(questionary.Choice(title=NEW_COL, value=NEW_COL))
+
+        click.echo(f"\n  Output for '{macro_name}':")
+        value = questionary.select(
+            "  Overwrite an existing column, or add a new one?",
+            choices=choices,
+        ).ask()
+        if value is None:
+            return None
+
+        if value == NEW_COL:
+            col_name = questionary.text(
+                f"  New column name for {macro_name}:"
+            ).ask()
+            if not col_name:
+                return None
+            return (col_name, None)
+
+        return (value, value)
+
+    def prompt_all_macros(
+        self,
+        macro_registry,
+        available_columns: list[str],
+    ) -> list:
+        """Orchestrate macro selection, param binding, and output for each.
+
+        Returns list[MacroApplication]. Empty list if no macros selected.
+        """
+        selected_names = self.prompt_macros(macro_registry)
+        if not selected_names:
+            return []
+
+        applications = []
+        for name in selected_names:
+            contract = macro_registry.get_contract(name)
+            if contract is None:
+                continue
+
+            click.echo(f"\n\u2500\u2500 Macro: {contract.func_name} \u2500\u2500")
+
+            bindings = self.prompt_macro_params(contract, available_columns)
+            if bindings is None:
+                return []
+
+            output = self.prompt_macro_output(name, available_columns)
+            if output is None:
+                return []
+
+            output_column, overwrites = output
+
+            applications.append(
+                MacroApplication(
+                    macro_name=name,
+                    param_bindings=bindings,
+                    output_column=output_column,
+                    overwrites=overwrites,
+                )
+            )
+
+        return applications
 
     # ---------------------------------------------------------------------------
     # Individual prompt methods

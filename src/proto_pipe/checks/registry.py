@@ -808,7 +808,12 @@ class CheckParamInspector:
 
         self.func = unwrapped
         self._sig = inspect.signature(self.func)
-        self._source = inspect.getsource(self.func)
+        try:
+            self._source = inspect.getsource(self.func)
+        except OSError:
+            # Source unavailable (stale bytecache, dynamic function, etc.)
+            # Degrades source_hash accuracy but doesn't block inspection.
+            self._source = ""
 
     def returns_boolean_series(self) -> bool:
         """True if the function's return annotation is pd.Series or Series."""

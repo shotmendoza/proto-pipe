@@ -8,6 +8,7 @@ from proto_pipe.cli.scaffold import (
     DeliverableSQLSpec,
     build_deliverable_sql,
 )
+from proto_pipe.cli.prompts import MacroApplication
 
 
 class TestBuildDeliverableSQLSingleReport:
@@ -340,3 +341,212 @@ class TestBuildDeliverableSQLWithViews:
             report_columns={"r": ["col"]},
         )
         assert spec.view_columns == {}
+
+
+class TestBuildDeliverableSQLMacros:
+    """Macro application in SQL generation."""
+
+    def test_macro_overwrites_replaces_column(self):
+        """When overwrites is set, the original column is replaced."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="with_macro",
+            report_columns={"premiums_report": ["policy_id", "bound_premium", "carrier"]},
+            macro_applications=[
+                MacroApplication(
+                    macro_name="apply_quota_share",
+                    param_bindings={"premium": "bound_premium", "share": "0.5"},
+                    output_column="adjusted_premium",
+                    overwrites="bound_premium",
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "apply_quota_share(bound_premium, 0.5) AS adjusted_premium" in sql
+        # Original bound_premium should NOT appear as a standalone column
+        select_part = sql.split("FROM")[0]
+        lines = [l.strip() for l in select_part.split("\n") if "bound_premium" in l]
+        for line in lines:
+            assert "apply_quota_share" in line, (
+                f"bound_premium should only appear inside macro expression, got: {line}"
+            )
+
+    def test_macro_no_overwrite_appends_column(self):
+        """When overwrites is None, macro expression is appended."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="with_macro",
+            report_columns={"premiums_report": ["policy_id", "bound_premium"]},
+            macro_applications=[
+                MacroApplication(
+                    macro_name="compute_tax",
+                    param_bindings={"amount": "bound_premium"},
+                    output_column="tax_amount",
+                    overwrites=None,
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "compute_tax(bound_premium) AS tax_amount" in sql
+        assert "policy_id" in sql
+        # Original bound_premium still present as its own column
+        select_part = sql.split("FROM")[0]
+        lines = [l.strip() for l in select_part.split("\n")
+                 if l.strip() and "bound_premium" in l]
+        # Should have two lines: one for the column, one for the macro
+        has_standalone = any("compute_tax" not in l for l in lines)
+        has_macro = any("compute_tax" in l for l in lines)
+        assert has_standalone, "Original bound_premium column should still be present"
+        assert has_macro, "Macro expression should be present"
+
+    def test_multiple_macros_all_appear(self):
+        """Multiple macro applications all appear in SELECT."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="multi_macro",
+            report_columns={"premiums_report": ["policy_id", "bound_premium", "carrier"]},
+            macro_applications=[
+                MacroApplication(
+                    macro_name="apply_quota_share",
+                    param_bindings={"premium": "bound_premium", "share": "0.5"},
+                    output_column="adjusted_premium",
+                    overwrites="bound_premium",
+                ),
+                MacroApplication(
+                    macro_name="normalize_carrier",
+                    param_bindings={"name": "carrier"},
+                    output_column="carrier_norm",
+                    overwrites=None,
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "apply_quota_share(bound_premium, 0.5) AS adjusted_premium" in sql
+        assert "normalize_carrier(carrier) AS carrier_norm" in sql
+
+    def test_no_macros_sql_unchanged(self):
+        """Empty macro_applications list produces identical SQL to pre-macro behavior."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="no_macros",
+            report_columns={"premiums_report": ["policy_id", "bound_premium"]},
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "policy_id" in sql
+        assert "bound_premium" in sql
+        assert "-- Macros:" not in sql
+
+    def test_macro_header_lists_macros(self):
+        """SQL header includes -- Macros: line when macros applied."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="header_test",
+            report_columns={"premiums_report": ["policy_id"]},
+            macro_applications=[
+                MacroApplication(
+                    macro_name="my_macro",
+                    param_bindings={"x": "policy_id"},
+                    output_column="result",
+                    overwrites=None,
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+        assert "-- Macros: my_macro" in sql
+
+    def test_macro_with_qualified_args_in_multi_table(self):
+        """Macro args use table.column format resolved to aliases."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="multi",
+            report_columns={
+                "premiums_report": ["policy_id", "bound_premium"],
+                "claims_report": ["policy_id", "claim_amount"],
+            },
+            join_specs=[
+                JoinSpec("premiums_report", "claims_report", "policy_id", "policy_id", "LEFT"),
+            ],
+            macro_applications=[
+                MacroApplication(
+                    macro_name="net_amount",
+                    param_bindings={
+                        "premium": "premiums_report.bound_premium",
+                        "claim": "claims_report.claim_amount",
+                    },
+                    output_column="net",
+                    overwrites=None,
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "net_amount(a.bound_premium, b.claim_amount) AS net" in sql
+
+    def test_macro_overwrites_in_multi_table(self):
+        """Overwrite works with aliased columns in multi-table SQL."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="overwrite_multi",
+            report_columns={
+                "premiums_report": ["policy_id", "bound_premium"],
+                "claims_report": ["policy_id", "claim_amount"],
+            },
+            join_specs=[
+                JoinSpec("premiums_report", "claims_report", "policy_id", "policy_id", "LEFT"),
+            ],
+            macro_applications=[
+                MacroApplication(
+                    macro_name="adjust",
+                    param_bindings={"val": "bound_premium"},
+                    output_column="bound_premium",
+                    overwrites="bound_premium",
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "adjust(a.bound_premium) AS bound_premium" in sql
+        # Only one reference to bound_premium in SELECT
+        select_part = sql.split("FROM")[0]
+        lines = [l.strip() for l in select_part.split("\n")
+                 if l.strip() and "bound_premium" in l]
+        assert len(lines) == 1, f"Expected 1 bound_premium line, got: {lines}"
+
+    def test_macro_literal_arg_not_aliased(self):
+        """Literal values in param_bindings are not alias-qualified."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="literal",
+            report_columns={"premiums_report": ["policy_id", "bound_premium"]},
+            macro_applications=[
+                MacroApplication(
+                    macro_name="scale",
+                    param_bindings={"val": "bound_premium", "factor": "100"},
+                    output_column="scaled",
+                    overwrites=None,
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+        assert "scale(bound_premium, 100) AS scaled" in sql
+
+    def test_default_macro_applications_is_empty_list(self):
+        """DeliverableSQLSpec without macro_applications defaults to empty list."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="default",
+            report_columns={"r": ["col"]},
+        )
+        assert spec.macro_applications == []
+
+    def test_macro_with_decimal_literal(self):
+        """Decimal literal like '0.5' is not mistaken for table.column."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="decimal",
+            report_columns={"premiums_report": ["policy_id", "bound_premium"]},
+            macro_applications=[
+                MacroApplication(
+                    macro_name="apply_share",
+                    param_bindings={"premium": "bound_premium", "share": "0.5"},
+                    output_column="shared",
+                    overwrites=None,
+                ),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+        assert "apply_share(bound_premium, 0.5) AS shared" in sql
