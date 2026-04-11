@@ -255,3 +255,135 @@ class TestVpNewDeliverableGuarantees:
         assert result is False
         # confirm was called (overwrite prompt)
         assert call_count["confirm"] >= 1
+
+    def test_no_views_available_skips_view_step(self, deliverable_env):
+        """When no views exist, wizard skips view selection and produces SQL without view JOINs."""
+        from proto_pipe.cli.prompts import DeliverableConfigPrompter
+        from proto_pipe.cli.scaffold import DeliverableSQLSpec, build_deliverable_sql
+        from proto_pipe.io.config import load_config
+
+        rep_config = load_config(deliverable_env["rep_cfg"])
+        src_config = load_config(deliverable_env["src_cfg"])
+
+        prompter = DeliverableConfigPrompter(
+            rep_config=rep_config,
+            src_config=src_config,
+            sql_dir=deliverable_env["sql_dir"],
+        )
+
+        # Create an empty views config
+        views_cfg = Path(deliverable_env["tmp_path"] / "views_config.yaml")
+        views_cfg.write_text(yaml.dump({"views": []}))
+
+        prompt_returns = iter([
+            "no_views_test",              # name
+            "xlsx",                       # format
+            "no_views_{date}.xlsx",       # filename template
+            ["premiums_report"],          # reports
+            ["policy_id", "bound_premium"],  # columns
+            False,                        # order by? no
+            False,                        # fill details? no
+        ])
+
+        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
+            mock_q.text.return_value.ask = lambda: next(prompt_returns)
+            mock_q.select.return_value.ask = lambda: next(prompt_returns)
+            mock_q.checkbox.return_value.ask = lambda: next(prompt_returns)
+            mock_q.confirm.return_value.ask = lambda: next(prompt_returns)
+            mock_q.Choice = MagicMock(side_effect=lambda *a, **kw: kw.get("value", a[0]))
+
+            result = prompter.run(
+                existing_names=[],
+                available_reports=["premiums_report"],
+                pipeline_db=deliverable_env["pipeline_db"],
+                views_config_path=str(views_cfg),
+            )
+
+        assert result is True
+
+        # Read the generated SQL — should have no JOIN
+        sql_path = Path(deliverable_env["sql_dir"]) / "no_views_test.sql"
+        assert sql_path.exists()
+        content = sql_path.read_text()
+        assert "JOIN" not in content
+        assert "-- Views:" not in content
+
+    def test_view_selected_produces_sql_with_view_join(self, deliverable_env):
+        """When a view is selected, SQL includes the view JOIN and view columns."""
+        import duckdb
+        from proto_pipe.cli.prompts import DeliverableConfigPrompter
+        from proto_pipe.io.config import load_config
+
+        # Create the view in DuckDB so get_table_columns works
+        conn = duckdb.connect(deliverable_env["pipeline_db"])
+        conn.execute(
+            "CREATE VIEW carrier_summary AS "
+            "SELECT carrier, SUM(bound_premium) AS total_premium "
+            "FROM premiums_report GROUP BY carrier"
+        )
+        conn.close()
+
+        # Create views config
+        views_cfg = Path(deliverable_env["tmp_path"] / "views_config.yaml")
+        views_cfg.write_text(yaml.dump({"views": [
+            {"name": "carrier_summary", "sql_file": "carrier_summary.sql"},
+        ]}))
+
+        rep_config = load_config(deliverable_env["rep_cfg"])
+        src_config = load_config(deliverable_env["src_cfg"])
+
+        prompter = DeliverableConfigPrompter(
+            rep_config=rep_config,
+            src_config=src_config,
+            sql_dir=deliverable_env["sql_dir"],
+        )
+
+        # Mock the full wizard flow including view steps.
+        # Sequence: name, format, filename, reports, report_columns,
+        # view_checkbox, view_columns, join_left_key, join_right_key,
+        # join_type, order_by_confirm
+        checkbox_calls = iter([
+            ["premiums_report"],                         # reports
+            ["policy_id", "carrier", "bound_premium"],   # report columns
+            ["carrier_summary"],                         # views checkbox
+            ["carrier", "total_premium"],                # view columns
+        ])
+        select_calls = iter([
+            "xlsx",           # format
+            "carrier",        # join left key (from premiums_report)
+            "carrier",        # join right key (from carrier_summary)
+            "LEFT",           # join type
+        ])
+        text_calls = iter([
+            "view_join_test",                # name
+            "view_join_{date}.xlsx",         # filename template
+        ])
+        confirm_calls = iter([
+            False,  # order by? no
+            False,  # fill details? no
+        ])
+
+        with patch("proto_pipe.cli.prompts.questionary") as mock_q:
+            mock_q.checkbox.return_value.ask = lambda: next(checkbox_calls)
+            mock_q.select.return_value.ask = lambda: next(select_calls)
+            mock_q.text.return_value.ask = lambda: next(text_calls)
+            mock_q.confirm.return_value.ask = lambda: next(confirm_calls)
+            mock_q.Choice = MagicMock(side_effect=lambda *a, **kw: kw.get("value", a[0]))
+
+            result = prompter.run(
+                existing_names=[],
+                available_reports=["premiums_report"],
+                pipeline_db=deliverable_env["pipeline_db"],
+                views_config_path=str(views_cfg),
+            )
+
+        assert result is True
+
+        sql_path = Path(deliverable_env["sql_dir"]) / "view_join_test.sql"
+        assert sql_path.exists()
+        content = sql_path.read_text()
+
+        assert "JOIN carrier_summary" in content
+        assert "carrier" in content
+        assert "total_premium" in content
+        assert "-- Views: carrier_summary" in content

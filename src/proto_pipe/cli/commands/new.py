@@ -252,12 +252,7 @@ def new_report(reports_config, pipeline_db):
 @click.option("--sources-config", default=None)
 @click.option("--sql-dir", default=None)
 def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir):
-    """Interactively define a new deliverable and add it to deliverables_config.yaml.
-
-    \b
-    Example:
-      vp new-deliverable
-    """
+    """Interactively define a new deliverable and add it to deliverables_config.yaml."""
     from proto_pipe.io.config import config_path_or_override, DeliverableConfig
     from proto_pipe.io.config import load_config, load_settings
     from proto_pipe.cli.prompts import DeliverableConfigPrompter
@@ -268,6 +263,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
     settings = load_settings()
     pipeline_db = settings["paths"].get("pipeline_db")
     sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
+    views_config = settings["paths"].get("views_config")  # NEW
 
     config = DeliverableConfig(del_cfg)
     rep_config = load_config(rep_cfg)
@@ -286,7 +282,12 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
         sql_dir=sql_directory,
     )
 
-    if not prompter.run(config.names(), available_reports, pipeline_db=pipeline_db):
+    if not prompter.run(
+        config.names(),
+        available_reports,
+        pipeline_db=pipeline_db,
+        views_config_path=views_config,  # NEW
+    ):
         click.echo("Cancelled.")
         return
 
@@ -299,13 +300,9 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
     sql_file = prompter.deliverable.get("sql_file")
     if sql_file:
         click.echo(f"1. Edit {sql_file} with your transformation query")
-        click.echo(
-            f"2. Run: vp deliver {prompter.deliverable['name']}"
-        )
+        click.echo(f"2. Run: vp deliver {prompter.deliverable['name']}")
     else:
-        click.echo(
-            f"1. Run: vp deliver {prompter.deliverable['name']}"
-        )
+        click.echo(f"1. Run: vp deliver {prompter.deliverable['name']}")
 
 
 @click.command("new-view")

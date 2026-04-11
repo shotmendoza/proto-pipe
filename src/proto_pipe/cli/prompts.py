@@ -1260,6 +1260,7 @@ class DeliverableConfigPrompter:
         existing_names: list[str],
         available_reports: list[str],
         pipeline_db: str | None = None,
+        views_config_path: str | None = None,
     ) -> bool:
         """Run the full deliverable configuration flow.
 
@@ -1267,7 +1268,7 @@ class DeliverableConfigPrompter:
         Returns True on completion, False if cancelled.
 
         :param pipeline_db: Path to pipeline DB. Required for column discovery.
-                            Optional to preserve backward compatibility with edit flow.
+        :param views_config_path: Path to views_config.yaml. Optional.
         """
         self.deliverable = {}
 
@@ -1300,9 +1301,22 @@ class DeliverableConfigPrompter:
             if report_columns is None:
                 return False
 
+            # View selection (optional — never cancels the wizard)
+            selected_views = self.prompt_views(views_config_path)
+            view_columns: dict[str, list[str]] = {}
+            if selected_views:
+                view_columns_result = self.prompt_view_columns(
+                    selected_views, pipeline_db
+                )
+                if view_columns_result is None:
+                    return False
+                view_columns = view_columns_result
+
+            # Join configuration — unified for reports + views
+            all_columns = {**report_columns, **view_columns}
             join_specs = []
-            if len(selected_reports) > 1:
-                join_specs = self.prompt_joins(report_columns)
+            if len(all_columns) > 1:
+                join_specs = self.prompt_joins(all_columns)
                 if join_specs is None:
                     return False
 
@@ -1318,6 +1332,7 @@ class DeliverableConfigPrompter:
                 report_columns=report_columns,
                 join_specs=join_specs,
                 order_by=order_by,
+                view_columns=view_columns,
             )
 
             sql_content = build_deliverable_sql(spec)
@@ -1389,42 +1404,59 @@ class DeliverableConfigPrompter:
 
     def prompt_joins(
         self,
-        report_columns: dict[str, list[str]],
+        all_columns: dict[str, list[str]],
     ) -> list | None:
-        """Prompt for join configuration between report pairs.
+        """Prompt for join configuration between tables.
 
-        For each pair (base, other), asks:
+        For each table after the first, asks:
+        - Which already-configured table to join against
         - Which column in the left table is the join key
         - Which column in the right table is the join key
         - What type of join (LEFT, INNER, FULL OUTER)
+
+        Works for reports, views, or any mix. The first table in
+        all_columns is the base — every other table must join to
+        one of the tables that came before it.
 
         Returns list[JoinSpec] or None if cancelled.
         """
         from proto_pipe.cli.scaffold import JoinSpec
 
-        reports = list(report_columns.keys())
-        if len(reports) < 2:
+        tables = list(all_columns.keys())
+        if len(tables) < 2:
             return []
 
-        base_report = reports[0]
         join_specs = []
 
-        for other_report in reports[1:]:
-            click.echo(f"\n  Join: {base_report} → {other_report}")
+        for i, right_table in enumerate(tables[1:], start=1):
+            # Tables available to join against = all tables before this one
+            available_left = tables[:i]
 
-            # Left key from base report
-            left_cols = report_columns[base_report]
+            if len(available_left) == 1:
+                left_table = available_left[0]
+            else:
+                left_table = questionary.select(
+                    f"  Join '{right_table}' to which table?",
+                    choices=available_left,
+                ).ask()
+                if left_table is None:
+                    return None
+
+            click.echo(f"\n  Join: {left_table} → {right_table}")
+
+            # Left key
+            left_cols = all_columns[left_table]
             left_key = questionary.select(
-                f"  Join key in '{base_report}':",
+                f"  Join key in '{left_table}':",
                 choices=left_cols,
             ).ask()
             if left_key is None:
                 return None
 
-            # Right key from other report
-            right_cols = report_columns[other_report]
+            # Right key
+            right_cols = all_columns[right_table]
             right_key = questionary.select(
-                f"  Matching key in '{other_report}':",
+                f"  Matching key in '{right_table}':",
                 choices=right_cols,
             ).ask()
             if right_key is None:
@@ -1452,8 +1484,8 @@ class DeliverableConfigPrompter:
 
             join_specs.append(
                 JoinSpec(
-                    left_table=base_report,
-                    right_table=other_report,
+                    left_table=left_table,
+                    right_table=right_table,
                     left_key=left_key,
                     right_key=right_key,
                     join_type=join_type,
@@ -1461,6 +1493,29 @@ class DeliverableConfigPrompter:
             )
 
         return join_specs
+
+    def prompt_views(self, views_config_path: str | None) -> list[str]:
+        """Present available views as a checkbox and return selected names.
+
+        Returns empty list if no views exist or none selected.
+        Never returns None — views are optional, not cancellable.
+        """
+        if not views_config_path:
+            return []
+
+        from proto_pipe.reports.views import load_views_config  # TODO: This likely needs to be moved
+
+        views = load_views_config(views_config_path)
+        if not views:
+            return []
+
+        view_names = [v["name"] for v in views]
+        selected = questionary.checkbox(
+            "Include views in this deliverable?",
+            choices=[questionary.Choice(name, value=name) for name in view_names],
+        ).ask()
+
+        return selected or []
 
     def prompt_order_by(
         self,
@@ -1504,6 +1559,52 @@ class DeliverableConfigPrompter:
         sql_path.write_text(sql_content)
         click.echo(f"  [ok]   {sql_path}")
         return str(sql_path)
+
+    def prompt_view_columns(
+        self,
+        selected_views: list[str],
+        pipeline_db: str,
+    ) -> dict[str, list[str]] | None:
+        """For each selected view, show its columns and let the user pick.
+
+        Returns {view_name: [selected_columns]} or None if cancelled.
+        Excludes _-prefixed internal columns.
+        Uses get_table_columns from io/db.py (works on views too).
+        """
+        from proto_pipe.io.db import get_table_columns
+
+        view_columns: dict[str, list[str]] = {}
+
+        for view_name in selected_views:
+            columns = get_table_columns(pipeline_db, view_name)
+            # Exclude internal columns
+            columns = [c for c in columns if not c.startswith("_")]
+
+            if not columns:
+                click.echo(
+                    f"\n  [warn] No columns found for view '{view_name}'."
+                    f" Has the view been created? Run: vp refresh views"
+                )
+                continue
+
+            selected = questionary.checkbox(
+                f"Columns from view '{view_name}':",
+                choices=[
+                    questionary.Choice(col, value=col, checked=True) for col in columns
+                ],
+            ).ask()
+
+            if selected is None:
+                return None
+            if not selected:
+                click.echo(
+                    f"  [warn] No columns selected for view '{view_name}' — skipping."
+                )
+                continue
+
+            view_columns[view_name] = selected
+
+        return view_columns
 
     # ---------------------------------------------------------------------------
     # Individual prompt methods

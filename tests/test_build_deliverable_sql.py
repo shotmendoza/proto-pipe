@@ -213,3 +213,130 @@ class TestBuildDeliverableSQLEdgeCases:
         sql = build_deliverable_sql(spec)
         assert "SELECT *" in sql
         assert "<table>" in sql
+
+
+class TestBuildDeliverableSQLWithViews:
+    """View join SQL generation."""
+
+    def test_single_report_plus_view_uses_aliases(self):
+        """A single report + view produces aliased JOINs (not the unaliased path)."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="with_view",
+            report_columns={"premiums_report": ["policy_id", "bound_premium"]},
+            view_columns={"carrier_summary": ["carrier", "total_premium"]},
+            join_specs=[
+                JoinSpec("premiums_report", "carrier_summary", "carrier", "carrier", "LEFT"),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "FROM premiums_report a" in sql
+        assert "LEFT JOIN carrier_summary b" in sql
+        assert "a.carrier = b.carrier" in sql
+        assert "a.policy_id" in sql
+        assert "a.bound_premium" in sql
+        assert "b.total_premium" in sql
+        # No unaliased columns
+        assert "\n    policy_id" not in sql
+
+    def test_single_report_no_views_unchanged(self):
+        """When view_columns is empty, single report uses the unaliased path."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="no_views",
+            report_columns={"premiums_report": ["policy_id", "bound_premium"]},
+            view_columns={},
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "FROM premiums_report" in sql
+        assert " a." not in sql
+        assert "policy_id" in sql
+
+    def test_two_reports_plus_view_all_aliased(self):
+        """Two reports + one view → three aliases (a, b, c)."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="triple",
+            report_columns={
+                "premiums_report": ["policy_id", "bound_premium"],
+                "claims_report": ["policy_id", "claim_amount"],
+            },
+            view_columns={
+                "carrier_summary": ["carrier", "total_premium"],
+            },
+            join_specs=[
+                JoinSpec("premiums_report", "claims_report", "policy_id", "policy_id", "LEFT"),
+                JoinSpec("premiums_report", "carrier_summary", "carrier", "carrier", "INNER"),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "FROM premiums_report a" in sql
+        assert "LEFT JOIN claims_report b" in sql
+        assert "INNER JOIN carrier_summary c" in sql
+        assert "a.policy_id = b.policy_id" in sql
+        assert "a.carrier = c.carrier" in sql
+        assert "c.total_premium" in sql
+
+    def test_view_columns_appear_after_report_columns(self):
+        """View columns appear in SELECT after all report columns."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="order_test",
+            report_columns={"premiums_report": ["policy_id"]},
+            view_columns={"carrier_summary": ["total_premium"]},
+            join_specs=[
+                JoinSpec("premiums_report", "carrier_summary", "carrier", "carrier", "LEFT"),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        policy_pos = sql.index("a.policy_id")
+        total_pos = sql.index("b.total_premium")
+        assert policy_pos < total_pos
+
+    def test_header_lists_views_separately(self):
+        """SQL header has separate -- Reports: and -- Views: lines."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="header_test",
+            report_columns={"premiums_report": ["policy_id"]},
+            view_columns={"carrier_summary": ["total_premium"]},
+            join_specs=[
+                JoinSpec("premiums_report", "carrier_summary", "carrier", "carrier", "LEFT"),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "-- Reports: premiums_report" in sql
+        assert "-- Views: carrier_summary" in sql
+
+    def test_no_views_header_omits_views_line(self):
+        """When no views, the -- Views: line is absent."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="no_view_header",
+            report_columns={"premiums_report": ["policy_id"]},
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "-- Reports: premiums_report" in sql
+        assert "-- Views:" not in sql
+
+    def test_view_with_different_join_keys(self):
+        """View join where left and right keys have different names."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="diff_keys",
+            report_columns={"premiums_report": ["carrier_code", "bound_premium"]},
+            view_columns={"carrier_summary": ["carrier_id", "total_premium"]},
+            join_specs=[
+                JoinSpec("premiums_report", "carrier_summary", "carrier_code", "carrier_id", "LEFT"),
+            ],
+        )
+        sql = build_deliverable_sql(spec)
+
+        assert "a.carrier_code = b.carrier_id" in sql
+
+    def test_default_view_columns_is_empty(self):
+        """DeliverableSQLSpec without view_columns defaults to empty dict."""
+        spec = DeliverableSQLSpec(
+            deliverable_name="default",
+            report_columns={"r": ["col"]},
+        )
+        assert spec.view_columns == {}
