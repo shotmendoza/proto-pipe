@@ -879,10 +879,6 @@ def query_block_count(conn, stage: str) -> int:
     return _safe_count(conn, f"SELECT count(*) FROM {table}")
 
 
-# ---------------------------------------------------------------------------
-# Validation export queries  (moved from cli/commands/export.py, Rule 16)
-# ---------------------------------------------------------------------------
-
 def query_validation_report_names(conn) -> list[str]:
     """Return distinct report names with validation failures, sorted."""
     return conn.execute(

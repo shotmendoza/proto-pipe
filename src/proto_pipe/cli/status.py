@@ -51,13 +51,18 @@ from proto_pipe.cli.errors import StageGroup
     help="Filter log events on or after this date, YYYY-MM-DD (use with --log).",
 )
 @click.option(
+    "--output",
+    default=None,
+    help="Override output path for --log --export (default: auto-named in log_dir).",
+)
+@click.option(
     "--clear",
     is_flag=True,
     default=False,
     help="Delete exported rows from pipeline_events (use with --log --export).",
 )
 @click.pass_context
-def status_cmd(ctx, pipeline_db, show_log, export_log, severity, since, clear):
+def status_cmd(ctx, pipeline_db, show_log, export_log, severity, since, clear, output):
     """Pipeline health summary with prescriptive next steps.
 
     \b
@@ -69,6 +74,7 @@ def status_cmd(ctx, pipeline_db, show_log, export_log, severity, since, clear):
       vp status --log                   — show pipeline events
       vp status --log --severity error  — show only errors
       vp status --log --export          — export events to CSV
+      vp status --log --export --output /tmp/events.csv
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -76,7 +82,7 @@ def status_cmd(ctx, pipeline_db, show_log, export_log, severity, since, clear):
     p_db = config_path_or_override("pipeline_db", pipeline_db)
 
     if show_log:
-        _handle_log(p_db, severity, since, export_log, clear)
+        _handle_log(p_db, severity, since, export_log, clear, output)
         return
 
     from proto_pipe.pipelines.query import query_pipeline_health
@@ -98,7 +104,7 @@ def status_cmd(ctx, pipeline_db, show_log, export_log, severity, since, clear):
     print_health_summary(health, del_names)
 
 
-def _handle_log(p_db, severity, since, export_log, clear):
+def _handle_log(p_db, severity, since, export_log, clear, output=None):
     """Handle --log mode: display or export pipeline_events."""
     from datetime import date, datetime, timezone
     from pathlib import Path
@@ -121,9 +127,12 @@ def _handle_log(p_db, severity, since, export_log, clear):
             df[col] = df[col].dt.tz_localize(None)
 
         if export_log:
-            log_dir = config_path_or_override("log_dir")
-            today = date.today().isoformat()
-            output_path = str(Path(log_dir) / f"pipeline_events_{today}.csv")
+            if output:
+                output_path = output
+            else:
+                log_dir = config_path_or_override("log_dir")
+                today = date.today().isoformat()
+                output_path = str(Path(log_dir) / f"pipeline_events_{today}.csv")
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(output_path, index=False)
             click.echo(f"[ok] {len(df)} event(s) exported to: {output_path}")

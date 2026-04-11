@@ -1,9 +1,9 @@
-"""Tests for pipeline_events table and vp export log.
+"""Tests for pipeline_events table and vp status --log --export.
 
 Covers:
 - init_pipeline_events: table created by init_all_pipeline_tables
 - write_pipeline_events: events written correctly, fire-and-forget on bad db
-- export log: basic export, --severity filter, --since filter, --clear flag
+- status --log --export: basic export, --severity filter, --since filter, --clear flag
 - skipped ingest files produce no events
 - validation events reflect correct severity
 """
@@ -159,7 +159,7 @@ class TestWritePipelineEvents:
 
 
 # ---------------------------------------------------------------------------
-# vp export log — via Click test runner
+# vp status --log --export — via Click test runner
 # ---------------------------------------------------------------------------
 
 class TestExportLog:
@@ -177,14 +177,15 @@ class TestExportLog:
 
     def test_exports_all_events(self, db_with_events):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path, tmp_path = db_with_events
         out_path = str(tmp_path / "events.csv")
 
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
+            "--log", "--export",
             "--output", out_path,
         ])
 
@@ -194,14 +195,15 @@ class TestExportLog:
 
     def test_severity_filter_errors_only(self, db_with_events):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path, tmp_path = db_with_events
         out_path = str(tmp_path / "errors.csv")
 
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
+            "--log", "--export",
             "--output", out_path,
             "--severity", "error",
         ])
@@ -213,7 +215,7 @@ class TestExportLog:
 
     def test_since_filter(self, tmp_path):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path = _make_db(tmp_path)
         # Write one old event and one recent event
@@ -232,8 +234,9 @@ class TestExportLog:
 
         out_path = str(tmp_path / "since.csv")
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
+            "--log", "--export",
             "--output", out_path,
             "--since", "2026-03-01",
         ])
@@ -245,14 +248,15 @@ class TestExportLog:
 
     def test_clear_deletes_exported_rows(self, db_with_events):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path, tmp_path = db_with_events
         out_path = str(tmp_path / "cleared.csv")
 
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
+            "--log", "--export",
             "--output", out_path,
             "--severity", "error",
             "--clear",
@@ -264,14 +268,15 @@ class TestExportLog:
 
     def test_clear_without_filter_deletes_all(self, db_with_events):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path, tmp_path = db_with_events
         out_path = str(tmp_path / "all_cleared.csv")
 
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
+            "--log", "--export",
             "--output", out_path,
             "--clear",
         ])
@@ -281,12 +286,13 @@ class TestExportLog:
 
     def test_invalid_since_format_returns_error(self, db_with_events):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path, tmp_path = db_with_events
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
+            "--log", "--export",
             "--output", str(tmp_path / "x.csv"),
             "--since", "not-a-date",
         ])
@@ -296,13 +302,13 @@ class TestExportLog:
 
     def test_no_matching_events_prints_info(self, db_with_events):
         from click.testing import CliRunner
-        from proto_pipe.cli.commands.export import export_log
+        from proto_pipe.cli.status import status_cmd
 
         db_path, tmp_path = db_with_events
         runner = CliRunner()
-        result = runner.invoke(export_log, [
+        result = runner.invoke(status_cmd, [
             "--pipeline-db", db_path,
-            "--output", str(tmp_path / "x.csv"),
+            "--log",
             "--since", "2030-01-01",  # future date — no events
         ])
 
