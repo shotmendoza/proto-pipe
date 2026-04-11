@@ -3,10 +3,8 @@ from __future__ import annotations
 import functools
 import hashlib
 import inspect
-import uuid
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from functools import partial
 from typing import Callable
 
@@ -32,39 +30,7 @@ import pandas as pd
 # functions.
 # ----------------------------------------------------------------
 # TODO: anything that is inspecting, should be inside CheckInspect
-def _is_str_annotation(ann) -> bool:
-    """True for str type or 'str' string annotation.
-
-    Handles both evaluated annotations (ann is str) and string annotations
-    produced by `from __future__ import annotations` (ann == "str").
-    """
-    return ann is str or ann == "str"
-
-
-def _is_series_annotation(ann) -> bool:
-    """True if annotation refers to pd.Series (column selector, not DataFrame).
-
-    pd.Series params are column selectors — the runner extracts the named
-    column as a Series and passes it directly to the function. They behave
-    identically to str params in the prompt flow (alias_map + column picker)
-    but the function receives the actual Series rather than the column name.
-
-    Handles both evaluated annotations (pd.Series, pd.Series[bool]) and
-    string annotations produced by `from __future__ import annotations`.
-    Explicitly excludes DataFrame annotations.
-    """
-    if ann is inspect.Parameter.empty:
-        return False
-    ann_str = str(ann) if not isinstance(ann, str) else ann
-    return "Series" in ann_str and "DataFrame" not in ann_str
-
-
-def _is_dataframe_annotation(ann) -> bool:
-    """True if annotation refers to pd.DataFrame."""
-    if ann is inspect.Parameter.empty:
-        return False
-    ann_str = str(ann) if not isinstance(ann, str) else ann
-    return "DataFrame" in ann_str
+from proto_pipe.shared import is_str_annotation, is_series_annotation, is_dataframe_annotation
 
 
 class CheckRegistry:
@@ -889,7 +855,7 @@ class CheckParamInspector:
         constant entry. No type exceptions.
         """
         return any(
-            _is_series_annotation(param.annotation)
+            is_series_annotation(param.annotation)
             for name, param in self._sig.parameters.items()
             if name != "context"
         )
@@ -944,7 +910,7 @@ class CheckParamInspector:
         return [
             name for name, param in self._sig.parameters.items()
             if name != "context"
-            and _is_series_annotation(param.annotation)
+            and is_series_annotation(param.annotation)
         ]
 
     def column_backed_scalar_params(self) -> list[str]:
@@ -994,7 +960,7 @@ class CheckParamInspector:
             name
             for name, param in self._sig.parameters.items()
             if name != "context"
-            and not _is_dataframe_annotation(param.annotation)
+            and not is_dataframe_annotation(param.annotation)
         ]
 
     def make_key(self) -> str:
@@ -1014,18 +980,18 @@ class CheckParamInspector:
 
         DataFrame params are excluded — they are auto-filled with the full table.
         String annotations produced by `from __future__ import annotations` are
-        handled correctly by _is_str_annotation and _is_series_annotation.
+        handled correctly by is_str_annotation and is_series_annotation.
         """
         return [
             name
             for name, param in self._sig.parameters.items()
             if name != "context"
             and (
-                _is_str_annotation(param.annotation)
+                is_str_annotation(param.annotation)
                 or param.annotation is inspect.Parameter.empty
-                or _is_series_annotation(param.annotation)
+                or is_series_annotation(param.annotation)
             )
-            and not _is_dataframe_annotation(param.annotation)
+            and not is_dataframe_annotation(param.annotation)
         ]
 
     def scalar_params(self) -> list[str]:
@@ -1042,9 +1008,9 @@ class CheckParamInspector:
             for name, param in self._sig.parameters.items()
             if name != "context"
             and param.annotation is not inspect.Parameter.empty
-            and not _is_str_annotation(param.annotation)
-            and not _is_series_annotation(param.annotation)
-            and not _is_dataframe_annotation(param.annotation)
+            and not is_str_annotation(param.annotation)
+            and not is_series_annotation(param.annotation)
+            and not is_dataframe_annotation(param.annotation)
         ]
 
     def dataframe_params(self) -> list[str]:
@@ -1056,7 +1022,7 @@ class CheckParamInspector:
         return [
             name
             for name, param in self._sig.parameters.items()
-            if name != "context" and _is_dataframe_annotation(param.annotation)
+            if name != "context" and is_dataframe_annotation(param.annotation)
         ]
 
     def has_dataframe_input(self) -> bool:

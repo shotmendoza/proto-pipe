@@ -2,7 +2,7 @@
 Tests for:
 - alias_map expansion (test_alias_map_*)
 - reset_report (test_reset_*)
-- load_macros / vp new-macro (test_macro_*)
+- vp new-macro CLI (test_new_macro_*)
 """
 
 import duckdb
@@ -15,7 +15,6 @@ from proto_pipe.io.db import init_ingest_state, init_all_pipeline_tables, table_
 from proto_pipe.io.ingest import (
     init_db,
     ingest_directory,
-    load_macros,
     reset_report,
 )
 from proto_pipe.io.registry import (
@@ -626,67 +625,6 @@ def test_reset_report_allows_reingest(tmp_path):
     rows = conn.execute("SELECT count(*) FROM sales").fetchone()[0]
     conn.close()
     assert rows == 2
-
-
-# ===========================================================================
-# load_macros
-# ===========================================================================
-
-def test_load_macros_registers_macro(tmp_path):
-    macros_dir = tmp_path / "macros"
-    macros_dir.mkdir()
-    (macros_dir / "normalize.sql").write_text("""
-        CREATE OR REPLACE MACRO normalize_status(val) AS
-            CASE WHEN val = 'Issuance' THEN 'Reinstatement' ELSE val END;
-    """)
-    conn = duckdb.connect()
-    load_macros(conn, str(macros_dir))
-
-    assert conn.execute("SELECT normalize_status('Issuance')").fetchone()[0] == "Reinstatement"
-    assert conn.execute("SELECT normalize_status('Renewal')").fetchone()[0] == "Renewal"
-    conn.close()
-
-
-def test_load_macros_missing_dir_warns_not_crashes(tmp_path, capsys):
-    conn = duckdb.connect()
-    load_macros(conn, str(tmp_path / "nonexistent"))
-    assert "warn" in capsys.readouterr().out
-    conn.close()
-
-
-def test_load_macros_empty_dir_is_noop(tmp_path):
-    macros_dir = tmp_path / "macros"
-    macros_dir.mkdir()
-    conn = duckdb.connect()
-    load_macros(conn, str(macros_dir))  # should not raise
-    conn.close()
-
-
-def test_load_macros_broken_file_skipped_others_load(tmp_path, capsys):
-    macros_dir = tmp_path / "macros"
-    macros_dir.mkdir()
-    (macros_dir / "bad.sql").write_text("THIS IS NOT VALID SQL ;;;")
-    (macros_dir / "good.sql").write_text("CREATE OR REPLACE MACRO double_val(x) AS x * 2;")
-
-    conn = duckdb.connect()
-    load_macros(conn, str(macros_dir))
-
-    assert conn.execute("SELECT double_val(5)").fetchone()[0] == 10
-    assert "macro-fail" in capsys.readouterr().out
-    conn.close()
-
-
-def test_load_macros_idempotent(tmp_path):
-    macros_dir = tmp_path / "macros"
-    macros_dir.mkdir()
-    (macros_dir / "add_one.sql").write_text("CREATE OR REPLACE MACRO add_one(x) AS x + 1;")
-
-    conn = duckdb.connect()
-    load_macros(conn, str(macros_dir))
-    load_macros(conn, str(macros_dir))
-
-    assert conn.execute("SELECT add_one(10)").fetchone()[0] == 11
-    conn.close()
 
 
 # ===========================================================================

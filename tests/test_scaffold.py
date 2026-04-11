@@ -3,7 +3,7 @@ Tests for proto_pipe.cli.scaffold
 
 Covers:
 - _suggest_pattern (filename pattern suggestion)
-- _scan_incoming (directory scanning)
+- scan_incoming (directory scanning)
 - _similar_columns (fuzzy column matching)
 - get_param_suggestions (history-based suggestions)
 - record_param_history (storing param usage)
@@ -17,7 +17,7 @@ import pytest
 
 from proto_pipe.cli.scaffold import (
     _suggest_pattern,
-    _scan_incoming,
+    scan_incoming,
     _sort_views,
     build_rich_sql_scaffold,
 )
@@ -57,40 +57,40 @@ class TestSuggestPattern:
 
 
 # ---------------------------------------------------------------------------
-# _scan_incoming
+# scan_incoming
 # ---------------------------------------------------------------------------
 
 class TestScanIncoming:
     def test_returns_csv_files(self, tmp_path):
         (tmp_path / "sales_2024.csv").write_text("a,b\n1,2")
         (tmp_path / "inventory_2024.csv").write_text("a,b\n1,2")
-        result = _scan_incoming(str(tmp_path))
+        result = scan_incoming(str(tmp_path))
         assert "sales_2024.csv" in result
         assert "inventory_2024.csv" in result
 
     def test_returns_xlsx_files(self, tmp_path):
         pd.DataFrame({"a": [1]}).to_excel(tmp_path / "report_2024.xlsx", index=False)
-        result = _scan_incoming(str(tmp_path))
+        result = scan_incoming(str(tmp_path))
         assert "report_2024.xlsx" in result
 
     def test_excludes_unsupported_extensions(self, tmp_path):
         (tmp_path / "notes.txt").write_text("hello")
         (tmp_path / "data.json").write_text("{}")
-        result = _scan_incoming(str(tmp_path))
+        result = scan_incoming(str(tmp_path))
         assert "notes.txt" not in result
         assert "data.json" not in result
 
     def test_empty_directory_returns_empty_list(self, tmp_path):
-        assert _scan_incoming(str(tmp_path)) == []
+        assert scan_incoming(str(tmp_path)) == []
 
     def test_nonexistent_directory_returns_empty_list(self, tmp_path):
-        assert _scan_incoming(str(tmp_path / "nonexistent")) == []
+        assert scan_incoming(str(tmp_path / "nonexistent")) == []
 
     def test_returns_sorted_filenames(self, tmp_path):
         (tmp_path / "c_2024.csv").write_text("a,b")
         (tmp_path / "a_2024.csv").write_text("a,b")
         (tmp_path / "b_2024.csv").write_text("a,b")
-        result = _scan_incoming(str(tmp_path))
+        result = scan_incoming(str(tmp_path))
         assert result == sorted(result)
 
 

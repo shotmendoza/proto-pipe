@@ -229,7 +229,7 @@ def _suggest_pattern(filename: str) -> str:
     return f"{pattern}{suffix}"
 
 
-def _group_files_by_pattern(files: list[str]) -> dict[str, list[str]]:
+def group_files_by_pattern(files: list[str]) -> dict[str, list[str]]:
     """Group files by their suggested glob pattern.
 
     Returns {pattern: [file, ...]} — files within each group are sorted.
@@ -249,7 +249,7 @@ def _group_files_by_pattern(files: list[str]) -> dict[str, list[str]]:
     return groups
 
 
-def _scan_incoming(incoming_dir: str) -> list[str]:
+def scan_incoming(incoming_dir: str) -> list[str]:
     """Return supported filenames from the incoming directory."""
     supported = {".csv", ".xlsx", ".xls"}
     p = Path(incoming_dir)
@@ -321,40 +321,11 @@ def get_check_params(check_name: str, check_registry: CheckRegistry) -> dict:
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
-def _scan_macros(macros_dir: str) -> list[str]:
-    """Scan macros_dir and return a list of macro signatures found in .sql files.
-
-    Extracts names and param lists from CREATE MACRO statements so the scaffold
-    can show the user what's available to call inline.
-    """
-    import re
-
-    p = Path(macros_dir)
-    if not p.exists():
-        return []
-
-    signatures = []
-    for sql_file in sorted(p.glob("*.sql")):
-        try:
-            text = sql_file.read_text()
-            # Match: CREATE [OR REPLACE] MACRO name(params) AS
-            matches = re.findall(
-                r"CREATE\s+(?:OR\s+REPLACE\s+)?MACRO\s+(\w+\([^)]*\))",
-                text,
-                re.IGNORECASE,
-            )
-            signatures.extend(matches)
-        except Exception:
-            pass
-    return signatures
-
-
 def build_rich_sql_scaffold(
         deliverable_name: str,
         selected_reports: list[str],
         reports_config: dict,
         sources_config: dict,
-        macros_dir: str | None = None,
 ) -> str:
     """Build an annotated SQL scaffold with join stubs, macro references,
     and transform notes.
@@ -382,7 +353,6 @@ def build_rich_sql_scaffold(
     if not selected_tables:
         return f"-- {deliverable_name}.sql\nSELECT *\nFROM <table>;\n"
 
-    macro_signatures = _scan_macros(macros_dir) if macros_dir else []
     base_table = selected_tables[0]
     base_alias = "a"
     base_pk = table_to_pk.get(base_table)
@@ -402,18 +372,9 @@ def build_rich_sql_scaffold(
         "",
         "SELECT",
         f"    {base_alias}.*",
+        f"    -- , macro_name({base_alias}.<col>) AS <col>"
+        f"  -- call a registered macro inline",
     ]
-
-    if macro_signatures:
-        lines.append("    -- Example macro usage (uncomment and adapt):")
-        for signature in macro_signatures:
-            macro_name = signature.split("(")[0]
-            lines.append(f"    -- , {macro_name}({base_alias}.<col>) AS <col>")
-    else:
-        lines.append(
-            f"    -- , macro_name({base_alias}.<col>) AS <col>"
-            f"  -- call a registered macro inline"
-        )
 
     lines.append(f"FROM {base_table} {base_alias}")
 

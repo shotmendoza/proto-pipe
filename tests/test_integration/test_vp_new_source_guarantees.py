@@ -10,7 +10,7 @@ Mocking strategy:
   - config_path_or_override → routes to temp paths
   - load_settings → returns temp pipeline.yaml paths
   - DuckDB connections → real temp DB (no mock)
-  - _scan_incoming / filter_unconfigured / _group_files_by_pattern →
+  - scan_incoming / filter_unconfigured / group_files_by_pattern →
     mocked to simulate file discovery without real files
 
 This pattern should be replicated for all vp new/edit/delete commands.
@@ -153,11 +153,11 @@ class TestVpNewSourceGuarantees:
                 lambda: settings,
             "proto_pipe.cli.commands.new.SourceConfigPrompter":
                 mock_prompter,
-            "proto_pipe.cli.commands.new._scan_incoming":
+            "proto_pipe.cli.commands.new.scan_incoming":
                 lambda d: ["premiums_2026-03.csv"],
             "proto_pipe.cli.commands.new.filter_unconfigured":
                 lambda files, sources: files,
-            "proto_pipe.cli.commands.new._group_files_by_pattern":
+            "proto_pipe.cli.commands.new.group_files_by_pattern":
                 lambda files: {"premiums_*": ["premiums_2026-03.csv"]},
         }
 
@@ -174,11 +174,11 @@ class TestVpNewSourceGuarantees:
                   side_effect=lambda key, override=None: settings["paths"].get(key, override or key)),
             patch("proto_pipe.cli.commands.new.load_settings", return_value=settings),
             patch("proto_pipe.cli.commands.new.SourceConfigPrompter", mock_prompter),
-            patch("proto_pipe.cli.commands.new._scan_incoming",
+            patch("proto_pipe.cli.commands.new.scan_incoming",
                   return_value=["premiums_2026-03.csv"]),
             patch("proto_pipe.cli.commands.new.filter_unconfigured",
                   side_effect=lambda files, sources: files),
-            patch("proto_pipe.cli.commands.new._group_files_by_pattern",
+            patch("proto_pipe.cli.commands.new.group_files_by_pattern",
                   return_value={"premiums_*": ["premiums_2026-03.csv"]}),
             patch("proto_pipe.cli.commands.new.duckdb") as mock_duckdb,
         ):
@@ -271,11 +271,11 @@ class TestVpNewSourceGuarantees:
                   side_effect=lambda key, override=None: settings["paths"].get(key, override or key)),
             patch("proto_pipe.cli.commands.new.load_settings", return_value=settings),
             patch("proto_pipe.cli.commands.new.SourceConfigPrompter", mock_prompter),
-            patch("proto_pipe.cli.commands.new._scan_incoming",
+            patch("proto_pipe.cli.commands.new.scan_incoming",
                   return_value=["premiums_2026-03.csv"]),
             patch("proto_pipe.cli.commands.new.filter_unconfigured",
                   side_effect=lambda files, sources: files),
-            patch("proto_pipe.cli.commands.new._group_files_by_pattern",
+            patch("proto_pipe.cli.commands.new.group_files_by_pattern",
                   return_value={"premiums_*": ["premiums_2026-03.csv"]}),
             patch("proto_pipe.cli.commands.new.duckdb") as mock_duckdb,
         ):
@@ -310,7 +310,7 @@ class TestVpNewSourceGuarantees:
             patch("proto_pipe.cli.commands.new.config_path_or_override",
                   side_effect=lambda key, override=None: settings["paths"].get(key, override or key)),
             patch("proto_pipe.cli.commands.new.load_settings", return_value=settings),
-            patch("proto_pipe.cli.commands.new._scan_incoming", return_value=[]),
+            patch("proto_pipe.cli.commands.new.scan_incoming", return_value=[]),
         ):
             result = runner.invoke(new_source, [])
 

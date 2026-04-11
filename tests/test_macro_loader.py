@@ -10,10 +10,10 @@ import duckdb
 import questionary
 
 from proto_pipe.cli.scaffold import (
-    scan_incoming,
     get_original_func,
     build_rich_sql_scaffold,
     filter_unconfigured,
+    scan_incoming,
     group_files_by_pattern,
 )
 from proto_pipe.io.db import get_all_source_tables

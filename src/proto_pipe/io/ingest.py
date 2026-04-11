@@ -1162,24 +1162,3 @@ def reset_report(table_name: str, db_path: str) -> None:
 
     finally:
         conn.close()
-
-
-def load_macros(conn: duckdb.DuckDBPyConnection, macros_dir: str) -> None:
-    """Register all SQL macros found in macros_dir with the DuckDB connection."""
-    p = Path(macros_dir)
-    if not p.exists():
-        print(f"  [warn] macros_dir '{macros_dir}' not found — skipping macro loading")
-        return
-
-    sql_files = sorted(p.glob("*.sql"))
-    if not sql_files:
-        return
-
-    for sql_file in sql_files:
-        try:
-            sql = sql_file.read_text().strip()
-            if sql:
-                conn.execute(sql)
-                print(f"  [macro] Loaded '{sql_file.name}'")
-        except Exception as e:
-            print(f"  [macro-fail] '{sql_file.name}': {e} — skipped")
