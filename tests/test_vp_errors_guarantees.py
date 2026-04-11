@@ -304,3 +304,96 @@ class TestVpErrorsReport:
             result = runner.invoke(errors_cmd, ["report"])
 
         assert "vp errors report export" in result.output
+
+
+class TestVpErrorsSourceFileLevelFailures:
+    """File-level ingest failures (unknown columns, bad types) live in
+    ingest_state with status='failed', not in source_block. vp errors source
+    must surface these alongside row-level source_block errors.
+    """
+
+    @pytest.fixture()
+    def file_failure_db(self, tmp_path, populated_db):
+        """DB with a file-level failure in ingest_state but no source_block rows."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        now = datetime.now(timezone.utc)
+        with duckdb.connect(populated_db) as conn:
+            init_all_pipeline_tables(conn)
+            conn.execute(
+                """
+                         INSERT INTO ingest_state
+                             (id, filename, table_name, status, rows, message, ingested_at)
+                         VALUES
+                             ('ff1', 'bad_file.csv', 'sales', 'failed', NULL,
+                              'Unknown columns: foo, bar. Run vp edit column-type.', ?)
+                         """,
+                [now],
+            )
+        return populated_db
+
+    def test_file_failure_appears_in_output(self, file_failure_db, src_cfg_path):
+        """vp errors source must show file-level failures from ingest_state."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(file_failure_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["source"])
+
+        assert result.exit_code == 0, result.output
+        assert "bad_file.csv" in result.output
+        assert "Unknown columns" in result.output
+
+    def test_file_failure_shows_prescriptive_fix(self, file_failure_db, src_cfg_path):
+        """File-level failure output must include fix commands."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(file_failure_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["source"])
+
+        assert result.exit_code == 0, result.output
+        assert "vp edit column-type" in result.output or "vp ingest" in result.output
+
+    def test_file_failure_filtered_by_name(self, file_failure_db, src_cfg_path):
+        """vp errors source <name> filters file failures to that table."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(file_failure_db, src_cfg_path),
+        ):
+            # Filter to 'sales' — should show the failure
+            result = runner.invoke(errors_cmd, ["source", "sales"])
+        assert "bad_file.csv" in result.output
+
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(file_failure_db, src_cfg_path),
+        ):
+            # Filter to 'nonexistent' — should NOT show the failure
+            result = runner.invoke(errors_cmd, ["source", "nonexistent"])
+        assert "bad_file.csv" not in result.output
+
+    def test_no_file_failures_no_section(self, errors_db, src_cfg_path):
+        """When no file-level failures exist, the file-level section is absent."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(errors_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["source"])
+
+        assert result.exit_code == 0, result.output
+        assert "File-level failures" not in result.output
+        # Row-level errors should still appear
+        assert "type_conflict" in result.output

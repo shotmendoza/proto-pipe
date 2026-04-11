@@ -1290,3 +1290,48 @@ class TestIngestProgressReporter:
         reporter = self._make_reporter()
         reporter.on_file_done("f.csv", {"status": "skipped"})
         assert reporter._skipped == 1
+
+
+class TestIngestSummarySkipNoise:
+    """vp ingest output must not list skipped files individually.
+    Skipped count appears as a single summary line.
+    """
+
+    def test_summary_no_per_file_skip_lines(self, tmp_path, populated_db):
+        """After ingest, output must not contain per-file [skip] lines."""
+        from proto_pipe.io.db import init_all_pipeline_tables, log_ingest_state
+        from proto_pipe.cli.prompts import IngestProgressReporter
+        from unittest.mock import MagicMock
+
+        reporter = IngestProgressReporter()
+        reporter._progress = MagicMock()
+
+        # Simulate 3 skipped files
+        for name in ["a.csv", "b.csv", "c.csv"]:
+            reporter.on_file_done(name, {"status": "skipped"})
+
+        assert reporter._skipped == 3
+        # console.print must NOT have been called for skipped files
+        assert not reporter._progress.console.print.called
+
+    def test_summary_line_format(self, capsys):
+        """The CLI summary should show a single skip count line."""
+        import click
+
+        ok, skipped, failed, flagged = 2, 5, 0, 0
+
+        parts = [f"{ok} loaded"]
+        if failed:
+            parts.append(f"{failed} failed")
+        if flagged:
+            parts.append(f"{flagged} row conflict(s) flagged")
+        click.echo(f"\n  {', '.join(parts)}.")
+
+        if skipped:
+            click.echo(f"  {skipped} file(s) skipped (already ingested)")
+
+        captured = capsys.readouterr()
+        assert "2 loaded." in captured.out
+        assert "5 file(s) skipped (already ingested)" in captured.out
+        # No per-file mentions
+        assert "[skip]" not in captured.out

@@ -285,3 +285,5 @@ class TestScenarioB_ClearsSourceBlock:
         assert not overlap, (
             f"Invariant violated — pks in both source_pass and source_block: {overlap}"
         )
+
+

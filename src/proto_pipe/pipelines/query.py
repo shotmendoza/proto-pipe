@@ -746,8 +746,8 @@ def query_source_statuses(conn) -> list[SourceStatus]:
         SourceStatus(
             table_name=row["table_name"],
             file_count=int(row["file_count"]),
-            total_rows=int(row["total_rows"]) if row["total_rows"] else 0,
-            last_ingest=str(row["last_ingest"])[:10] if row["last_ingest"] else None,
+            total_rows=int(row["total_rows"]) if pd.notna(row["total_rows"]) else 0,
+            last_ingest=str(row["last_ingest"])[:10] if pd.notna(row["last_ingest"]) else None,
             error_count=errors.get(row["table_name"], 0),
         )
         for _, row in df.iterrows()
@@ -780,8 +780,8 @@ def query_source_detail(conn, name: str) -> SourceDetail:
             history.append({
                 "filename": row["filename"],
                 "status": row["status"],
-                "rows": row["rows"],
-                "ingested_at": str(row["ingested_at"])[:10] if row["ingested_at"] else None,
+                "rows": int(row["rows"]) if pd.notna(row["rows"]) else None,
+                "ingested_at": str(row["ingested_at"])[:10] if pd.notna(row["ingested_at"]) else None,
             })
     except Exception:
         pass

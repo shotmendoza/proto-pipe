@@ -280,7 +280,14 @@ def ingest_directory(
             )
 
     if unmatched:
-        pass
+        for fname in unmatched:
+            log_ingest_state(
+                conn,
+                fname,
+                None,
+                "skipped",
+                message="no matching source pattern",
+            )
 
     conn.close()
     return summary

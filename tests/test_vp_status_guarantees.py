@@ -166,3 +166,85 @@ class TestVpStatusReport:
 
         assert result.exit_code == 0, result.output
         assert "Report: sales_report" in result.output
+
+
+class TestVpStatusSourceMissingTable:
+    """When a source table doesn't exist (ingest failed before creating it),
+    vp status source <name> should show 'table not found' plus the most
+    recent failure message from ingest_state.
+    """
+
+    @pytest.fixture()
+    def failed_ingest_db(self, tmp_path):
+        """DB with ingest_state failure but no source table."""
+        from proto_pipe.io.db import init_all_pipeline_tables
+
+        db_path = str(tmp_path / "pipeline.db")
+        now = datetime.now(timezone.utc)
+        with duckdb.connect(db_path) as conn:
+            init_all_pipeline_tables(conn)
+            # File failed — table 'foobar' was never created
+            conn.execute(
+                """
+                         INSERT INTO ingest_state
+                             (id, filename, table_name, status, rows, message, ingested_at)
+                         VALUES
+                             ('ff1', 'foobar_2026.csv', 'foobar', 'failed', NULL,
+                              'DuckDB write failed: Conversion Error', ?)
+                         """,
+                [now],
+            )
+        return db_path
+
+    def test_missing_table_shows_table_not_found(self, failed_ingest_db, src_cfg_path):
+        from proto_pipe.cli.status import status_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.status.config_path_or_override",
+            side_effect=_cfg(failed_ingest_db, src_cfg_path),
+        ):
+            result = runner.invoke(status_cmd, ["source", "foobar"])
+
+        assert result.exit_code == 0, result.output
+        assert "table not found" in result.output.lower()
+
+    def test_missing_table_shows_failure_message(self, failed_ingest_db, src_cfg_path):
+        from proto_pipe.cli.status import status_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.status.config_path_or_override",
+            side_effect=_cfg(failed_ingest_db, src_cfg_path),
+        ):
+            result = runner.invoke(status_cmd, ["source", "foobar"])
+
+        assert result.exit_code == 0, result.output
+        assert "Conversion Error" in result.output
+
+    def test_missing_table_shows_fix_command(self, failed_ingest_db, src_cfg_path):
+        from proto_pipe.cli.status import status_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.status.config_path_or_override",
+            side_effect=_cfg(failed_ingest_db, src_cfg_path),
+        ):
+            result = runner.invoke(status_cmd, ["source", "foobar"])
+
+        assert result.exit_code == 0, result.output
+        assert "vp ingest" in result.output
+
+    def test_existing_table_no_failure_message(self, status_db, src_cfg_path):
+        """When the table exists, no failure message is shown."""
+        from proto_pipe.cli.status import status_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.status.config_path_or_override",
+            side_effect=_cfg(status_db, src_cfg_path),
+        ):
+            result = runner.invoke(status_cmd, ["source", "sales"])
+
+        assert result.exit_code == 0, result.output
+        assert "table not found" not in result.output.lower()

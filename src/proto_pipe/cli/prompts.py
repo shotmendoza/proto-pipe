@@ -2753,28 +2753,33 @@ def print_source_detail(detail) -> None:
     Args:
         detail: SourceDetail from query_source_detail.
     """
-    click.echo(f"\nSource: {detail.name}\n")
+    click.echo(f"\n  Source: {detail.name}")
+    click.echo(f"  {'─' * 40}")
 
     if detail.row_count is not None:
-        click.echo(f"Rows: {detail.row_count}")
+        click.echo(f"  Rows:     {detail.row_count:,}")
     else:
-        click.echo("Rows: table not found")
+        click.echo(f"  Rows:     table not found")
         if detail.last_failure_message:
-            click.echo(f"  Last failure: {detail.last_failure_message}")
-            click.echo(f"  Fix the issue and run: vp ingest")
+            click.echo(f"  Reason:   {detail.last_failure_message}")
+            click.echo(f"  Fix:      fix the issue and run: vp ingest")
 
     if detail.error_count:
-        click.echo(f"Errors: {detail.error_count}")
-        click.echo(f"Fix: vp errors source {detail.name}")
+        click.echo(f"  Errors:   {detail.error_count}")
+        click.echo(f"  Fix:      vp errors source {detail.name}")
     else:
-        click.echo("Errors: none")
+        click.echo(f"  Errors:   none")
 
     if detail.history:
-        click.echo("\n  Ingest history:")
+        click.echo(f"\n  Ingest history:")
+        click.echo(f"  {'Date':<12} {'File':<35} {'Status':<10} {'Rows':>6}")
+        click.echo(f"  {'─' * 65}")
         for h in detail.history:
             ts = h["ingested_at"] or "—"
-            rows = h["rows"] if h["rows"] else "—"
-            click.echo(f"    {ts}  {h['filename']:<35} {h['status']:<10} {rows} rows")
+            rows = str(h["rows"]) if h["rows"] is not None else "—"
+            status = h["status"] or "—"
+            click.echo(f"  {ts:<12} {h['filename']:<35} {status:<10} {rows:>6}")
+    click.echo()
 
 
 def print_report_list(statuses) -> None:
@@ -2800,22 +2805,26 @@ def print_report_detail(detail) -> None:
     Args:
         detail: ReportDetail from query_report_detail.
     """
-    click.echo(f"\nReport: {detail.name}\n")
+    click.echo(f"\n  Report: {detail.name}")
+    click.echo(f"  {'─' * 40}")
 
     if detail.row_count is not None:
-        click.echo(f"Rows: {detail.row_count}")
+        click.echo(f"  Rows:       {detail.row_count:,}")
     else:
-        click.echo("Rows: table not found (run vp validate)")
+        click.echo(f"  Rows:       table not found (run vp validate)")
 
-    click.echo(f"  Last validated: {detail.last_validated or '—'}")
+    click.echo(f"  Validated:  {detail.last_validated or '—'}")
 
     if detail.failure_count:
-        click.echo(f"Failures:     {detail.failure_count}")
-        click.echo(f"Fix: vp errors report {detail.name}")
+        click.echo(f"  Failures:   {detail.failure_count}")
+        click.echo(f"  Fix:        vp errors report {detail.name}")
     else:
-        click.echo("Failures:     none")
+        click.echo(f"  Failures:   none")
 
     if detail.checks:
-        click.echo("\nCheck results:")
+        click.echo(f"\n  Check results:")
+        click.echo(f"  {'Check':<30} {'Status':<10} {'Records':>8}")
+        click.echo(f"  {'─' * 50}")
         for check_name, status, cnt in detail.checks:
-            click.echo(f"{check_name:<30} {status:<10} {cnt} records")
+            click.echo(f"  {check_name:<30} {status:<10} {cnt:>8}")
+    click.echo()
