@@ -117,7 +117,8 @@ class TestVpErrorsSummary:
 # ---------------------------------------------------------------------------
 
 class TestVpErrorsSource:
-    def test_shows_grouped_by_cause(self, errors_db, src_cfg_path):
+    def test_list_view_shows_table_names(self, errors_db, src_cfg_path):
+        """vp errors source (no name) shows one line per source with counts."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -128,10 +129,10 @@ class TestVpErrorsSource:
             result = runner.invoke(errors_cmd, ["source"])
 
         assert result.exit_code == 0, result.output
-        assert "type_conflict" in result.output
-        assert "duplicate_conflict" in result.output
+        assert "sales" in result.output
 
-    def test_prescriptive_fix_commands_in_output(self, errors_db, src_cfg_path):
+    def test_list_view_shows_drilldown_hint(self, errors_db, src_cfg_path):
+        """vp errors source (no name) tells user how to get detail."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -141,8 +142,35 @@ class TestVpErrorsSource:
         ):
             result = runner.invoke(errors_cmd, ["source"])
 
+        assert "vp errors source <name>" in result.output
+
+    def test_detail_view_shows_check_names(self, errors_db, src_cfg_path):
+        """vp errors source <name> shows individual check causes."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(errors_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["source", "sales"])
+
+        assert result.exit_code == 0, result.output
+        assert "type_conflict" in result.output
+        assert "duplicate_conflict" in result.output
+
+    def test_detail_view_shows_fix_commands(self, errors_db, src_cfg_path):
+        """vp errors source <name> shows prescriptive fix commands."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(errors_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["source", "sales"])
+
         assert "vp errors source export" in result.output
-        assert "vp errors source retry" in result.output
 
     def test_name_filters_to_one_table(self, errors_db, src_cfg_path):
         from proto_pipe.cli.errors import errors_cmd
@@ -279,7 +307,8 @@ class TestVpErrorsReportClear:
 # ---------------------------------------------------------------------------
 
 class TestVpErrorsReport:
-    def test_shows_grouped_by_cause(self, errors_db, src_cfg_path):
+    def test_list_view_shows_report_names(self, errors_db, src_cfg_path):
+        """vp errors report (no name) shows one line per report with counts."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -290,10 +319,10 @@ class TestVpErrorsReport:
             result = runner.invoke(errors_cmd, ["report"])
 
         assert result.exit_code == 0, result.output
-        assert "null_check" in result.output
-        assert "range_check" in result.output
+        assert "sales_report" in result.output
 
-    def test_prescriptive_fix_commands(self, errors_db, src_cfg_path):
+    def test_list_view_shows_drilldown_hint(self, errors_db, src_cfg_path):
+        """vp errors report (no name) tells user how to get detail."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -303,13 +332,45 @@ class TestVpErrorsReport:
         ):
             result = runner.invoke(errors_cmd, ["report"])
 
+        assert "vp errors report <name>" in result.output
+
+    def test_detail_view_shows_check_names(self, errors_db, src_cfg_path):
+        """vp errors report <n> shows individual check causes."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(errors_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["report", "sales_report"])
+
+        assert result.exit_code == 0, result.output
+        assert "null_check" in result.output
+        assert "range_check" in result.output
+
+    def test_detail_view_shows_fix_commands(self, errors_db, src_cfg_path):
+        """vp errors report <n> shows prescriptive fix commands."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(errors_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["report", "sales_report"])
+
         assert "vp errors report export" in result.output
 
 
+# ---------------------------------------------------------------------------
+# vp errors source <n> — file-level failures from ingest_state
+# ---------------------------------------------------------------------------
+
 class TestVpErrorsSourceFileLevelFailures:
     """File-level ingest failures (unknown columns, bad types) live in
-    ingest_state with status='failed', not in source_block. vp errors source
-    must surface these alongside row-level source_block errors.
+    ingest_state with status='failed', not in source_block. vp errors source <n>
+    must surface these in the detail view.
     """
 
     @pytest.fixture()
@@ -320,20 +381,17 @@ class TestVpErrorsSourceFileLevelFailures:
         now = datetime.now(timezone.utc)
         with duckdb.connect(populated_db) as conn:
             init_all_pipeline_tables(conn)
-            conn.execute(
-                """
-                         INSERT INTO ingest_state
-                             (id, filename, table_name, status, rows, message, ingested_at)
-                         VALUES
-                             ('ff1', 'bad_file.csv', 'sales', 'failed', NULL,
-                              'Unknown columns: foo, bar. Run vp edit column-type.', ?)
-                         """,
-                [now],
-            )
+            conn.execute("""
+                INSERT INTO ingest_state
+                    (id, filename, table_name, status, rows, message, ingested_at)
+                VALUES
+                    ('ff1', 'bad_file.csv', 'sales', 'failed', NULL,
+                     'Unknown columns: foo, bar. Run vp edit column-type.', ?)
+            """, [now])
         return populated_db
 
-    def test_file_failure_appears_in_output(self, file_failure_db, src_cfg_path):
-        """vp errors source must show file-level failures from ingest_state."""
+    def test_file_failure_appears_in_detail(self, file_failure_db, src_cfg_path):
+        """vp errors source <n> shows file-level failures."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -341,14 +399,28 @@ class TestVpErrorsSourceFileLevelFailures:
             "proto_pipe.cli.errors.config_path_or_override",
             side_effect=_cfg(file_failure_db, src_cfg_path),
         ):
-            result = runner.invoke(errors_cmd, ["source"])
+            result = runner.invoke(errors_cmd, ["source", "sales"])
 
         assert result.exit_code == 0, result.output
         assert "bad_file.csv" in result.output
         assert "Unknown columns" in result.output
 
-    def test_file_failure_shows_prescriptive_fix(self, file_failure_db, src_cfg_path):
-        """File-level failure output must include fix commands."""
+    def test_file_failure_shows_fix(self, file_failure_db, src_cfg_path):
+        """File-level failure output includes fix commands."""
+        from proto_pipe.cli.errors import errors_cmd
+
+        runner = CliRunner()
+        with patch(
+            "proto_pipe.cli.errors.config_path_or_override",
+            side_effect=_cfg(file_failure_db, src_cfg_path),
+        ):
+            result = runner.invoke(errors_cmd, ["source", "sales"])
+
+        assert result.exit_code == 0, result.output
+        assert "vp edit column-type" in result.output or "vp ingest" in result.output
+
+    def test_file_failure_counted_in_list_view(self, file_failure_db, src_cfg_path):
+        """vp errors source (no name) includes file failure count."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -359,10 +431,10 @@ class TestVpErrorsSourceFileLevelFailures:
             result = runner.invoke(errors_cmd, ["source"])
 
         assert result.exit_code == 0, result.output
-        assert "vp edit column-type" in result.output or "vp ingest" in result.output
+        assert "sales" in result.output
 
-    def test_file_failure_filtered_by_name(self, file_failure_db, src_cfg_path):
-        """vp errors source <name> filters file failures to that table."""
+    def test_file_failure_counted_in_overview(self, file_failure_db, src_cfg_path):
+        """vp errors (bare) includes file failure counts."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -370,20 +442,13 @@ class TestVpErrorsSourceFileLevelFailures:
             "proto_pipe.cli.errors.config_path_or_override",
             side_effect=_cfg(file_failure_db, src_cfg_path),
         ):
-            # Filter to 'sales' — should show the failure
-            result = runner.invoke(errors_cmd, ["source", "sales"])
-        assert "bad_file.csv" in result.output
+            result = runner.invoke(errors_cmd, [])
 
-        with patch(
-            "proto_pipe.cli.errors.config_path_or_override",
-            side_effect=_cfg(file_failure_db, src_cfg_path),
-        ):
-            # Filter to 'nonexistent' — should NOT show the failure
-            result = runner.invoke(errors_cmd, ["source", "nonexistent"])
-        assert "bad_file.csv" not in result.output
+        assert result.exit_code == 0, result.output
+        assert "file failure" in result.output.lower()
 
     def test_no_file_failures_no_section(self, errors_db, src_cfg_path):
-        """When no file-level failures exist, the file-level section is absent."""
+        """When no file-level failures exist, the section is absent."""
         from proto_pipe.cli.errors import errors_cmd
 
         runner = CliRunner()
@@ -391,9 +456,9 @@ class TestVpErrorsSourceFileLevelFailures:
             "proto_pipe.cli.errors.config_path_or_override",
             side_effect=_cfg(errors_db, src_cfg_path),
         ):
-            result = runner.invoke(errors_cmd, ["source"])
+            result = runner.invoke(errors_cmd, ["source", "sales"])
 
         assert result.exit_code == 0, result.output
-        assert "File-level failures" not in result.output
+        assert "File-level" not in result.output
         # Row-level errors should still appear
         assert "type_conflict" in result.output

@@ -2590,94 +2590,143 @@ def print_error_overview(overview) -> None:
     Args:
         overview: ErrorOverview from query_error_overview.
     """
-    if overview.source_count == 0 and overview.report_count == 0:
+    has_source = overview.source_count > 0 or overview.file_failure_count > 0
+    has_report = overview.report_count > 0
+
+    if not has_source and not has_report:
         click.echo("\n  No pipeline errors — all clear.")
         return
 
-    click.echo("\nPipeline Errors\n")
+    click.echo("\n  Pipeline Errors")
+    click.echo(f"  {'─' * 50}")
 
-    if overview.source_count > 0:
-        click.echo(
-            f"  Source: {overview.source_count} blocked row(s) across "
-            f"{overview.source_table_count} table(s)"
-        )
-        click.echo("    Run: vp errors source\n")
+    if has_source:
+        parts = []
+        if overview.source_count:
+            parts.append(f"{overview.source_count} blocked row(s)")
+        if overview.file_failure_count:
+            parts.append(f"{overview.file_failure_count} file failure(s)")
+        click.echo(f"\n  Source:  {' + '.join(parts)}")
+        click.echo(f"    Run: vp errors source")
     else:
-        click.echo("  Source: no errors\n")
+        click.echo(f"\n  Source:  no errors")
 
-    if overview.report_count > 0:
+    if has_report:
         click.echo(
-            f"  Report: {overview.report_count} validation failure(s) across "
+            f"\n  Report:  {overview.report_count} validation failure(s) across "
             f"{overview.report_name_count} report(s)"
         )
-        click.echo("    Run: vp errors report")
+        click.echo(f"    Run: vp errors report")
     else:
-        click.echo("  Report: no errors")
+        click.echo(f"\n  Report:  no errors")
+
+    click.echo()
 
 
 def print_prescriptive_errors(
     stage: str,
-    name: str | None,
+    name: str,
     by_scope: dict[str, list[tuple[str, int]]],
 ) -> None:
-    """Display error rows grouped by scope and cause with prescriptive fixes.
+    """Display detailed errors for ONE source or report with prescriptive fixes.
+
+    Only called with a name — list views use print_source_error_list / print_report_error_list.
 
     Args:
         stage: "source" or "report".
-        name: optional filter name (for the title).
+        name: table_name (source) or report_name (report).
         by_scope: dict from query_error_groups — scope_name → [(check_name, count)].
     """
-    label = "Source" if stage == "source" else "Report"
-
     if not by_scope:
-        scope = f"'{name}'" if name else f"any {stage}"
-        click.echo(f"\n  No {stage} errors for {scope} — all clear.")
         return
 
     total = sum(c for checks in by_scope.values() for _, c in checks)
-    scope_count = len(by_scope)
 
-    if name:
-        click.echo(f"\n{label} Errors — {name} — {total} blocked row(s)")
-    else:
-        click.echo(
-            f"\n{label} Errors — {total} blocked row(s) across "
-            f"{scope_count} {stage}(s)"
-        )
-
+    click.echo(f"\n  Row-level errors ({total} rows)")
     for scope_name, check_rows in by_scope.items():
-        scope_total = sum(c for _, c in check_rows)
-        click.echo(f"\n  {scope_name} ({scope_total} rows)")
         groups = build_error_groups(check_rows, stage, name=scope_name)
-        format_error_groups(groups, indent=4)
+        for g in groups:
+            click.echo(f"    {g.cause}: {g.count} row(s) — {g.explanation}")
+            for i, cmd in enumerate(g.fix_commands):
+                prefix = "Fix:" if i == 0 else "  or:"
+                click.echo(f"      {prefix} {cmd}")
 
 
-def print_file_failures(file_failures) -> None:
+def print_source_error_list(summaries) -> None:
+    """One-line-per-source list for `vp errors source` (no name).
+
+    Args:
+        summaries: list of SourceErrorSummary from query_source_error_summary.
+    """
+    if not summaries:
+        click.echo("\n  No source errors — all clear.")
+        return
+
+    click.echo("\n  Source Errors")
+    click.echo(f"  {'─' * 50}")
+    click.echo(f"  {'Table':<25} {'Blocked':>10} {'File fails':>12}")
+    click.echo(f"  {'─' * 50}")
+
+    for s in summaries:
+        blocked = str(s.blocked_count) if s.blocked_count else "—"
+        file_fails = str(s.file_failure_count) if s.file_failure_count else "—"
+        click.echo(f"  {s.table_name:<25} {blocked:>10} {file_fails:>12}")
+
+    click.echo(f"\n  Run: vp errors source <name>  for details")
+    click.echo()
+
+
+def print_report_error_list(summaries) -> None:
+    """One-line-per-report list for `vp errors report` (no name).
+
+    Args:
+        summaries: list of ReportErrorSummary from query_report_error_summary.
+    """
+    if not summaries:
+        click.echo("\n  No report errors — all clear.")
+        return
+
+    click.echo("\n  Report Errors")
+    click.echo(f"  {'─' * 50}")
+    click.echo(f"  {'Report':<30} {'Failures':>10}")
+    click.echo(f"  {'─' * 50}")
+
+    for s in summaries:
+        click.echo(f"  {s.report_name:<30} {s.failure_count:>10}")
+
+    click.echo(f"\n  Run: vp errors report <name>  for details")
+    click.echo()
+
+
+def print_file_failures(file_failures, detail: bool = False) -> None:
     """Display file-level ingest failures from ingest_state.
 
-    Shown above row-level source_block errors so users see the
-    distinction: file failures prevent any rows from loading,
-    while row-level errors flag individual bad rows.
+    Groups by error message so duplicate reasons are shown once with
+    a list of affected filenames.
 
     Args:
         file_failures: list of FileFailure from query_file_failures.
+        detail: True for detail view (with name), False unused here.
     """
     if not file_failures:
         return
 
     from collections import defaultdict
-    by_table: dict[str, list] = defaultdict(list)
+
+    # Group by message — same error across files shown once
+    by_message: dict[str, list[str]] = defaultdict(list)
     for f in file_failures:
-        by_table[f.table_name or "(unknown)"].append(f)
+        by_message[f.message].append(f.filename)
 
-    click.echo(f"\nFile-level failures — {len(file_failures)} file(s) failed to load\n")
-
-    for table_name, failures in by_table.items():
-        click.echo(f"  {table_name} ({len(failures)} file(s))")
-        for f in failures:
-            click.echo(f"    {f.filename}: {f.message}")
-        click.echo(f"    Fix: vp edit column-type (if unknown columns)")
-        click.echo(f"      or: fix the file and run: vp ingest")
+    click.echo(f"\n  File-level failures ({len(file_failures)} file(s))")
+    for message, filenames in by_message.items():
+        if len(filenames) == 1:
+            click.echo(f"    {filenames[0]}: {message}")
+        else:
+            click.echo(f"    {message} ({len(filenames)} files)")
+            for fn in filenames:
+                click.echo(f"      {fn}")
+    click.echo(f"    Fix: vp edit column-type  or fix the file, then: vp ingest")
 
 
 def print_health_summary(health, deliverable_names: list[str]) -> None:

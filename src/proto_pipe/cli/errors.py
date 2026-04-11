@@ -282,24 +282,36 @@ def source_cmd(ctx, pipeline_db):
     if ctx.invoked_subcommand is not None:
         return
 
-    from proto_pipe.pipelines.query import query_error_groups, query_file_failures
-    from proto_pipe.cli.prompts import print_prescriptive_errors, print_file_failures
-
     name = (ctx.obj or {}).get("stage_name")
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
-        file_failures = query_file_failures(conn, name=name)
-        by_scope = query_error_groups(conn, "source", name=name)
+        if name:
+            # Detail view — one source
+            from proto_pipe.pipelines.query import query_error_groups, query_file_failures
+            from proto_pipe.cli.prompts import (
+                print_prescriptive_errors, print_file_failures,
+            )
 
-        if not file_failures and not by_scope:
-            scope = f"'{name}'" if name else "any source"
-            click.echo(f"\n  No source errors for {scope} — all clear.")
-            return
+            file_failures = query_file_failures(conn, name=name)
+            by_scope = query_error_groups(conn, "source", name=name)
 
-        print_file_failures(file_failures)
-        if by_scope:
+            if not file_failures and not by_scope:
+                click.echo(f"\n  No source errors for '{name}' — all clear.")
+                return
+
+            click.echo(f"\n  Source Errors: {name}")
+            click.echo(f"  {'─' * 50}")
+            print_file_failures(file_failures)
             print_prescriptive_errors("source", name, by_scope)
+            click.echo()
+        else:
+            # List view — one line per source
+            from proto_pipe.pipelines.query import query_source_error_summary
+            from proto_pipe.cli.prompts import print_source_error_list
+
+            summaries = query_source_error_summary(conn)
+            print_source_error_list(summaries)
     finally:
         conn.close()
 
@@ -648,15 +660,32 @@ def report_cmd(ctx, pipeline_db):
     if ctx.invoked_subcommand is not None:
         return
 
-    from proto_pipe.pipelines.query import query_error_groups
-    from proto_pipe.cli.prompts import print_prescriptive_errors
-
     name = (ctx.obj or {}).get("stage_name")
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
-        by_scope = query_error_groups(conn, "report", name=name)
-        print_prescriptive_errors("report", name, by_scope)
+        if name:
+            # Detail view — one report
+            from proto_pipe.pipelines.query import query_error_groups
+            from proto_pipe.cli.prompts import print_prescriptive_errors
+
+            by_scope = query_error_groups(conn, "report", name=name)
+
+            if not by_scope:
+                click.echo(f"\n  No report errors for '{name}' — all clear.")
+                return
+
+            click.echo(f"\n  Report Errors: {name}")
+            click.echo(f"  {'─' * 50}")
+            print_prescriptive_errors("report", name, by_scope)
+            click.echo()
+        else:
+            # List view — one line per report
+            from proto_pipe.pipelines.query import query_report_error_summary
+            from proto_pipe.cli.prompts import print_report_error_list
+
+            summaries = query_report_error_summary(conn)
+            print_report_error_list(summaries)
     finally:
         conn.close()
 

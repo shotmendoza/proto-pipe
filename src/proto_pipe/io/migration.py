@@ -191,20 +191,30 @@ def auto_migrate(
     conn: duckdb.DuckDBPyConnection,
     table: str,
     df: pd.DataFrame,
+    registry_types: dict[str, str] | None = None,
 ) -> list[str]:
-    """Add columns present in df but missing from the table.
+    """Add columns present in df but missing from the table, and reconcile
+    column types against the registry.
 
     New columns are typed based on pandas dtype inference — acceptable here
     since this is a schema ALTER, not a data load operation.
     Does not remove or rename existing columns.
 
-    :param conn:  Open DuckDB connection.
-    :param table: Target table name.
-    :param df:    Incoming DataFrame.
+    When registry_types is provided, existing columns whose DuckDB type
+    disagrees with the registry type are ALTER'd to match. This handles
+    the case where a table was created before types were registered
+    (DuckDB inference) and the user later confirmed correct types via
+    vp edit column-type.
+
+    :param conn:            Open DuckDB connection.
+    :param table:           Target table name.
+    :param df:              Incoming DataFrame.
+    :param registry_types:  {col: declared_type} from column_type_registry.
     :return: List of column names newly added to the table.
     """
-    existing = get_columns(conn, table)
-    new_cols = [col for col in df.columns if col not in existing]
+    existing = get_column_types(conn, table)
+    existing_names = set(existing.keys())
+    new_cols = [col for col in df.columns if col not in existing_names]
 
     for col in new_cols:
         dtype = df[col].dtype
@@ -221,6 +231,30 @@ def auto_migrate(
 
         conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {sql_type}')
         print(f"  [migrate] Added column '{col}' ({sql_type}) to '{table}'")
+
+    # Reconcile existing column types against registry
+    if registry_types:
+        for col, reg_type in registry_types.items():
+            if col not in existing:
+                continue
+            # Strip format suffix: "DATE|%m/%d/%Y" → "DATE"
+            base_type = reg_type.split("|")[0].upper()
+            table_type = existing[col].upper()
+            if base_type != table_type:
+                try:
+                    conn.execute(
+                        f'ALTER TABLE "{table}" ALTER COLUMN "{col}" '
+                        f'SET DATA TYPE {base_type}'
+                    )
+                    print(
+                        f"  [migrate] Column '{col}' in '{table}': "
+                        f"{table_type} → {base_type}"
+                    )
+                except Exception as exc:
+                    print(
+                        f"  [warn] Could not migrate '{col}' from "
+                        f"{table_type} to {base_type}: {exc}"
+                    )
 
     return new_cols
 

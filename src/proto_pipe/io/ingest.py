@@ -282,10 +282,7 @@ def ingest_directory(
     if unmatched:
         for fname in unmatched:
             log_ingest_state(
-                conn,
-                fname,
-                None,
-                "skipped",
+                conn, fname, None, "skipped",
                 message="no matching source pattern",
             )
 
@@ -999,7 +996,7 @@ def ingest_single_file(
     # ── Scenario B: subsequent ingest ─────────────────────────────────────
     else:
         try:
-            new_cols = auto_migrate(conn, table, df)
+            new_cols = auto_migrate(conn, table, df, registry_types=registry_types)
 
             if primary_key:
                 df, flagged_count, skipped_count = _handle_duplicates(

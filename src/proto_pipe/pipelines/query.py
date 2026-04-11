@@ -500,6 +500,8 @@ class ErrorOverview:
     """Counts for bare `vp errors` summary."""
     source_count: int
     source_table_count: int
+    file_failure_count: int
+    file_failure_table_count: int
     report_count: int
     report_name_count: int
 
@@ -562,6 +564,12 @@ def query_error_overview(conn) -> ErrorOverview:
         source_count=_safe_count(conn, "SELECT count(*) FROM source_block"),
         source_table_count=_safe_count(
             conn, "SELECT count(DISTINCT table_name) FROM source_block"
+        ),
+        file_failure_count=_safe_count(
+            conn, "SELECT count(*) FROM ingest_state WHERE status = 'failed'"
+        ),
+        file_failure_table_count=_safe_count(
+            conn, "SELECT count(DISTINCT table_name) FROM ingest_state WHERE status = 'failed'"
         ),
         report_count=_safe_count(conn, "SELECT count(*) FROM validation_block"),
         report_name_count=_safe_count(
@@ -681,6 +689,69 @@ def query_file_failures(
         )
         for r in rows
     ]
+
+
+@dataclass
+class SourceErrorSummary:
+    """One-line summary for vp errors source (no name)."""
+    table_name: str
+    blocked_count: int
+    file_failure_count: int
+
+
+@dataclass
+class ReportErrorSummary:
+    """One-line summary for vp errors report (no name)."""
+    report_name: str
+    failure_count: int
+
+
+def query_source_error_summary(conn) -> list[SourceErrorSummary]:
+    """One row per source table with error counts for list view.
+
+    Merges source_block row counts and ingest_state file failure counts.
+    """
+    blocked: dict[str, int] = {}
+    try:
+        for name, cnt in conn.execute(
+            "SELECT table_name, count(*) FROM source_block GROUP BY table_name"
+        ).fetchall():
+            blocked[name] = cnt
+    except Exception:
+        pass
+
+    file_fails: dict[str, int] = {}
+    try:
+        for name, cnt in conn.execute(
+            "SELECT table_name, count(*) FROM ingest_state "
+            "WHERE status = 'failed' GROUP BY table_name"
+        ).fetchall():
+            file_fails[name or "(unknown)"] = cnt
+    except Exception:
+        pass
+
+    all_names = sorted(set(blocked) | set(file_fails))
+    return [
+        SourceErrorSummary(
+            table_name=n,
+            blocked_count=blocked.get(n, 0),
+            file_failure_count=file_fails.get(n, 0),
+        )
+        for n in all_names
+    ]
+
+
+def query_report_error_summary(conn) -> list[ReportErrorSummary]:
+    """One row per report with failure counts for list view."""
+    try:
+        rows = conn.execute(
+            "SELECT report_name, count(*) FROM validation_block "
+            "GROUP BY report_name ORDER BY report_name"
+        ).fetchall()
+    except Exception:
+        return []
+
+    return [ReportErrorSummary(report_name=n, failure_count=c) for n, c in rows]
 
 
 # ---------------------------------------------------------------------------
