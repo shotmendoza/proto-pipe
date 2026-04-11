@@ -469,19 +469,29 @@ def write_registry_types(
     source_name: str,
     column_types: dict[str, str],
 ) -> None:
-    """Upsert confirmed column types into column_type_registry."""
+    """Upsert confirmed column types into column_type_registry.
+
+    Wrapped in an explicit transaction so all columns are written
+    atomically — a failure mid-loop won't leave partial writes.
+    """
     if not column_types:
         return
     now = datetime.now(timezone.utc)
-    for col, dtype in column_types.items():
-        conn.execute("""
-            INSERT INTO column_type_registry
-                (column_name, source_name, declared_type, recorded_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (column_name, source_name)
-            DO UPDATE SET declared_type = excluded.declared_type,
-                          recorded_at   = excluded.recorded_at
-        """, [col, source_name, dtype, now])
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for col, dtype in column_types.items():
+            conn.execute("""
+                INSERT INTO column_type_registry
+                    (column_name, source_name, declared_type, recorded_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (column_name, source_name)
+                DO UPDATE SET declared_type = excluded.declared_type,
+                              recorded_at   = excluded.recorded_at
+            """, [col, source_name, dtype, now])
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def delete_registry_types_for_source(

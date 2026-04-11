@@ -229,6 +229,11 @@ class SourceConfigPrompter:
 
         self.confirmed_types = self.prompt_column_types()
 
+        # If there are file columns but no types were confirmed, the user
+        # cancelled mid-flow inside prompt_column_types — treat as cancel.
+        if self._file_cols and not self.confirmed_types:
+            return False
+
         self.source = {"name": name, "patterns": patterns, "target_table": table}
         if timestamp_col:
             self.source["timestamp_col"] = timestamp_col
@@ -2311,7 +2316,6 @@ class IngestProgressReporter(PipelineProgressReporter):
             self._print(f"  [error] {filename}: {message}")
         elif status == "skipped":
             self._skipped += 1
-            self._print(f"  [skip] {filename}")
 
 
 class ValidateProgressReporter(PipelineProgressReporter):
@@ -2648,6 +2652,34 @@ def print_prescriptive_errors(
         format_error_groups(groups, indent=4)
 
 
+def print_file_failures(file_failures) -> None:
+    """Display file-level ingest failures from ingest_state.
+
+    Shown above row-level source_block errors so users see the
+    distinction: file failures prevent any rows from loading,
+    while row-level errors flag individual bad rows.
+
+    Args:
+        file_failures: list of FileFailure from query_file_failures.
+    """
+    if not file_failures:
+        return
+
+    from collections import defaultdict
+    by_table: dict[str, list] = defaultdict(list)
+    for f in file_failures:
+        by_table[f.table_name or "(unknown)"].append(f)
+
+    click.echo(f"\nFile-level failures — {len(file_failures)} file(s) failed to load\n")
+
+    for table_name, failures in by_table.items():
+        click.echo(f"  {table_name} ({len(failures)} file(s))")
+        for f in failures:
+            click.echo(f"    {f.filename}: {f.message}")
+        click.echo(f"    Fix: vp edit column-type (if unknown columns)")
+        click.echo(f"      or: fix the file and run: vp ingest")
+
+
 def print_health_summary(health, deliverable_names: list[str]) -> None:
     """Display bare `vp status` health overview with prescriptive next steps.
 
@@ -2727,6 +2759,9 @@ def print_source_detail(detail) -> None:
         click.echo(f"Rows: {detail.row_count}")
     else:
         click.echo("Rows: table not found")
+        if detail.last_failure_message:
+            click.echo(f"  Last failure: {detail.last_failure_message}")
+            click.echo(f"  Fix the issue and run: vp ingest")
 
     if detail.error_count:
         click.echo(f"Errors: {detail.error_count}")

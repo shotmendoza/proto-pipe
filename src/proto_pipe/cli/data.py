@@ -79,14 +79,19 @@ def ingest(incoming_dir, pipeline_db, sources_config, mode, validate):
     failed = sum(1 for v in summary.values() if v["status"] == "failed")
     flagged = sum(v.get("flagged", 0) for v in summary.values())
 
-    click.echo(
-        f"\n  {ok} loaded, {skipped} skipped, {failed} failed, "
-        f"{flagged} row conflict(s) flagged — see ingest_state for details."
-    )
+    parts = [f"{ok} loaded"]
+    if failed:
+        parts.append(f"{failed} failed")
+    if flagged:
+        parts.append(f"{flagged} row conflict(s) flagged")
+    click.echo(f"\n  {', '.join(parts)}.")
+
+    if skipped:
+        click.echo(f"  {skipped} file(s) skipped (already ingested)")
 
     if failed:
         click.echo(
-            "Run: vp ingest-log --status failed  to see failure reasons (queries ingest_state)."
+            "  Run: vp errors source  to see failure details."
         )
 
     # Write pipeline events — one per file processed (skipped files omitted)

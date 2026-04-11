@@ -530,6 +530,7 @@ class SourceDetail:
     row_count: int | None
     error_count: int
     history: list = field(default_factory=list)   # [{filename, status, rows, ingested_at}]
+    last_failure_message: str | None = None        # most recent ingest_state failure
 
 
 @dataclass
@@ -632,6 +633,56 @@ def query_error_groups(
     return dict(by_scope)
 
 
+@dataclass
+class FileFailure:
+    """One file-level ingest failure from ingest_state."""
+    table_name: str
+    filename: str
+    message: str
+    ingested_at: str | None
+
+
+def query_file_failures(
+    conn, name: str | None = None
+) -> list[FileFailure]:
+    """File-level ingest failures from ingest_state.
+
+    These are file-level errors (unknown columns, bad type declarations)
+    that never reach source_block — they fail the entire file.
+
+    Args:
+        name: optional table_name filter.
+
+    Returns:
+        list of FileFailure, most recent first.
+    """
+    where = "WHERE status = 'failed'"
+    params: list = []
+    if name:
+        where += " AND table_name = ?"
+        params.append(name)
+
+    try:
+        rows = conn.execute(f"""
+            SELECT table_name, filename, message, ingested_at
+            FROM ingest_state
+            {where}
+            ORDER BY ingested_at DESC
+        """, params).fetchall()
+    except Exception:
+        return []
+
+    return [
+        FileFailure(
+            table_name=r[0] or "",
+            filename=r[1],
+            message=r[2] or "unknown error",
+            ingested_at=str(r[3])[:10] if r[3] else None,
+        )
+        for r in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # vp status queries
 # ---------------------------------------------------------------------------
@@ -705,7 +756,13 @@ def query_source_statuses(conn) -> list[SourceStatus]:
 
 def query_source_detail(conn, name: str) -> SourceDetail:
     """Detailed data for one source table."""
-    row_count = _safe_count(conn, f'SELECT count(*) FROM "{name}"')
+    from proto_pipe.io.db import table_exists
+
+    if table_exists(conn, name):
+        row_count = _safe_count(conn, f'SELECT count(*) FROM "{name}"')
+    else:
+        row_count = None
+
     error_count = _safe_count(
         conn, "SELECT count(*) FROM source_block WHERE table_name = ?", [name]
     )
@@ -729,11 +786,27 @@ def query_source_detail(conn, name: str) -> SourceDetail:
     except Exception:
         pass
 
+    # Most recent failure message from ingest_state (for prescriptive output
+    # when the table doesn't exist yet).
+    last_failure_message = None
+    if row_count is None:
+        try:
+            msg_row = conn.execute("""
+                SELECT message FROM ingest_state
+                WHERE table_name = ? AND status = 'failed'
+                ORDER BY ingested_at DESC LIMIT 1
+            """, [name]).fetchone()
+            if msg_row and msg_row[0]:
+                last_failure_message = msg_row[0]
+        except Exception:
+            pass
+
     return SourceDetail(
         name=name,
-        row_count=row_count if row_count else None,
+        row_count=row_count,
         error_count=error_count,
         history=history,
+        last_failure_message=last_failure_message,
     )
 
 

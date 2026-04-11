@@ -282,15 +282,24 @@ def source_cmd(ctx, pipeline_db):
     if ctx.invoked_subcommand is not None:
         return
 
-    from proto_pipe.pipelines.query import query_error_groups
-    from proto_pipe.cli.prompts import print_prescriptive_errors
+    from proto_pipe.pipelines.query import query_error_groups, query_file_failures
+    from proto_pipe.cli.prompts import print_prescriptive_errors, print_file_failures
 
     name = (ctx.obj or {}).get("stage_name")
     p_db = config_path_or_override("pipeline_db", pipeline_db)
     conn = duckdb.connect(p_db)
     try:
+        file_failures = query_file_failures(conn, name=name)
         by_scope = query_error_groups(conn, "source", name=name)
-        print_prescriptive_errors("source", name, by_scope)
+
+        if not file_failures and not by_scope:
+            scope = f"'{name}'" if name else "any source"
+            click.echo(f"\n  No source errors for {scope} — all clear.")
+            return
+
+        print_file_failures(file_failures)
+        if by_scope:
+            print_prescriptive_errors("source", name, by_scope)
     finally:
         conn.close()
 

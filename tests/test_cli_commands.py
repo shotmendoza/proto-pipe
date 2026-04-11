@@ -1265,13 +1265,16 @@ class TestIngestProgressReporter:
         assert "bad.csv" in printed
         assert "type mismatch" in printed
 
-    def test_skipped_uses_console_print(self):
+    def test_skipped_does_not_print_per_file(self):
+        """Skipped files only increment the counter — no per-file output.
+
+        Users run vp status for skip details; per-file [skip] lines are noise.
+        """
         reporter = self._make_reporter()
         reporter.on_file_done("already_loaded.csv", {"status": "skipped"})
 
-        assert reporter._progress.console.print.called
-        printed = str(reporter._progress.console.print.call_args)
-        assert "already_loaded.csv" in printed
+        assert not reporter._progress.console.print.called
+        assert reporter._skipped == 1
 
     def test_ok_increments_ok_counter(self):
         reporter = self._make_reporter()
