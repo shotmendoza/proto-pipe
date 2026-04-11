@@ -299,8 +299,13 @@ def edit_report(report, reports_config, pipeline_db):
 @click.option("--reports-config", default=None)
 @click.option("--sources-config", default=None)
 @click.option("--sql-dir", default=None)
-def edit_deliverable(deliverable, deliverables_config, reports_config, sources_config, sql_dir):
+@click.option("--pipeline-db", default=None, help="Override pipeline DB path.")
+def edit_deliverable(deliverable, deliverables_config, reports_config, sources_config, sql_dir, pipeline_db):
     """Edit an existing deliverable configuration.
+
+    Re-runs the deliverable wizard with existing values pre-filled.
+    The SQL file is regenerated from scratch based on selections —
+    any hand edits to the SQL file will be lost (with confirmation).
 
     \b
     Examples:
@@ -308,14 +313,16 @@ def edit_deliverable(deliverable, deliverables_config, reports_config, sources_c
       vp edit deliverable --deliverable carrier_a
     """
     from proto_pipe.io.config import DeliverableConfig
-    from proto_pipe.io.config import load_settings
     from proto_pipe.cli.prompts import DeliverableConfigPrompter
+    from proto_pipe.cli.commands.new import build_inspect_macro_registry
 
     del_cfg = config_path_or_override("deliverables_config", deliverables_config)
     rep_cfg = config_path_or_override("reports_config", reports_config)
     src_cfg = config_path_or_override("sources_config", sources_config)
     settings = load_settings()
     sql_directory = sql_dir or settings["paths"].get("sql_dir", "sql")
+    p_db = pipeline_db or settings["paths"].get("pipeline_db")
+    views_config = settings["paths"].get("views_config")
 
     config = DeliverableConfig(del_cfg)
     rep_config = load_config(rep_cfg)
@@ -348,58 +355,32 @@ def edit_deliverable(deliverable, deliverables_config, reports_config, sources_c
         click.echo("\n  No reports configured yet. Run: vp new report")
         return
 
+    # Build inspect-only macro registry (no DuckDB registration)
+    macro_registry = build_inspect_macro_registry(settings)
+
     prompter = DeliverableConfigPrompter(
         rep_config=rep_config,
         src_config=src_config,
         sql_dir=sql_directory,
         existing_deliverable=existing,
+        macro_registry=macro_registry,
     )
 
-    name = prompter.prompt_name([n for n in config.names() if n != deliverable])
-    if not name:
+    other_names = [n for n in config.names() if n != deliverable]
+    if not prompter.run(
+        other_names,
+        available_reports,
+        pipeline_db=p_db,
+        views_config_path=views_config,
+    ):
         click.echo("Cancelled.")
         return
 
-    fmt = prompter.prompt_format()
-    if not fmt:
-        click.echo("Cancelled.")
-        return
-
-    filename_template = prompter.prompt_filename_template(name, fmt)
-    if not filename_template:
-        click.echo("Cancelled.")
-        return
-
-    selected_reports = prompter.prompt_reports(available_reports)
-    if not selected_reports:
-        click.echo("Cancelled.")
-        return
-
-    if fmt == "csv" and len(selected_reports) > 1:
-        click.echo(
-            "\n  [warn] Multiple reports selected for a CSV deliverable —"
-            " you'll need to join them in your SQL file."
-        )
-
-    sql_file = prompter.prompt_sql(name, selected_reports)
-    report_entries = prompter.prompt_report_entries(selected_reports, fmt)
-
-    updated = {
-        "name": name,
-        "format": fmt,
-        "filename_template": filename_template,
-        "reports": report_entries,
-    }
-    if sql_file:
-        updated["sql_file"] = sql_file
-
-    if name != deliverable:
+    if prompter.deliverable["name"] != deliverable:
         config.remove(deliverable)
-        config.add(updated)
-    else:
-        config.update(deliverable, updated)
 
-    click.echo(f"\n[ok] Deliverable '{name}' updated.")
+    config.add_or_update(prompter.deliverable)
+    click.echo(f"\n[ok] Deliverable '{prompter.deliverable['name']}' updated.")
 
 
 @edit_cmd.command("table")

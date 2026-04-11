@@ -1427,9 +1427,35 @@ class DeliverableConfigPrompter:
             )
 
             sql_content = build_deliverable_sql(spec)
-            sql_file = self._write_sql_file(name, sql_content)
+
+            # Edit flow: confirm before overwriting hand-edited SQL
+            existing_sql = self._existing.get("sql_file")
+            if existing_sql:
+                from pathlib import Path as _Path
+
+                if _Path(existing_sql).exists():
+                    proceed = questionary.confirm(
+                        f"This will regenerate {existing_sql}. "
+                        f"Any hand edits will be lost. Continue?",
+                        default=True,
+                    ).ask()
+                    if not proceed:
+                        sql_file = existing_sql
+                        click.echo(f"  [skip] Keeping existing {existing_sql}")
+                    else:
+                        # Write directly — already confirmed, skip _write_sql_file's
+                        # own overwrite check to avoid a double confirmation.
+                        sql_path = _Path(self._sql_dir) / f"{name}.sql"
+                        sql_path.parent.mkdir(parents=True, exist_ok=True)
+                        sql_path.write_text(sql_content)
+                        click.echo(f"  [ok]   {sql_path}")
+                        sql_file = str(sql_path)
+                else:
+                    sql_file = self._write_sql_file(name, sql_content)
+            else:
+                sql_file = self._write_sql_file(name, sql_content)
         else:
-            # Fallback: old behavior for edit flow or when no DB available
+            # Fallback: prompt-based SQL when no DB available
             sql_file = self.prompt_sql(name, selected_reports)
 
         report_entries = self.prompt_report_entries(selected_reports, fmt)
@@ -2679,14 +2705,14 @@ def print_source_list(statuses) -> None:
         statuses: list of SourceStatus from query_source_statuses.
     """
     if not statuses:
-        click.echo("  No sources ingested yet. Run: vp ingest")
+        click.echo("No sources ingested yet. Run: vp ingest")
         return
 
     click.echo("\nSources\n")
     for s in statuses:
-        err = f"  {s.error_count} error(s)" if s.error_count else ""
+        err = f"{s.error_count} error(s)" if s.error_count else ""
         last = s.last_ingest or "—"
-        click.echo(f"  {s.table_name:<25} {s.total_rows:>8} rows    last: {last}{err}")
+        click.echo(f"{s.table_name:<25} {s.total_rows:>8} rows last: {last}{err}")
 
 
 def print_source_detail(detail) -> None:
@@ -2698,15 +2724,15 @@ def print_source_detail(detail) -> None:
     click.echo(f"\nSource: {detail.name}\n")
 
     if detail.row_count is not None:
-        click.echo(f"  Rows:         {detail.row_count}")
+        click.echo(f"Rows: {detail.row_count}")
     else:
-        click.echo("  Rows:         table not found")
+        click.echo("Rows: table not found")
 
     if detail.error_count:
-        click.echo(f"  Errors:       {detail.error_count}")
-        click.echo(f"    Fix: vp errors source {detail.name}")
+        click.echo(f"Errors: {detail.error_count}")
+        click.echo(f"Fix: vp errors source {detail.name}")
     else:
-        click.echo("  Errors:       none")
+        click.echo("Errors: none")
 
     if detail.history:
         click.echo("\n  Ingest history:")
@@ -2723,14 +2749,14 @@ def print_report_list(statuses) -> None:
         statuses: list of ReportStatus from query_report_statuses.
     """
     if not statuses:
-        click.echo("  No reports validated yet. Run: vp validate")
+        click.echo("No reports validated yet. Run: vp validate")
         return
 
     click.echo("\nReports\n")
     for s in statuses:
-        fail = f"  {s.failure_count} failure(s)" if s.failure_count else ""
+        fail = f"{s.failure_count} failure(s)" if s.failure_count else ""
         last = s.last_validated or "—"
-        click.echo(f"  {s.report_name:<25} {s.record_count:>8} records    last: {last}{fail}")
+        click.echo(f"{s.report_name:<25} {s.record_count:>8} records last: {last}{fail}")
 
 
 def print_report_detail(detail) -> None:
@@ -2742,19 +2768,19 @@ def print_report_detail(detail) -> None:
     click.echo(f"\nReport: {detail.name}\n")
 
     if detail.row_count is not None:
-        click.echo(f"  Rows:         {detail.row_count}")
+        click.echo(f"Rows: {detail.row_count}")
     else:
-        click.echo("  Rows:         table not found (run vp validate)")
+        click.echo("Rows: table not found (run vp validate)")
 
     click.echo(f"  Last validated: {detail.last_validated or '—'}")
 
     if detail.failure_count:
-        click.echo(f"  Failures:     {detail.failure_count}")
-        click.echo(f"    Fix: vp errors report {detail.name}")
+        click.echo(f"Failures:     {detail.failure_count}")
+        click.echo(f"Fix: vp errors report {detail.name}")
     else:
-        click.echo("  Failures:     none")
+        click.echo("Failures:     none")
 
     if detail.checks:
-        click.echo("\n  Check results:")
+        click.echo("\nCheck results:")
         for check_name, status, cnt in detail.checks:
-            click.echo(f"    {check_name:<30} {status:<10} {cnt} records")
+            click.echo(f"{check_name:<30} {status:<10} {cnt} records")

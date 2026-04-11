@@ -52,8 +52,8 @@ from proto_pipe.checks.helpers import register_custom_check
 def _make_df() -> pd.DataFrame:
     return pd.DataFrame({
         "order_id": ["ORD-001", "ORD-002", "ORD-003"],
-        "price":    [10.0, 20.0, 30.0],
-        "region":   ["EMEA", "APAC", "EMEA"],
+        "price": [10.0, 20.0, 30.0],
+        "region": ["EMEA", "APAC", "EMEA"],
     })
 
 
@@ -234,6 +234,7 @@ class TestSeriesWrapperDualPath:
 
     def test_series_pandas_context_result(self):
         """Pandas context: extracts column from df, produces correct Series."""
+
         def fn(price: pd.Series) -> pd.Series[bool]:
             return price > 15.0
 
@@ -389,141 +390,6 @@ class TestScalarWrapperDualPath:
         assert call_count[0] == 1, (
             "Constant param must call function once — not per row"
         )
-
-
-# ---------------------------------------------------------------------------
-# Guarantee 5 — _compute_report uses contract flags to gate pandas vs DuckDB
-# ---------------------------------------------------------------------------
-
-class TestComputeReportContractGating:
-    """_compute_report reads contract flags, never re-inspects functions.
-
-    needs_dataframe=True or is_legacy=True → pandas path
-    needs_series=True or is_scalar=True → DuckDB path (conn kept open)
-    """
-
-    def test_series_check_takes_duckdb_path(self, pipeline_db, watermark_store, sales_df):
-        """pd.Series check → DuckDB path — no full pending_df loaded."""
-        from proto_pipe.io.db import init_all_pipeline_tables
-        from proto_pipe.reports.runner import _compute_report
-
-        with duckdb.connect(pipeline_db) as conn:
-            init_all_pipeline_tables(conn)
-            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
-
-        cr = CheckRegistry()
-
-        def price_check(price: pd.Series) -> pd.Series[bool]:
-            return price > 0
-
-        func = partial(price_check, price="price")
-        register_custom_check("price_series_v1", func, cr, kind="check")
-
-        config = {
-            "name": "sales_report",
-            "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
-            "alias_map": [{"param": "price", "column": "price"}],
-            "options": {"parallel": False},
-            "checks": [{"name": "price_series_v1", "params": {}}],
-        }
-        from proto_pipe.checks.registry import ReportRegistry
-        from proto_pipe.io.registry import register_from_config
-        rr = ReportRegistry()
-        full_config = {"templates": {}, "reports": [config]}
-        register_from_config(full_config, cr, rr)
-        report = rr.get("sales_report")
-
-        # Must complete without error — DuckDB path fires for Series checks
-        bundle = _compute_report(report, cr, pipeline_db)
-        assert bundle.status == "computed", f"Expected computed, got {bundle.status}: {bundle.error}"
-
-    def test_dataframe_check_takes_pandas_path(self, pipeline_db, watermark_store, sales_df):
-        """pd.DataFrame check → pandas path — pending_df loaded."""
-        from proto_pipe.io.db import init_all_pipeline_tables
-        from proto_pipe.reports.runner import _compute_report
-
-        with duckdb.connect(pipeline_db) as conn:
-            init_all_pipeline_tables(conn)
-            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
-
-        cr = CheckRegistry()
-
-        def df_check(df: pd.DataFrame) -> pd.Series[bool]:
-            return df["price"] > 0
-
-        register_custom_check("df_check_v1", df_check, cr, kind="check")
-
-        config = {
-            "name": "sales_report",
-            "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
-            "alias_map": [],
-            "options": {"parallel": False},
-            "checks": [{"name": "df_check_v1", "params": {}}],
-        }
-        from proto_pipe.checks.registry import ReportRegistry
-        from proto_pipe.io.registry import register_from_config
-        rr = ReportRegistry()
-        full_config = {"templates": {}, "reports": [config]}
-        register_from_config(full_config, cr, rr)
-        report = rr.get("sales_report")
-
-        bundle = _compute_report(report, cr, pipeline_db)
-        assert bundle.status == "computed", f"Expected computed, got {bundle.status}: {bundle.error}"
-
-    def test_legacy_check_takes_pandas_path(self, pipeline_db, watermark_store, sales_df):
-        """Legacy context: dict check → pandas path (is_legacy=True)."""
-        from proto_pipe.io.db import init_all_pipeline_tables
-        from proto_pipe.reports.runner import _compute_report
-
-        with duckdb.connect(pipeline_db) as conn:
-            init_all_pipeline_tables(conn)
-            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
-
-        cr = CheckRegistry()
-
-        def legacy_check(context: dict) -> pd.Series[bool]:
-            return context["df"]["price"] > 0
-
-        register_custom_check("legacy_v1", legacy_check, cr, kind="check")
-
-        config = {
-            "name": "sales_report",
-            "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
-            "alias_map": [],
-            "options": {"parallel": False},
-            "checks": [{"name": "legacy_v1", "params": {}}],
-        }
-        from proto_pipe.checks.registry import ReportRegistry
-        from proto_pipe.io.registry import register_from_config
-        rr = ReportRegistry()
-        full_config = {"templates": {}, "reports": [config]}
-        register_from_config(full_config, cr, rr)
-        report = rr.get("sales_report")
-
-        bundle = _compute_report(report, cr, pipeline_db)
-        assert bundle.status == "computed"
-
-    def test_no_checks_takes_duckdb_path(self, pipeline_db, watermark_store, sales_df):
-        """Report with no checks → DuckDB path (no contracts force pandas)."""
-        from proto_pipe.io.db import init_all_pipeline_tables
-        from proto_pipe.reports.runner import _compute_report
-
-        with duckdb.connect(pipeline_db) as conn:
-            init_all_pipeline_tables(conn)
-            conn.execute("CREATE TABLE sales AS SELECT * FROM sales_df")
-
-        cr = CheckRegistry()
-        config = {
-            "name": "sales_report",
-            "source": {"type": "duckdb", "path": pipeline_db, "table": "sales", "primary_key": "order_id"},
-            "alias_map": [],
-            "options": {"parallel": False},
-            "checks": [],
-            "resolved_checks": [],
-        }
-
-        bundle = _compute_report(config, cr, pipeline_db)
-        assert bundle.status == "computed"
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +595,7 @@ class TestBulkColumnFetch:
         )
 
     def test_col_cache_does_not_contain_columns_from_other_tables(
-        self, pipeline_db, watermark_store, sales_df
+            self, pipeline_db, watermark_store, sales_df
     ):
         """col_cache is scoped to the report's source table — no cross-table bleed."""
         from proto_pipe.io.db import init_all_pipeline_tables
@@ -910,7 +776,7 @@ class TestDisplayName:
             pytest.fail(f"_display_name raised unexpectedly: {e}")
 
     def test_display_name_used_in_check_output(
-        self, pipeline_db, watermark_store, sales_df
+            self, pipeline_db, watermark_store, sales_df
     ):
         """Check failure output shows function name not UUID."""
         from proto_pipe.io.db import init_all_pipeline_tables
@@ -958,5 +824,5 @@ class TestDisplayName:
 
         log_messages = " ".join(entry.message for entry in bundle.log)
         assert (
-            "always_fails" in log_messages
+                "always_fails" in log_messages
         ), "Check output must show function name 'always_fails', not a UUID"

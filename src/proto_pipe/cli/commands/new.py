@@ -22,7 +22,7 @@ from proto_pipe.cli.prompts import SourceConfigPrompter, ViewConfigPrompter
 from proto_pipe.constants import DEFAULT_SETTINGS_PATH
 
 
-def _build_inspect_macro_registry(settings: dict):
+def build_inspect_macro_registry(settings: dict):
     """Build a MacroRegistry for wizard inspection — no DuckDB registration.
 
     Same as smoke_test_macros but returns the populated registry.
@@ -329,7 +329,7 @@ def new_deliverable(deliverables_config, reports_config, sources_config, sql_dir
         return
 
     # Build inspect-only macro registry (no DuckDB registration)
-    macro_registry = _build_inspect_macro_registry(settings)
+    macro_registry = build_inspect_macro_registry(settings)
 
     click.echo("\n── New Deliverable ─────────────────────────")
 

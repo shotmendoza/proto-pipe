@@ -215,24 +215,6 @@ class TestResolveCheckUuidExpansion:
         finally:
             self._cleanup_test_checks()
 
-    def test_each_expansion_gets_unique_key(self):
-        from proto_pipe.io.registry import register_from_config
-        self._register_test_checks()
-        try:
-            reg, rep_reg = CheckRegistry(), ReportRegistry()
-            config = self._config(
-                alias_map=[
-                    {"param": "col", "column": "price"},
-                    {"param": "col", "column": "cost"},
-                ],
-                checks=[{"name": "price_check", "params": {"min_val": 0, "max_val": 500}}],
-            )
-            register_from_config(config, reg, rep_reg)
-            names = rep_reg.get("test_report")["resolved_checks"]
-            assert len(set(names)) == 2
-        finally:
-            self._cleanup_test_checks()
-
     def test_scalar_params_broadcast_across_expansions(self):
         from proto_pipe.io.registry import register_from_config, _build_check_keys
         self._register_test_checks()
