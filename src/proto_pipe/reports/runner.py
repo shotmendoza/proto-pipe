@@ -562,6 +562,23 @@ def _compute_report(
 
     # 10. Compute validation_pass entries in memory.
     all_passed = all(v.status == "passed" for v in results.values())
+
+    # 10a. Add transform outcomes to results for display (after all_passed
+    # so transforms don't affect watermark advancement — only checks matter).
+    if transform_names:
+        transform_error_names = {
+            entry.check_name
+            for entry in bundle.log
+            if entry.category == "transform"
+            and entry.level in ("error", "warn")
+            and entry.check_name
+        }
+        for t_name in transform_names:
+            if t_name in transform_error_names:
+                results[t_name] = CheckOutcome(status="transform_error")
+            else:
+                results[t_name] = CheckOutcome(status="applied")
+
     flagged_pks = {fr.pk_value for fr in accumulated_flags if fr.pk_value}
     pass_entries = []
     for pk_str, row_hash in incoming.items():

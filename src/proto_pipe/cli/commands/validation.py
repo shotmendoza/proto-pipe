@@ -51,6 +51,24 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
     load_custom_checks(check_registry)
     _config = load_config(rep_cfg)
     register_from_config(_config, check_registry, report_registry)
+
+    # Write metadata for expanded UUIDs so vp errors can resolve them
+    # to human-readable function names. Same pattern as vp new report
+    # (new.py lines 273–278) — CLI wiring, not business logic (rule 16).
+    from proto_pipe.checks.registry import CheckParamInspector
+    from proto_pipe.io.db import init_check_registry_metadata
+    from proto_pipe.cli.scaffold import get_original_func
+
+    conn_meta = duckdb.connect(p_db)
+    try:
+        init_check_registry_metadata(conn_meta)
+        for check_name in check_registry.available():
+            original = get_original_func(check_name, check_registry)
+            if original is not None:
+                CheckParamInspector(original).write_to_db(conn_meta, check_name)
+    finally:
+        conn_meta.close()
+
     watermark_store = WatermarkStore(w_db)
 
     if table:
@@ -98,7 +116,7 @@ def validate(pipeline_db, watermark_db, reports_config, table, full):
             )
         elif status == "completed":
             has_failures = any(
-                v.status in ("failed", "error")
+                v.status in ("failed", "error", "transform_error")
                 for v in r.get("results", {}).values()
             )
             events.append(

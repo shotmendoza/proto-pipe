@@ -340,8 +340,8 @@ class TestVpNewDeliverableGuarantees:
 
         # Mock the full wizard flow including view steps.
         # Sequence: name, format, filename, reports, report_columns,
-        # view_checkbox, view_columns, join_left_key, join_right_key,
-        # join_type, order_by_confirm
+        # view_checkbox, view_columns, base_table_select,
+        # join_left_key, join_right_key, join_type, order_by_confirm
         checkbox_calls = iter([
             ["premiums_report"],                         # reports
             ["policy_id", "carrier", "bound_premium"],   # report columns
@@ -349,10 +349,11 @@ class TestVpNewDeliverableGuarantees:
             ["carrier", "total_premium"],                # view columns
         ])
         select_calls = iter([
-            "xlsx",           # format
-            "carrier",        # join left key (from premiums_report)
-            "carrier",        # join right key (from carrier_summary)
-            "LEFT",           # join type
+            "xlsx",              # format
+            "premiums_report",   # base table selection (Issue 3 — user picks left side)
+            "carrier",           # join left key (from premiums_report)
+            "carrier",           # join right key (from carrier_summary)
+            "LEFT",              # join type
         ])
         text_calls = iter([
             "view_join_test",                # name

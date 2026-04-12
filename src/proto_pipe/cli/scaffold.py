@@ -630,12 +630,21 @@ def _build_multi_report_sql(spec: DeliverableSQLSpec, header: list[str]) -> str:
     col_refs: list[str] = []
     for report in reports:
         alias = aliases[report]
-        for col in spec.report_columns[report]:
-            col_refs.append(f"{alias}.{col}")
+        cols = spec.report_columns[report]
+        if cols:
+            for col in cols:
+                col_refs.append(f"{alias}.{col}")
+        else:
+            # No columns selected (table doesn't exist yet) → SELECT alias.*
+            col_refs.append(f"{alias}.*")
     for view in views:
         alias = aliases[view]
-        for col in spec.view_columns[view]:
-            col_refs.append(f"{alias}.{col}")
+        cols = spec.view_columns.get(view, [])
+        if cols:
+            for col in cols:
+                col_refs.append(f"{alias}.{col}")
+        else:
+            col_refs.append(f"{alias}.*")
 
     # Apply macro expressions
     all_columns = {**spec.report_columns, **spec.view_columns}

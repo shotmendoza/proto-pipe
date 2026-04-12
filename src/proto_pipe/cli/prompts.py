@@ -1282,27 +1282,65 @@ class ReportConfigPrompter:
                         return [], [], True
                     filled_params["overwrite_cols"] = sorted(overwrite_cols)
 
-            # _output prompt for transforms with column-backed params
-            # Fires when transform alias entries were added this check.
+            # _output prompt for transforms with column-backed params.
+            # Fires when:
+            #   (a) new alias entries were added this check, OR
+            #   (b) existing _output entries for this check are carried
+            #       forward from the pre-edit alias_map (edit path).
             # Checks never need _output — results go to validation_block.
             new_alias_entries = accumulated_alias[alias_before_check:]
             input_alias_entries = [
                 e for e in new_alias_entries if e["param"] != "_output"
             ]
-            if kind == "transform" and input_alias_entries:
+
+            # Existing _output entries for this check from pre-edit alias_map.
+            # On the create path existing_alias_map is empty so this is [].
+            existing_output_entries = [
+                e for e in (existing_alias_map or [])
+                if e["param"] == "_output"
+                and e.get("check") == check_name
+            ]
+            # Existing input entries carried forward (not re-added due to
+            # the duplicate guard above)
+            existing_input_entries = [
+                e for e in (existing_alias_map or [])
+                if e["param"] != "_output"
+                and e["param"] in all_col_picker_params
+            ]
+
+            has_new_inputs = bool(input_alias_entries)
+            has_existing_outputs = bool(existing_output_entries)
+
+            if kind == "transform" and (has_new_inputs or has_existing_outputs):
+                # Determine n_runs from new OR existing input entries
+                source_entries = input_alias_entries if has_new_inputs else existing_input_entries
                 n_runs = max(
-                    len([e for e in input_alias_entries if e["param"] == p])
-                    for p in {e["param"] for e in input_alias_entries}
-                )
+                    len([e for e in source_entries if e["param"] == p])
+                    for p in {e["param"] for e in source_entries}
+                ) if source_entries else 1
+
+                # Pre-populate from existing _output selections (edit path)
+                preselected_outputs = [e["column"] for e in existing_output_entries]
+
                 click.echo(
                     f"\n  \u2139  '{check_name}' is a transform. "
                     f"Select the output column(s) where each run's result "
                     f"should be written ({n_runs} run(s) — select {n_runs} to align)."
                 )
+
+                # Remove existing _output entries for this check before
+                # re-prompting so the user's new selection replaces the old.
+                accumulated_alias = [
+                    e for e in accumulated_alias
+                    if not (e["param"] == "_output" and e.get("check") == check_name)
+                ]
+
                 if n_runs == 1:
+                    default_output = preselected_outputs[0] if preselected_outputs else None
                     output_val = questionary.select(
                         "Output column:",
                         choices=_make_col_choices(table_cols, registry_types),
+                        default=default_output,
                     ).ask()
                     if output_val is None:
                         if _ask_skip_or_abort(check_name):
@@ -1316,9 +1354,9 @@ class ReportConfigPrompter:
                     # single-entry params just broadcast and aren't meaningful to mirror.
                     _MANUAL_SELECT = "\u270e Select output columns manually"
                     multi_col_params = {
-                        p: [e["column"] for e in input_alias_entries if e["param"] == p]
-                        for p in {e["param"] for e in input_alias_entries}
-                        if len([e for e in input_alias_entries if e["param"] == p]) > 1
+                        p: [e["column"] for e in source_entries if e["param"] == p]
+                        for p in {e["param"] for e in source_entries}
+                        if len([e for e in source_entries if e["param"] == p]) > 1
                     }
                     param_choices = [
                         questionary.Choice(
@@ -1347,7 +1385,10 @@ class ReportConfigPrompter:
                             accumulated_alias.append({"param": "_output", "column": col, "check": check_name})
                     else:
                         # Manual → user picks output columns freely from full column list.
-                        output_choices = _make_col_choices(table_cols, registry_types)
+                        precheck_set = set(preselected_outputs)
+                        output_choices = _make_col_choices(
+                            table_cols, registry_types, precheck=precheck_set,
+                        )
                         output_vals = questionary.checkbox(
                             "Output columns:",
                             choices=output_choices,
@@ -1511,6 +1552,20 @@ class DeliverableConfigPrompter:
                 if join_specs is None:
                     return False
 
+                # Reorder report/view columns so the user's chosen base table
+                # is first in the spec. build_deliverable_sql uses the first
+                # table as the FROM clause base.
+                if join_specs:
+                    base = join_specs[0].left_table
+                    if base in report_columns and list(report_columns.keys())[0] != base:
+                        reordered = {base: report_columns[base]}
+                        reordered.update({k: v for k, v in report_columns.items() if k != base})
+                        report_columns = reordered
+                    elif base in view_columns and list(view_columns.keys())[0] != base:
+                        reordered_v = {base: view_columns[base]}
+                        reordered_v.update({k: v for k, v in view_columns.items() if k != base})
+                        view_columns = reordered_v
+
             order_by = self.prompt_order_by(report_columns)
 
             spec = DeliverableSQLSpec(
@@ -1578,6 +1633,10 @@ class DeliverableConfigPrompter:
 
         Returns {report_name: [selected_columns]} or None if cancelled.
         Uses get_table_columns from io/db.py (Rule 15 — reuse existing).
+
+        When a report table doesn't exist yet (vp validate not run), the
+        report is included with an empty column list. build_deliverable_sql
+        and _format_column_list handle empty lists by producing SELECT *.
         """
         from proto_pipe.io.db import get_table_columns
 
@@ -1587,9 +1646,13 @@ class DeliverableConfigPrompter:
             columns = get_table_columns(pipeline_db, report_name)
             if not columns:
                 click.echo(
-                    f"\n  [warn] No columns found for report '{report_name}'."
-                    f" Has 'vp validate' been run?"
+                    f"\n  [info] Report table '{report_name}' not found."
+                    f" Run: vp validate  to enable column selection."
+                    f"\n         Using SELECT * for now."
                 )
+                # Include with empty list — build_deliverable_sql produces
+                # SELECT * via _format_column_list's empty-list path.
+                report_columns[report_name] = []
                 continue
 
             selected = questionary.checkbox(
@@ -1610,7 +1673,7 @@ class DeliverableConfigPrompter:
             report_columns[report_name] = selected
 
         if not report_columns:
-            click.echo("  No columns selected from any report.")
+            click.echo("  No reports available.")
             return None
 
         return report_columns
@@ -1621,15 +1684,12 @@ class DeliverableConfigPrompter:
     ) -> list | None:
         """Prompt for join configuration between tables.
 
-        For each table after the first, asks:
-        - Which already-configured table to join against
-        - Which column in the left table is the join key
-        - Which column in the right table is the join key
-        - What type of join (LEFT, INNER, FULL OUTER)
+        First asks which table should be the base (left) table — this
+        controls which table's rows are preserved in LEFT JOINs. Then
+        for each remaining table, asks join key + join type.
 
         Works for reports, views, or any mix. The first table in
-        all_columns is the base — every other table must join to
-        one of the tables that came before it.
+        all_columns is the default but the user can override.
 
         Returns list[JoinSpec] or None if cancelled.
         """
@@ -1638,6 +1698,19 @@ class DeliverableConfigPrompter:
         tables = list(all_columns.keys())
         if len(tables) < 2:
             return []
+
+        # Let the user pick the base table — don't assume dict order.
+        base_table = questionary.select(
+            "Which table should be the base (left side) of the JOIN?",
+            choices=tables,
+            default=tables[0],
+        ).ask()
+        if base_table is None:
+            return None
+
+        # Reorder: base first, rest in original order
+        remaining = [t for t in tables if t != base_table]
+        tables = [base_table] + remaining
 
         join_specs = []
 
@@ -1712,14 +1785,26 @@ class DeliverableConfigPrompter:
 
         Returns empty list if no views exist or none selected.
         Never returns None — views are optional, not cancellable.
+        Shows explanatory messages when views are unavailable.
         """
         if not views_config_path:
+            click.echo(
+                "\n  [skip] No views_config path in pipeline.yaml"
+                " — skipping view selection."
+                "\n         To add views: set paths.views_config in pipeline.yaml,"
+                " then run: vp new view"
+            )
             return []
 
         from proto_pipe.reports.views import load_views_config  # TODO: This likely needs to be moved
 
         views = load_views_config(views_config_path)
         if not views:
+            click.echo(
+                "\n  [skip] No views defined in views_config.yaml"
+                " — skipping view selection."
+                "\n         To add views: vp new view"
+            )
             return []
 
         view_names = [v["name"] for v in views]
@@ -1823,14 +1908,25 @@ class DeliverableConfigPrompter:
     def prompt_macros(self, macro_registry) -> list[str]:
         """Checkbox of available macros. Returns selected macro names.
 
-        Skips silently if macro_registry is None or empty.
+        Shows explanatory messages when macros are unavailable.
         Never returns None — macros are optional, not cancellable.
         """
         if macro_registry is None:
+            click.echo(
+                "\n  [skip] No macro registry available"
+                " — skipping macro selection."
+                "\n         To add macros: set custom_macros_module or macros_dir"
+                " in pipeline.yaml, then run: vp new macro"
+            )
             return []
 
         available = macro_registry.available()
         if not available:
+            click.echo(
+                "\n  [skip] No macros registered"
+                " — skipping macro selection."
+                "\n         To add macros: vp new macro"
+            )
             return []
 
         choices = []
@@ -2457,7 +2553,7 @@ class ValidateProgressReporter(PipelineProgressReporter):
             self._completed += 1
             results = result.get("results", {})
             has_failures = any(
-                v.status in ("failed", "error") for v in results.values()
+                v.status in ("failed", "error", "transform_error") for v in results.values()
             )
             header_style = "bold red" if has_failures else "bold green"
             self._print(f"\n  [{header_style}]{report_name}[/{header_style}] [completed]")
@@ -2465,25 +2561,30 @@ class ValidateProgressReporter(PipelineProgressReporter):
             for check_name, outcome in results.items():
                 name = display_name(check_name, self._check_registry)
                 check_status = outcome.status
-                failed_count = (
-                    int(outcome.result.mask.sum())
-                    if outcome.result and outcome.result.mask is not None
-                    else 0
-                )
 
-                if check_status == "passed":
-                    self._print(f"    [green]✓[/green] {name}")
+                if check_status == "applied":
+                    # Transform successfully applied
+                    self._print(f"    [cyan]\u21bb[/cyan] {name} [dim][applied][/dim]")
+                elif check_status == "transform_error":
+                    self._print(f"    [bold red]\u21bb {name} [transform error][/bold red]")
+                elif check_status == "passed":
+                    self._print(f"    [green]\u2713[/green] {name}")
                 elif check_status == "failed":
-                    self._print(f"    [bold red]✗[/bold red] {name}")
+                    failed_count = (
+                        int(outcome.result.mask.sum())
+                        if outcome.result and outcome.result.mask is not None
+                        else 0
+                    )
+                    self._print(f"    [bold red]\u2717[/bold red] {name}")
                     self._print(
-                        f"      [dim]{failed_count} row(s) failed → validation_block[/dim]"
+                        f"      [dim]{failed_count} row(s) failed \u2192 validation_block[/dim]"
                     )
                 elif check_status == "error":
-                    self._print(f"    [bold red]✗ {name}: {outcome.error or ''}[/bold red]")
+                    self._print(f"    [bold red]\u2717 {name}: {outcome.error or ''}[/bold red]")
 
         elif status == "skipped":
             self._skipped += 1
-            self._print(f"\n  [dim]{report_name} [skipped — no pending records][/dim]")
+            self._print(f"\n  [dim]{report_name} [skipped \u2014 no pending records][/dim]")
 
         elif status == "error":
             self._failed += 1
