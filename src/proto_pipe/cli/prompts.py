@@ -619,6 +619,20 @@ def prompt_param_binding(
 _DIRECT_ENTRY = "\u270e Enter value directly"
 
 
+def _ask_skip_or_abort(check_name: str) -> bool:
+    """Prompt the user to skip a function or abort the entire wizard.
+
+    Returns True to skip (caller should continue to next function),
+    False to abort (caller should return go_back=True).
+    """
+    skip = questionary.confirm(
+        f"  Skip '{check_name}' and continue with remaining functions?",
+        default=True,
+    ).ask()
+    # None (ESC on the confirm itself) → treat as abort
+    return bool(skip)
+
+
 # ---------------------------------------------------------------------------
 # ReportConfigPrompter
 # ---------------------------------------------------------------------------
@@ -953,6 +967,9 @@ class ReportConfigPrompter:
         check_col (kind=check + returns DataFrame) → params dict.
         overwrite_cols (kind=transform + returns DataFrame) → params dict.
 
+        ESC during any param prompt offers to skip the current function and
+        continue with the remaining selections, or abort back to check selection.
+
         Returns (check_entries, alias_map_entries, go_back).
         """
         import inspect
@@ -1017,9 +1034,15 @@ class ReportConfigPrompter:
 
             click.echo(f"\nParameters for '{check_name}':")
 
+            # Issue 3 fix: gate multi-select on is_expandable().
+            # Only functions returning pd.Series or pd.DataFrame can be
+            # meaningfully expanded N times via alias_map. Without this gate,
+            # the prompt allows multi-column selection but the runtime
+            # (_expand_check_with_alias_map) silently ignores it.
             eligible = (
                 self._multi_select
                 and inspector is not None
+                and inspector.is_expandable()
                 and (
                     inspector.is_multiselect_eligible()  # checks: bool-Series return
                     or (                                  # transforms: col-backed params
@@ -1041,7 +1064,8 @@ class ReportConfigPrompter:
             sig = inspect.signature(inspector.func) if inspector else None
 
             filled_params: dict = {}
-            alias_before_check = len(accumulated_alias)  # for _output prompt
+            alias_before_check = len(accumulated_alias)  # for rollback on skip
+            skip_this_check = False  # Issue 4: flag for skip-and-continue
 
             for param_name, default in params.items():
                 ann = (
@@ -1084,9 +1108,44 @@ class ReportConfigPrompter:
                             f" once per column."
                         )
                         choices = _make_col_choices(ordered, registry_types, precheck=precheck_cols)
+                        # Issue 2 fix: escape hatch in checkbox path for
+                        # column-backed scalars so user can enter a constant.
+                        if has_escape:
+                            choices.append(
+                                questionary.Choice(
+                                    title=_DIRECT_ENTRY, value=_DIRECT_ENTRY
+                                )
+                            )
                         value = questionary.checkbox(f"{param_name}:", choices=choices).ask()
                         if value is None:
+                            if _ask_skip_or_abort(check_name):
+                                skip_this_check = True
+                                break
                             return [], [], True
+
+                        # Issue 2: if user selected _DIRECT_ENTRY in checkbox,
+                        # route to free-text and store as broadcast constant.
+                        if _DIRECT_ENTRY in value:
+                            raw = questionary.text(
+                                f"{param_name} (enter value directly):"
+                            ).ask()
+                            if raw is None:
+                                if _ask_skip_or_abort(check_name):
+                                    skip_this_check = True
+                                    break
+                                return [], [], True
+                            if raw:
+                                try:
+                                    parsed: object = (
+                                        int(raw) if "." not in raw else float(raw)
+                                    )
+                                except ValueError:
+                                    parsed = raw
+                            else:
+                                parsed = raw
+                            filled_params[param_name] = parsed
+                            continue  # skip alias_map — broadcast constant
+
                         value = sorted(value)
                         for col in value:
                             if not any(
@@ -1109,6 +1168,9 @@ class ReportConfigPrompter:
                             default=default_col,
                         ).ask()
                         if value is None:
+                            if _ask_skip_or_abort(check_name):
+                                skip_this_check = True
+                                break
                             return [], [], True
 
                         if value == _DIRECT_ENTRY:
@@ -1116,6 +1178,9 @@ class ReportConfigPrompter:
                                 f"{param_name} (enter value directly):"
                             ).ask()
                             if raw is None:
+                                if _ask_skip_or_abort(check_name):
+                                    skip_this_check = True
+                                    break
                                 return [], [], True
                             if raw:
                                 try:
@@ -1152,6 +1217,9 @@ class ReportConfigPrompter:
                     choices = _make_col_choices(ordered, registry_types)
                     value = questionary.checkbox(f"{param_name}:", choices=choices).ask()
                     if value is None:
+                        if _ask_skip_or_abort(check_name):
+                            skip_this_check = True
+                            break
                         return [], [], True
                     filled_params[param_name] = sorted(value)
 
@@ -1164,6 +1232,9 @@ class ReportConfigPrompter:
                     )
                     value = questionary.text(f"{param_name}:", default=suggested_default).ask()
                     if value is None:
+                        if _ask_skip_or_abort(check_name):
+                            skip_this_check = True
+                            break
                         return [], [], True
                     if value:
                         try:
@@ -1171,6 +1242,11 @@ class ReportConfigPrompter:
                         except ValueError:
                             pass
                     filled_params[param_name] = value
+
+            # Issue 4: roll back alias entries and skip to next function
+            if skip_this_check:
+                accumulated_alias = accumulated_alias[:alias_before_check]
+                continue
 
             # ── DataFrame-return prompts ──────────────────────────────────────
             if has_df_return:
@@ -1184,6 +1260,9 @@ class ReportConfigPrompter:
                         choices=_make_col_choices(table_cols, registry_types),
                     ).ask()
                     if check_col is None:
+                        if _ask_skip_or_abort(check_name):
+                            accumulated_alias = accumulated_alias[:alias_before_check]
+                            continue
                         return [], [], True
                     filled_params["check_col"] = check_col
 
@@ -1197,6 +1276,9 @@ class ReportConfigPrompter:
                         choices=_make_col_choices(table_cols, registry_types),
                     ).ask()
                     if overwrite_cols is None:
+                        if _ask_skip_or_abort(check_name):
+                            accumulated_alias = accumulated_alias[:alias_before_check]
+                            continue
                         return [], [], True
                     filled_params["overwrite_cols"] = sorted(overwrite_cols)
 
@@ -1223,6 +1305,9 @@ class ReportConfigPrompter:
                         choices=_make_col_choices(table_cols, registry_types),
                     ).ask()
                     if output_val is None:
+                        if _ask_skip_or_abort(check_name):
+                            accumulated_alias = accumulated_alias[:alias_before_check]
+                            continue
                         return [], [], True
                     accumulated_alias.append({"param": "_output", "column": output_val, "check": check_name})
                 else:
@@ -1248,6 +1333,9 @@ class ReportConfigPrompter:
                         choices=param_choices,
                     ).ask()
                     if mirror_param is None:
+                        if _ask_skip_or_abort(check_name):
+                            accumulated_alias = accumulated_alias[:alias_before_check]
+                            continue
                         return [], [], True
 
                     if mirror_param != _MANUAL_SELECT:
@@ -1265,6 +1353,9 @@ class ReportConfigPrompter:
                             choices=output_choices,
                         ).ask()
                         if output_vals is None:
+                            if _ask_skip_or_abort(check_name):
+                                accumulated_alias = accumulated_alias[:alias_before_check]
+                                continue
                             return [], [], True
                         for col in output_vals:
                             accumulated_alias.append({"param": "_output", "column": col, "check": check_name})

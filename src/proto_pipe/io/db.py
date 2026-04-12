@@ -874,6 +874,28 @@ def init_all_pipeline_tables(conn: duckdb.DuckDBPyConnection) -> None:
     init_check_registry_metadata(conn)
     init_column_type_registry(conn)
     init_pipeline_events(conn)
+    init_check_params_history(conn)
+
+
+def init_check_params_history(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the check_params_history table if it doesn't exist.
+
+    Tracks which columns were previously selected for each check+param
+    combination, enabling pre-population of column checkboxes in
+    ``vp new report``.  Reads via ``get_column_param_history``,
+    writes via ``record_param_history``.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS check_params_history (
+            id          VARCHAR PRIMARY KEY,
+            check_name  VARCHAR NOT NULL,
+            report_name VARCHAR NOT NULL,
+            table_name  VARCHAR NOT NULL,
+            param_name  VARCHAR NOT NULL,
+            param_value VARCHAR NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL
+        )
+    """)
 
 
 # ---------------------------------------------------------------------------
