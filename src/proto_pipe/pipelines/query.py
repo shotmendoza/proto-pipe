@@ -558,6 +558,19 @@ class ReportDetail:
 # vp errors queries
 # ---------------------------------------------------------------------------
 
+# CTE that filters ingest_state to only the most recent attempt per file.
+# Used by error queries to show current state, not historical accumulation.
+# A file that failed 3 times then succeeded shows 0 failures, not 3.
+_LATEST_FILE_STATUS_CTE = """
+    WITH _latest_file_status AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY filename ORDER BY ingested_at DESC
+               ) AS _rn
+        FROM ingest_state
+    )
+"""
+
 def query_error_overview(conn) -> ErrorOverview:
     """Counts for the bare `vp errors` summary display."""
     return ErrorOverview(
@@ -566,10 +579,16 @@ def query_error_overview(conn) -> ErrorOverview:
             conn, "SELECT count(DISTINCT table_name) FROM source_block"
         ),
         file_failure_count=_safe_count(
-            conn, "SELECT count(*) FROM ingest_state WHERE status = 'failed'"
+            conn,
+            _LATEST_FILE_STATUS_CTE
+            + "SELECT count(*) FROM _latest_file_status "
+            "WHERE _rn = 1 AND status = 'failed'"
         ),
         file_failure_table_count=_safe_count(
-            conn, "SELECT count(DISTINCT table_name) FROM ingest_state WHERE status = 'failed'"
+            conn,
+            _LATEST_FILE_STATUS_CTE
+            + "SELECT count(DISTINCT table_name) FROM _latest_file_status "
+            "WHERE _rn = 1 AND status = 'failed'"
         ),
         report_count=_safe_count(conn, "SELECT count(*) FROM validation_block"),
         report_name_count=_safe_count(
@@ -658,25 +677,30 @@ def query_file_failures(
     These are file-level errors (unknown columns, bad type declarations)
     that never reach source_block — they fail the entire file.
 
+    Only includes files whose most recent ingest attempt is 'failed'.
+    Files that were re-ingested successfully are excluded.
+
     Args:
         name: optional table_name filter.
 
     Returns:
         list of FileFailure, most recent first.
     """
-    where = "WHERE status = 'failed'"
+    where_extra = ""
     params: list = []
     if name:
-        where += " AND table_name = ?"
+        where_extra = " AND table_name = ?"
         params.append(name)
 
     try:
-        rows = conn.execute(f"""
-            SELECT table_name, filename, message, ingested_at
-            FROM ingest_state
-            {where}
-            ORDER BY ingested_at DESC
-        """, params).fetchall()
+        rows = conn.execute(
+            _LATEST_FILE_STATUS_CTE
+            + "SELECT table_name, filename, message, ingested_at "
+            "FROM _latest_file_status "
+            f"WHERE _rn = 1 AND status = 'failed'{where_extra} "
+            "ORDER BY ingested_at DESC",
+            params,
+        ).fetchall()
     except Exception:
         return []
 
@@ -710,6 +734,7 @@ def query_source_error_summary(conn) -> list[SourceErrorSummary]:
     """One row per source table with error counts for list view.
 
     Merges source_block row counts and ingest_state file failure counts.
+    File failures only count files whose most recent attempt is 'failed'.
     """
     blocked: dict[str, int] = {}
     try:
@@ -723,8 +748,9 @@ def query_source_error_summary(conn) -> list[SourceErrorSummary]:
     file_fails: dict[str, int] = {}
     try:
         for name, cnt in conn.execute(
-            "SELECT table_name, count(*) FROM ingest_state "
-            "WHERE status = 'failed' GROUP BY table_name"
+            _LATEST_FILE_STATUS_CTE
+            + "SELECT table_name, count(*) FROM _latest_file_status "
+            "WHERE _rn = 1 AND status = 'failed' GROUP BY table_name"
         ).fetchall():
             file_fails[name or "(unknown)"] = cnt
     except Exception:
